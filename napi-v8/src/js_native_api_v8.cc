@@ -44,6 +44,15 @@ inline napi_valuetype TypeOf(v8::Local<v8::Value> value) {
   return napi_object;
 }
 
+inline v8::PropertyAttribute ToV8PropertyAttributes(napi_property_attributes attrs,
+                                                    bool include_writable) {
+  int v8_attrs = v8::None;
+  if ((attrs & napi_enumerable) == 0) v8_attrs |= v8::DontEnum;
+  if ((attrs & napi_configurable) == 0) v8_attrs |= v8::DontDelete;
+  if (include_writable && (attrs & napi_writable) == 0) v8_attrs |= v8::ReadOnly;
+  return static_cast<v8::PropertyAttribute>(v8_attrs);
+}
+
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* payload =
       static_cast<CallbackPayload*>(info.Data().As<v8::External>()->Value());
@@ -487,8 +496,14 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
                                          size_t property_count,
                                          const napi_property_descriptor* properties,
                                          napi_value* result) {
-  if (!CheckEnv(env) || constructor == nullptr || result == nullptr) {
+  if (!CheckEnv(env)) {
     return napi_invalid_arg;
+  }
+  if (utf8name == nullptr || constructor == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  if (property_count > 0 && properties == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
 
   napi_value ctorValue = nullptr;
@@ -502,7 +517,6 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
                                      .ToLocalChecked()
                                      .As<v8::Object>();
 
-  if (property_count > 0 && properties == nullptr) return napi_invalid_arg;
   for (size_t i = 0; i < property_count; ++i) {
     const napi_property_descriptor& desc = properties[i];
     if (desc.utf8name == nullptr) return napi_name_expected;
@@ -523,7 +537,7 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
                context,
                key,
                napi_v8_unwrap_value(fnValue),
-               static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete | v8::ReadOnly))
+               ToV8PropertyAttributes(desc.attributes, true))
                .FromMaybe(false)) {
         return napi_generic_failure;
       }
@@ -551,13 +565,25 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
           key,
           getter_fn,
           setter_fn,
-          static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete));
+          ToV8PropertyAttributes(desc.attributes, false));
+      continue;
+    }
+
+    if (desc.value != nullptr) {
+      if (!target->DefineOwnProperty(
+               context,
+               key,
+               napi_v8_unwrap_value(desc.value),
+               ToV8PropertyAttributes(desc.attributes, true))
+               .FromMaybe(false)) {
+        return napi_generic_failure;
+      }
       continue;
     }
   }
 
   *result = ctorValue;
-  return napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_new_instance(napi_env env,
@@ -644,7 +670,7 @@ napi_status NAPI_CDECL napi_define_properties(
                context,
                key,
                napi_v8_unwrap_value(fnValue),
-               static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete | v8::ReadOnly))
+               ToV8PropertyAttributes(desc.attributes, true))
                .FromMaybe(false)) {
         return napi_generic_failure;
       }
@@ -673,7 +699,7 @@ napi_status NAPI_CDECL napi_define_properties(
           key,
           getter_fn,
           setter_fn,
-          static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete));
+          ToV8PropertyAttributes(desc.attributes, false));
       continue;
     }
 
@@ -682,7 +708,7 @@ napi_status NAPI_CDECL napi_define_properties(
                context,
                key,
                napi_v8_unwrap_value(desc.value),
-               static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete | v8::ReadOnly))
+               ToV8PropertyAttributes(desc.attributes, true))
                .FromMaybe(false)) {
         return napi_generic_failure;
       }
