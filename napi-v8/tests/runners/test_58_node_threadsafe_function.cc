@@ -4,9 +4,9 @@
 
 extern "C" napi_value napi_register_module_v1(napi_env env, napi_value exports);
 
-class Test57NodeReferenceByApiV10 : public FixtureTestBase {};
+class Test58NodeThreadsafeFunction : public FixtureTestBase {};
 
-TEST_F(Test57NodeReferenceByApiV10, PortedCoreFlow) {
+TEST_F(Test58NodeThreadsafeFunction, PortedCoreFlow) {
   EnvScope s(runtime_.get());
   napi_value exports = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &exports), napi_ok);
@@ -14,7 +14,7 @@ TEST_F(Test57NodeReferenceByApiV10, PortedCoreFlow) {
 
   napi_value global = nullptr;
   ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
-  ASSERT_EQ(napi_set_named_property(s.env, global, "__trv10", exports), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "__ttsf", exports), napi_ok);
 
   auto run_js = [&](const char* source_text) {
     v8::TryCatch tc(s.isolate);
@@ -37,15 +37,14 @@ TEST_F(Test57NodeReferenceByApiV10, PortedCoreFlow) {
   };
 
   ASSERT_TRUE(run_js(R"JS(
-const idxNum = __trv10.createRef(42);
-if (__trv10.ref(idxNum) !== 2) throw new Error('refNum');
-if (__trv10.unref(idxNum) !== 1) throw new Error('unrefNum1');
-if (__trv10.unref(idxNum) !== 0) throw new Error('unrefNum0');
-if (__trv10.getRefValue(idxNum) !== 42) throw new Error('numValue');
-__trv10.deleteRef(idxNum);
-
-const idxObj = __trv10.createRef({ p: 1 });
-if (__trv10.getRefValue(idxObj) === undefined) throw new Error('objValue');
-__trv10.deleteRef(idxObj);
+if (typeof __ttsf.ARRAY_LENGTH !== 'number') throw new Error('arrayLength');
+if (typeof __ttsf.MAX_QUEUE_SIZE !== 'number') throw new Error('maxQueueSize');
+let finalizeCalled = false;
+__ttsf.CallIntoModule(
+  () => {},
+  {},
+  'tsfn',
+  () => { finalizeCalled = true; }
+);
 )JS"));
 }

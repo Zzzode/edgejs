@@ -316,6 +316,10 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     ported/node-api/test_reference_by_node_api_version/test_reference_by_node_api_version.c
   )
   target_compile_definitions(napi_v8_test_57_node_reference_by_api_v10 PRIVATE NAPI_VERSION=10)
+  add_fixture_test(napi_v8_test_58_node_threadsafe_function
+    runners/test_58_node_threadsafe_function.cc
+    ported/node-api/test_threadsafe_function/binding.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_42_node_async PRIVATE "${NAPI_V8_UV_LIB}")
@@ -337,6 +341,9 @@ if(NAPI_V8_V8_MONOLITH_LIB)
   endif()
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_51_node_fatal PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_58_node_threadsafe_function PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
