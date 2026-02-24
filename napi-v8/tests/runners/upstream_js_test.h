@@ -158,7 +158,14 @@ inline bool InstallUpstreamJsShim(EnvScope& s, napi_value addon_exports) {
       };
     }
     if (spec === 'assert') return globalThis.assert;
-    if (spec.startsWith('./build/')) return globalThis.__napi_test_addon;
+    if (spec.startsWith('./build/')) {
+      if (globalThis.__napi_test_require_exception) {
+        const err = globalThis.__napi_test_require_exception;
+        globalThis.__napi_test_require_exception = null;
+        throw err;
+      }
+      return globalThis.__napi_test_addon;
+    }
     throw new Error(`Unsupported require: ${spec}`);
   };
   globalThis.require.main = {};
@@ -177,6 +184,12 @@ inline bool InstallUpstreamJsShim(EnvScope& s, napi_value addon_exports) {
 )JS";
 
   return RunScript(s, shim, "shim");
+}
+
+inline bool SetUpstreamRequireException(EnvScope& s, napi_value exception_value) {
+  napi_value global = nullptr;
+  if (napi_get_global(s.env, &global) != napi_ok) return false;
+  return napi_set_named_property(s.env, global, "__napi_test_require_exception", exception_value) == napi_ok;
 }
 
 inline bool RunUpstreamJsFile(EnvScope& s, const std::string& path) {
