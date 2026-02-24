@@ -232,11 +232,19 @@ napi_status NAPI_CDECL napi_create_int32(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL napi_create_int64(napi_env env,
+                                         int64_t value,
+                                         napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  *result = napi_v8_wrap_value(env, v8::Number::New(env->isolate, static_cast<double>(value)));
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
 napi_status NAPI_CDECL napi_create_uint32(napi_env env,
                                           uint32_t value,
                                           napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  *result = napi_v8_wrap_value(env, v8::Uint32::New(env->isolate, value));
+  *result = napi_v8_wrap_value(env, v8::Integer::NewFromUnsigned(env->isolate, value));
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -326,6 +334,16 @@ napi_status NAPI_CDECL napi_get_value_int32(napi_env env,
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
   if (!local->IsNumber()) return napi_number_expected;
   *result = local->Int32Value(env->context()).FromMaybe(0);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_value_int64(napi_env env,
+                                            napi_value value,
+                                            int64_t* result) {
+  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  if (!local->IsNumber()) return napi_number_expected;
+  *result = local->IntegerValue(env->context()).FromMaybe(0);
   return napi_ok;
 }
 
