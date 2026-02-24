@@ -130,6 +130,10 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_15_function.cc
     ported/js-native-api/test_function/test_function.c
   )
+  add_fixture_test(napi_v8_test_16_reference
+    runners/test_16_reference.cc
+    ported/js-native-api/test_reference/test_reference.c
+  )
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
 endif()

@@ -347,6 +347,25 @@ napi_status NAPI_CDECL napi_create_symbol(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL node_api_symbol_for(napi_env env,
+                                           const char* utf8description,
+                                           size_t length,
+                                           napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  if (utf8description == nullptr && length > 0) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  const char* desc = (utf8description == nullptr) ? "" : utf8description;
+  const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
+  v8::Local<v8::String> key;
+  if (!v8::String::NewFromUtf8(env->isolate, desc, v8::NewStringType::kNormal, v8_length)
+           .ToLocal(&key)) {
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, v8::Symbol::For(env->isolate, key));
+  return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
+}
+
 napi_status NAPI_CDECL napi_typeof(napi_env env,
                                    napi_value value,
                                    napi_valuetype* result) {
@@ -842,6 +861,16 @@ napi_status NAPI_CDECL napi_get_value_string_utf8(
     std::memcpy(buf, *utf8, to_copy);
     buf[to_copy] = '\0';
   }
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_value_external(napi_env env,
+                                               napi_value value,
+                                               void** result) {
+  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  if (!local->IsExternal()) return napi_invalid_arg;
+  *result = local.As<v8::External>()->Value();
   return napi_ok;
 }
 
