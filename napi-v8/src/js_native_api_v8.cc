@@ -74,7 +74,11 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
 
   napi_value ret = payload->cb(env, cbinfo);
-  if (ret != nullptr) {
+  bool pending_exception = !env->last_exception.IsEmpty();
+  if (pending_exception) {
+    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+    env->last_exception.Reset();
+  } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 
@@ -95,7 +99,10 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   cbinfo->data = payload->data;
   cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
   napi_value ret = payload->getter_cb(env, cbinfo);
-  if (ret != nullptr) {
+  if (!env->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+    env->last_exception.Reset();
+  } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
   delete cbinfo;
@@ -117,6 +124,10 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
   cbinfo->args.push_back(napi_v8_wrap_value(env, value));
   payload->setter_cb(env, cbinfo);
+  if (!env->last_exception.IsEmpty()) {
+    info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
+    env->last_exception.Reset();
+  }
   delete cbinfo;
 }
 
@@ -266,6 +277,18 @@ napi_status NAPI_CDECL napi_create_object(napi_env env, napi_value* result) {
 napi_status NAPI_CDECL napi_create_array(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Array::New(env->isolate));
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_external(napi_env env,
+                                            void* data,
+                                            node_api_basic_finalize finalize_cb,
+                                            void* finalize_hint,
+                                            napi_value* result) {
+  (void)finalize_cb;
+  (void)finalize_hint;
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  *result = napi_v8_wrap_value(env, v8::External::New(env->isolate, data));
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -615,8 +638,13 @@ napi_status NAPI_CDECL napi_new_instance(napi_env env,
   args.reserve(argc);
   for (size_t i = 0; i < argc; ++i) args.push_back(napi_v8_unwrap_value(argv[i]));
   v8::Local<v8::Value> out;
+  v8::TryCatch tryCatch(env->isolate);
   if (!ctor->NewInstance(env->context(), static_cast<int>(argc), args.data())
            .ToLocal(&out)) {
+    if (tryCatch.HasCaught()) {
+      env->last_exception.Reset(env->isolate, tryCatch.Exception());
+      return napi_v8_set_last_error(env, napi_pending_exception, "Constructor threw");
+    }
     return napi_generic_failure;
   }
   *result = napi_v8_wrap_value(env, out);
