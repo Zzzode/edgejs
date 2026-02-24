@@ -3,14 +3,10 @@
 
 #include <node_api.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
+EXTERN_C_START
 napi_value Init(napi_env env, napi_value exports);
+EXTERN_C_END
 
-#ifdef __cplusplus
-}
-#endif
+NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)
 
 #endif  // JS_NATIVE_API_ENTRY_POINT_H_

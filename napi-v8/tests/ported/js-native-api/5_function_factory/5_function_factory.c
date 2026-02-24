@@ -1,5 +1,6 @@
 #include <js_native_api.h>
 #include "../common.h"
+#include "../entry_point.h"
 
 static napi_value MyFunction(napi_env env, napi_callback_info info) {
   napi_value str;
@@ -15,7 +16,7 @@ static napi_value CreateFunction(napi_env env, napi_callback_info info) {
 }
 
 EXTERN_C_START
-napi_value Init_5_function_factory(napi_env env, napi_value exports) {
+napi_value Init(napi_env env, napi_value exports) {
   NODE_API_CALL(env,
       napi_create_function(env, "exports", -1, CreateFunction, NULL, &exports));
   return exports;

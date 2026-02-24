@@ -3,8 +3,6 @@
 
 #include <js_native_api.h>
 
-namespace fixture8 {
-
 class MyObject {
  public:
   static napi_status Init(napi_env env);
@@ -24,7 +22,5 @@ class MyObject {
   napi_env env_;
   napi_ref wrapper_;
 };
-
-}  // namespace fixture8
 
 #endif  // TEST_JS_NATIVE_API_8_PASSING_WRAPPED_MYOBJECT_H_

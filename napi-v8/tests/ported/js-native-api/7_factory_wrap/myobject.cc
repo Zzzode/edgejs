@@ -1,8 +1,6 @@
 #include "myobject.h"
 #include "../common.h"
 
-namespace fixture7 {
-
 static int finalize_count = 0;
 
 MyObject::MyObject() : env_(nullptr), wrapper_(nullptr) {}
@@ -18,7 +16,6 @@ void MyObject::Destructor(napi_env env,
 }
 
 napi_value MyObject::GetFinalizeCount(napi_env env, napi_callback_info info) {
-  (void)info;
   napi_value result;
   NODE_API_CALL(env, napi_create_int32(env, finalize_count, &result));
   return result;
@@ -102,5 +99,3 @@ napi_value MyObject::PlusOne(napi_env env, napi_callback_info info) {
 
   return num;
 }
-
-}  // namespace fixture7

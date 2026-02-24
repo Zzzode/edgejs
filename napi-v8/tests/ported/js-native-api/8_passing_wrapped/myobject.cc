@@ -1,8 +1,6 @@
 #include "myobject.h"
 #include "../common.h"
 
-namespace fixture8 {
-
 size_t finalize_count = 0;
 
 MyObject::MyObject() : env_(nullptr), wrapper_(nullptr) {}
@@ -14,7 +12,6 @@ MyObject::~MyObject() {
 
 void MyObject::Destructor(
   napi_env env, void* nativeObject, void* /*finalize_hint*/) {
-  (void)env;
   MyObject* obj = static_cast<MyObject*>(nativeObject);
   delete obj;
 }
@@ -54,6 +51,9 @@ napi_value MyObject::New(napi_env env, napi_callback_info info) {
 
   obj->env_ = env;
 
+  // The below call to napi_wrap() must request a reference to the wrapped
+  // object via the out-parameter, because this ensures that we test the code
+  // path that deals with a reference that is destroyed from its own finalizer.
   NODE_API_CALL(env,
       napi_wrap(env, _this, obj, MyObject::Destructor,
           nullptr /* finalize_hint */, &obj->wrapper_));
@@ -78,5 +78,3 @@ napi_status MyObject::NewInstance(napi_env env,
 
   return napi_ok;
 }
-
-}  // namespace fixture8

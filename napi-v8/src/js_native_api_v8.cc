@@ -16,7 +16,8 @@ struct CallbackPayload {
 
 struct AccessorPayload {
   napi_env env;
-  napi_callback cb;
+  napi_callback getter_cb;
+  napi_callback setter_cb;
   void* data;
 };
 
@@ -75,7 +76,7 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   (void)property;
   auto* payload =
       static_cast<AccessorPayload*>(info.Data().As<v8::External>()->Value());
-  if (payload == nullptr || payload->env == nullptr || payload->cb == nullptr) {
+  if (payload == nullptr || payload->env == nullptr || payload->getter_cb == nullptr) {
     return;
   }
   napi_env env = payload->env;
@@ -83,7 +84,7 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   cbinfo->env = env;
   cbinfo->data = payload->data;
   cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
-  napi_value ret = payload->cb(env, cbinfo);
+  napi_value ret = payload->getter_cb(env, cbinfo);
   if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
@@ -96,7 +97,7 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   (void)property;
   auto* payload =
       static_cast<AccessorPayload*>(info.Data().As<v8::External>()->Value());
-  if (payload == nullptr || payload->env == nullptr || payload->cb == nullptr) {
+  if (payload == nullptr || payload->env == nullptr || payload->setter_cb == nullptr) {
     return;
   }
   napi_env env = payload->env;
@@ -105,7 +106,7 @@ void SetterTrampoline(v8::Local<v8::Name> property,
   cbinfo->data = payload->data;
   cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
   cbinfo->args.push_back(napi_v8_wrap_value(env, value));
-  payload->cb(env, cbinfo);
+  payload->setter_cb(env, cbinfo);
   delete cbinfo;
 }
 
@@ -410,26 +411,27 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
     }
 
     if (desc.getter != nullptr || desc.setter != nullptr) {
-      auto* getterPayload = new (std::nothrow) AccessorPayload{env, desc.getter, desc.data};
-      auto* setterPayload = new (std::nothrow) AccessorPayload{env, desc.setter, desc.data};
-      if ((desc.getter != nullptr && getterPayload == nullptr) ||
-          (desc.setter != nullptr && setterPayload == nullptr)) {
-        return napi_generic_failure;
+      v8::Local<v8::Function> getter_fn;
+      v8::Local<v8::Function> setter_fn;
+      if (desc.getter != nullptr) {
+        napi_value getter_value = nullptr;
+        status = napi_create_function(
+            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.getter, desc.data, &getter_value);
+        if (status != napi_ok) return status;
+        getter_fn = napi_v8_unwrap_value(getter_value).As<v8::Function>();
       }
-      v8::Local<v8::Value> payloadData = v8::External::New(
-          env->isolate, desc.getter != nullptr ? static_cast<void*>(getterPayload)
-                                               : static_cast<void*>(setterPayload));
-      if (!target
-               ->SetNativeDataProperty(
-                   context,
-                   key,
-                   desc.getter != nullptr ? GetterTrampoline : nullptr,
-                   desc.setter != nullptr ? SetterTrampoline : nullptr,
-                   payloadData,
-                   static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete))
-               .FromMaybe(false)) {
-        return napi_generic_failure;
+      if (desc.setter != nullptr) {
+        napi_value setter_value = nullptr;
+        status = napi_create_function(
+            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.setter, desc.data, &setter_value);
+        if (status != napi_ok) return status;
+        setter_fn = napi_v8_unwrap_value(setter_value).As<v8::Function>();
       }
+      target->SetAccessorProperty(
+          key,
+          getter_fn,
+          setter_fn,
+          static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete));
       continue;
     }
   }
@@ -530,26 +532,28 @@ napi_status NAPI_CDECL napi_define_properties(
     }
 
     if (desc.getter != nullptr || desc.setter != nullptr) {
-      auto* getterPayload = new (std::nothrow) AccessorPayload{env, desc.getter, desc.data};
-      auto* setterPayload = new (std::nothrow) AccessorPayload{env, desc.setter, desc.data};
-      if ((desc.getter != nullptr && getterPayload == nullptr) ||
-          (desc.setter != nullptr && setterPayload == nullptr)) {
-        return napi_generic_failure;
+      napi_status status = napi_ok;
+      v8::Local<v8::Function> getter_fn;
+      v8::Local<v8::Function> setter_fn;
+      if (desc.getter != nullptr) {
+        napi_value getter_value = nullptr;
+        status = napi_create_function(
+            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.getter, desc.data, &getter_value);
+        if (status != napi_ok) return status;
+        getter_fn = napi_v8_unwrap_value(getter_value).As<v8::Function>();
       }
-      v8::Local<v8::Value> payloadData = v8::External::New(
-          env->isolate, desc.getter != nullptr ? static_cast<void*>(getterPayload)
-                                               : static_cast<void*>(setterPayload));
-      if (!target
-               ->SetNativeDataProperty(
-                   context,
-                   key,
-                   desc.getter != nullptr ? GetterTrampoline : nullptr,
-                   desc.setter != nullptr ? SetterTrampoline : nullptr,
-                   payloadData,
-                   static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete))
-               .FromMaybe(false)) {
-        return napi_generic_failure;
+      if (desc.setter != nullptr) {
+        napi_value setter_value = nullptr;
+        status = napi_create_function(
+            env, desc.utf8name, NAPI_AUTO_LENGTH, desc.setter, desc.data, &setter_value);
+        if (status != napi_ok) return status;
+        setter_fn = napi_v8_unwrap_value(setter_value).As<v8::Function>();
       }
+      target->SetAccessorProperty(
+          key,
+          getter_fn,
+          setter_fn,
+          static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete));
       continue;
     }
 

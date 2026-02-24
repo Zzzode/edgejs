@@ -20,46 +20,85 @@ set(NAPI_V8_GTEST_ROOT "${NAPI_V8_NODE_ROOT}/deps/googletest")
 include(GoogleTest)
 
 if(NAPI_V8_V8_MONOLITH_LIB)
-  add_executable(napi_v8_tier1_tests
+  add_library(napi_v8_gtest STATIC
     "${NAPI_V8_GTEST_ROOT}/src/gtest-all.cc"
     "${NAPI_V8_GTEST_ROOT}/src/gtest_main.cc"
-    tier1_ported_runner.cc
-    ported/js-native-api/2_function_arguments/2_function_arguments.c
-    ported/js-native-api/3_callbacks/3_callbacks.c
-    ported/js-native-api/4_object_factory/4_object_factory.c
-    ported/js-native-api/5_function_factory/5_function_factory.c
-    ported/js-native-api/7_factory_wrap/7_factory_wrap.cc
-    ported/js-native-api/7_factory_wrap/myobject.cc
-    ported/js-native-api/8_passing_wrapped/8_passing_wrapped.cc
-    ported/js-native-api/8_passing_wrapped/myobject.cc
   )
 
-  target_include_directories(napi_v8_tier1_tests
+  target_include_directories(napi_v8_gtest
     PRIVATE
       "${NAPI_V8_GTEST_ROOT}"
       "${NAPI_V8_GTEST_ROOT}/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/ported/js-native-api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/runners"
       "${NAPI_V8_ROOT}/include"
       "${NAPI_V8_V8_INCLUDE_DIR}"
   )
 
-  target_link_libraries(napi_v8_tier1_tests PRIVATE napi_v8)
-  target_link_libraries(napi_v8_tier1_tests PRIVATE "${NAPI_V8_V8_MONOLITH_LIB}")
-  if(NAPI_V8_V8_DEFINES)
-    target_compile_definitions(napi_v8_tier1_tests PRIVATE ${NAPI_V8_V8_DEFINES})
-  endif()
-  if(NAPI_V8_V8_EXTRA_LIBS)
-    target_link_libraries(napi_v8_tier1_tests PRIVATE ${NAPI_V8_V8_EXTRA_LIBS})
-  endif()
-  get_filename_component(NAPI_V8_V8_LIB_DIR "${NAPI_V8_V8_MONOLITH_LIB}" DIRECTORY)
-  set_target_properties(napi_v8_tier1_tests PROPERTIES
-    BUILD_RPATH "${NAPI_V8_V8_LIB_DIR}"
-    INSTALL_RPATH "${NAPI_V8_V8_LIB_DIR}"
+  function(add_fixture_test target_name)
+    add_executable(${target_name} ${ARGN})
+    target_include_directories(${target_name}
+      PRIVATE
+        "${NAPI_V8_GTEST_ROOT}"
+        "${NAPI_V8_GTEST_ROOT}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ported/js-native-api"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runners"
+        "${NAPI_V8_ROOT}/include"
+        "${NAPI_V8_V8_INCLUDE_DIR}"
+    )
+    target_link_libraries(${target_name}
+      PRIVATE
+        napi_v8_gtest
+        napi_v8
+        "${NAPI_V8_V8_MONOLITH_LIB}"
+    )
+    if(NAPI_V8_V8_DEFINES)
+      target_compile_definitions(${target_name} PRIVATE ${NAPI_V8_V8_DEFINES})
+    endif()
+    if(NAPI_V8_V8_EXTRA_LIBS)
+      target_link_libraries(${target_name} PRIVATE ${NAPI_V8_V8_EXTRA_LIBS})
+    endif()
+    get_filename_component(NAPI_V8_V8_LIB_DIR "${NAPI_V8_V8_MONOLITH_LIB}" DIRECTORY)
+    set_target_properties(${target_name} PROPERTIES
+      BUILD_RPATH "${NAPI_V8_V8_LIB_DIR}"
+      INSTALL_RPATH "${NAPI_V8_V8_LIB_DIR}"
+    )
+    gtest_discover_tests(
+      ${target_name}
+      DISCOVERY_TIMEOUT 30
+      TEST_PREFIX "napi_v8.${target_name}."
+    )
+  endfunction()
+
+  add_fixture_test(napi_v8_test_2
+    runners/test_2_function_arguments.cc
+    ported/js-native-api/2_function_arguments/2_function_arguments.c
   )
-  gtest_discover_tests(
-    napi_v8_tier1_tests
-    DISCOVERY_TIMEOUT 30
-    TEST_PREFIX "napi_v8."
+  add_fixture_test(napi_v8_test_3
+    runners/test_3_callbacks.cc
+    ported/js-native-api/3_callbacks/3_callbacks.c
+  )
+  add_fixture_test(napi_v8_test_4
+    runners/test_4_object_factory.cc
+    ported/js-native-api/4_object_factory/4_object_factory.c
+  )
+  add_fixture_test(napi_v8_test_5
+    runners/test_5_function_factory.cc
+    ported/js-native-api/5_function_factory/5_function_factory.c
+  )
+  add_fixture_test(napi_v8_test_6
+    runners/test_6_object_wrap.cc
+    ported/js-native-api/6_object_wrap/myobject.cc
+  )
+  add_fixture_test(napi_v8_test_7
+    runners/test_7_factory_wrap.cc
+    ported/js-native-api/7_factory_wrap/7_factory_wrap.cc
+    ported/js-native-api/7_factory_wrap/myobject.cc
+  )
+  add_fixture_test(napi_v8_test_8
+    runners/test_8_passing_wrapped.cc
+    ported/js-native-api/8_passing_wrapped/8_passing_wrapped.cc
+    ported/js-native-api/8_passing_wrapped/myobject.cc
   )
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")

@@ -1,11 +1,9 @@
 #include <js_native_api.h>
 #include "../common.h"
+#include "../entry_point.h"
 #include "myobject.h"
 
-using fixture8::MyObject;
-namespace fixture8 {
 extern size_t finalize_count;
-}
 
 static napi_value CreateObject(napi_env env, napi_callback_info info) {
   size_t argc = 1;
@@ -40,17 +38,13 @@ static napi_value Add(napi_env env, napi_callback_info info) {
 }
 
 static napi_value FinalizeCount(napi_env env, napi_callback_info info) {
-  (void)info;
   napi_value return_value;
-  NODE_API_CALL(env, napi_create_uint32(
-                         env,
-                         static_cast<uint32_t>(fixture8::finalize_count),
-                         &return_value));
+  NODE_API_CALL(env, napi_create_uint32(env, finalize_count, &return_value));
   return return_value;
 }
 
 EXTERN_C_START
-napi_value Init_8_passing_wrapped(napi_env env, napi_value exports) {
+napi_value Init(napi_env env, napi_value exports) {
   MyObject::Init(env);
 
   napi_property_descriptor desc[] = {

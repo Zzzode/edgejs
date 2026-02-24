@@ -1,8 +1,7 @@
 #include <js_native_api.h>
 #include "../common.h"
+#include "../entry_point.h"
 #include "myobject.h"
-
-using fixture7::MyObject;
 
 napi_value CreateObject(napi_env env, napi_callback_info info) {
   size_t argc = 1;
@@ -17,7 +16,7 @@ napi_value CreateObject(napi_env env, napi_callback_info info) {
 }
 
 EXTERN_C_START
-napi_value Init_7_factory_wrap(napi_env env, napi_value exports) {
+napi_value Init(napi_env env, napi_value exports) {
   NODE_API_CALL(env, MyObject::Init(env));
 
   napi_property_descriptor descriptors[] = {

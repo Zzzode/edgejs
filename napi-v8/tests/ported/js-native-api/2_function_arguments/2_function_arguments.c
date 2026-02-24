@@ -1,5 +1,6 @@
 #include <js_native_api.h>
 #include "../common.h"
+#include "../entry_point.h"
 
 static napi_value Add(napi_env env, napi_callback_info info) {
   size_t argc = 2;
@@ -30,7 +31,7 @@ static napi_value Add(napi_env env, napi_callback_info info) {
 }
 
 EXTERN_C_START
-napi_value Init_2_function_arguments(napi_env env, napi_value exports) {
+napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor desc = DECLARE_NODE_API_PROPERTY("add", Add);
   NODE_API_CALL(env, napi_define_properties(env, exports, 1, &desc));
   return exports;

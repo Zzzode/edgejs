@@ -1,6 +1,7 @@
 #include <js_native_api.h>
 #include <string.h>
 #include "../common.h"
+#include "../entry_point.h"
 
 static napi_value RunCallback(napi_env env, napi_callback_info info) {
   size_t argc = 2;
@@ -46,7 +47,7 @@ static napi_value RunCallbackWithRecv(napi_env env, napi_callback_info info) {
 }
 
 EXTERN_C_START
-napi_value Init_3_callbacks(napi_env env, napi_value exports) {
+napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor desc[2] = {
     DECLARE_NODE_API_PROPERTY("RunCallback", RunCallback),
     DECLARE_NODE_API_PROPERTY("RunCallbackWithRecv", RunCallbackWithRecv),
