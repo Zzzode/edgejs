@@ -298,11 +298,16 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
   v8::Local<v8::Private> wrapFinalizeKey = v8::Private::ForApi(
       isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap_finalize"));
   wrap_finalizer_private_key.Reset(isolate, wrapFinalizeKey);
+  v8::Local<v8::Private> bufferKey = v8::Private::ForApi(
+      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_buffer_record"));
+  buffer_private_key.Reset(isolate, bufferKey);
   napi_v8_clear_last_error(this);
 }
 
 napi_env__::~napi_env__() {
   napi_v8_run_async_cleanup_hooks(this);
+  napi_v8_run_env_cleanup_hooks(this);
+  napi_v8_finalize_buffer_records(this);
 
   for (auto* raw_record : wrap_finalizers) {
     auto* record = static_cast<WrapFinalizerRecord*>(raw_record);
@@ -513,24 +518,6 @@ napi_status NAPI_CDECL napi_create_external(napi_env env,
   (void)finalize_hint;
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::External::New(env->isolate, data));
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
-}
-
-napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
-                                                   size_t length,
-                                                   void* data,
-                                                   node_api_basic_finalize finalize_cb,
-                                                   void* finalize_hint,
-                                                   napi_value* result) {
-  (void)finalize_cb;
-  (void)finalize_hint;
-  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
-  v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, length);
-  if (length > 0 && data != nullptr) {
-    std::memcpy(ab->Data(), data, length);
-  }
-  v8::Local<v8::Uint8Array> view = v8::Uint8Array::New(ab, 0, length);
-  *result = napi_v8_wrap_value(env, view);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 

@@ -55,12 +55,15 @@ struct napi_env__ {
   v8::Global<v8::Private> wrap_private_key;
   v8::Global<v8::Private> wrap_ref_private_key;
   v8::Global<v8::Private> wrap_finalizer_private_key;
+  v8::Global<v8::Private> buffer_private_key;
   int32_t module_api_version = 8;
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
   std::vector<void*> threadsafe_functions;
   std::vector<void*> async_cleanup_hooks;
+  std::vector<void*> env_cleanup_hooks;
+  std::vector<void*> buffer_records;
   std::vector<void*> wrap_finalizers;
   std::vector<TypeTagEntry> type_tag_entries;
 };
@@ -74,5 +77,7 @@ napi_status napi_v8_clear_last_error(napi_env env);
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);
 void napi_v8_run_async_cleanup_hooks(napi_env env);
+void napi_v8_run_env_cleanup_hooks(napi_env env);
+void napi_v8_finalize_buffer_records(napi_env env);
 
 #endif  // NAPI_V8_ENV_H_

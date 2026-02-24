@@ -261,6 +261,27 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_44_node_async_cleanup_hook.cc
     ported/node-api/test_async_cleanup_hook/binding.c
   )
+  add_fixture_test(napi_v8_test_45_node_async_context
+    runners/test_45_node_async_context.cc
+    ported/node-api/test_async_context/binding.c
+  )
+  add_fixture_test(napi_v8_test_46_node_buffer
+    runners/test_46_node_buffer.cc
+    ported/node-api/test_buffer/test_buffer.c
+  )
+  target_compile_definitions(napi_v8_test_46_node_buffer PRIVATE NAPI_VERSION=10)
+  add_fixture_test(napi_v8_test_47_node_buffer_finalizer
+    runners/test_47_node_buffer_finalizer.cc
+    ported/node-api/test_buffer/test_finalizer.c
+  )
+  add_fixture_test(napi_v8_test_48_node_callback_scope
+    runners/test_48_node_callback_scope.cc
+    ported/node-api/test_callback_scope/binding.c
+  )
+  add_fixture_test(napi_v8_test_49_node_cleanup_hook
+    runners/test_49_node_cleanup_hook.cc
+    ported/node-api/test_cleanup_hook/binding.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_42_node_async PRIVATE "${NAPI_V8_UV_LIB}")
@@ -270,6 +291,15 @@ if(NAPI_V8_V8_MONOLITH_LIB)
   endif()
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_28_node_instance_data PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_46_node_buffer PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_47_node_buffer_finalizer PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_48_node_callback_scope PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
