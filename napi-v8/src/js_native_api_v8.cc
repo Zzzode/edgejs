@@ -308,6 +308,22 @@ napi_status NAPI_CDECL napi_create_string_utf8(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL napi_create_symbol(napi_env env,
+                                          napi_value description,
+                                          napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> desc_value = v8::Undefined(env->isolate);
+  if (description != nullptr) {
+    if (!CheckValue(env, description)) return napi_invalid_arg;
+    desc_value = napi_v8_unwrap_value(description);
+    if (!desc_value->IsString()) return napi_string_expected;
+  }
+  v8::Local<v8::Symbol> sym = v8::Symbol::New(
+      env->isolate, desc_value->IsString() ? desc_value.As<v8::String>() : v8::Local<v8::String>());
+  *result = napi_v8_wrap_value(env, sym);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
 napi_status NAPI_CDECL napi_typeof(napi_env env,
                                    napi_value value,
                                    napi_valuetype* result) {
