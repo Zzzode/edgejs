@@ -17,6 +17,7 @@ set(NAPI_V8_V8_EXTRA_LIBS
   CACHE STRING "Semicolon-separated extra V8 libraries (e.g. libplatform/libbase)"
 )
 set(NAPI_V8_GTEST_ROOT "${NAPI_V8_NODE_ROOT}/deps/googletest")
+set(NAPI_V8_UV_INCLUDE_DIR "${NAPI_V8_NODE_ROOT}/deps/uv/include")
 include(GoogleTest)
 
 if(NAPI_V8_V8_MONOLITH_LIB)
@@ -45,6 +46,7 @@ if(NAPI_V8_V8_MONOLITH_LIB)
         "${CMAKE_CURRENT_SOURCE_DIR}/runners"
         "${NAPI_V8_ROOT}/include"
         "${NAPI_V8_V8_INCLUDE_DIR}"
+        "${NAPI_V8_UV_INCLUDE_DIR}"
     )
     target_link_libraries(${target_name}
       PRIVATE
@@ -186,6 +188,14 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     ported/js-native-api/test_object/test_null.c
   )
   target_compile_definitions(napi_v8_test_27_object PRIVATE NAPI_EXPERIMENTAL)
+  add_fixture_test(napi_v8_test_28_node_instance_data
+    runners/test_28_node_instance_data.cc
+    ported/node-api/test_instance_data/test_instance_data.c
+  )
+  find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_28_node_instance_data PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
 endif()

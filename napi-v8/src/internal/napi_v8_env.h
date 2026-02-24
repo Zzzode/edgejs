@@ -58,6 +58,7 @@ struct napi_env__ {
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
+  std::vector<void*> threadsafe_functions;
   std::vector<TypeTagEntry> type_tag_entries;
 };
 
