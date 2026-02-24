@@ -18,6 +18,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_conversions` (ported to gtest harness)
 - `test_properties` (ported to gtest harness)
 - `test_general` (ported to gtest harness)
+- `test_object` (`test_exceptions` and `test_null` slices ported)
 
 ### implement_now
 
@@ -32,7 +33,6 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_exception`
 - `test_function`
 - `test_number`
-- `test_object`
 - `test_symbol`
 
 ### defer_phase2
