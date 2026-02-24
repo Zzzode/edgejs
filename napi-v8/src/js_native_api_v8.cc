@@ -1,4 +1,5 @@
 #include "internal/napi_v8_env.h"
+#include "node_api_types.h"
 
 #include <climits>
 #include <cstring>
@@ -1572,6 +1573,38 @@ napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv)) return napi_invalid_arg;
   *result = napiEnv->module_api_version;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_node_version(
+    node_api_basic_env env, const napi_node_version** version) {
+#ifdef NODE_MAJOR_VERSION
+  static const uint32_t kMajor = NODE_MAJOR_VERSION;
+  static const uint32_t kMinor = NODE_MINOR_VERSION;
+  static const uint32_t kPatch = NODE_PATCH_VERSION;
+  static const char* kRelease = NODE_RELEASE;
+#else
+  static const uint32_t kMajor = 0;
+  static const uint32_t kMinor = 0;
+  static const uint32_t kPatch = 0;
+  static const char* kRelease = "node";
+#endif
+  static const napi_node_version kVersion = {
+      kMajor, kMinor, kPatch, kRelease};
+  if (version == nullptr) return napi_invalid_arg;
+  auto* napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv)) return napi_invalid_arg;
+  *version = &kVersion;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL node_api_get_module_file_name(
+    node_api_basic_env env, const char** result) {
+  static const char kModuleUrl[] = "file:///napi-v8-addon.node";
+  if (result == nullptr) return napi_invalid_arg;
+  auto* napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv)) return napi_invalid_arg;
+  *result = kModuleUrl;
   return napi_ok;
 }
 
