@@ -773,11 +773,20 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
 
   for (size_t i = 0; i < property_count; ++i) {
     const napi_property_descriptor& desc = properties[i];
-    if (desc.utf8name == nullptr) return napi_name_expected;
-    v8::Local<v8::String> key;
-    if (!v8::String::NewFromUtf8(env->isolate, desc.utf8name, v8::NewStringType::kNormal)
-             .ToLocal(&key)) {
-      return napi_generic_failure;
+    v8::Local<v8::Name> key;
+    if (desc.utf8name != nullptr) {
+      v8::Local<v8::String> key_str;
+      if (!v8::String::NewFromUtf8(env->isolate, desc.utf8name, v8::NewStringType::kNormal)
+               .ToLocal(&key_str)) {
+        return napi_generic_failure;
+      }
+      key = key_str;
+    } else if (desc.name != nullptr) {
+      v8::Local<v8::Value> name_value = napi_v8_unwrap_value(desc.name);
+      if (!name_value->IsName()) return napi_name_expected;
+      key = name_value.As<v8::Name>();
+    } else {
+      return napi_name_expected;
     }
     v8::Local<v8::Object> target =
         (desc.attributes & napi_static) ? ctor.As<v8::Object>() : proto;
@@ -912,12 +921,21 @@ napi_status NAPI_CDECL napi_define_properties(
 
   for (size_t i = 0; i < property_count; ++i) {
     const napi_property_descriptor& desc = properties[i];
-    if (desc.utf8name == nullptr) return napi_name_expected;
-    v8::Local<v8::String> key;
-    if (!v8::String::NewFromUtf8(
-             env->isolate, desc.utf8name, v8::NewStringType::kNormal)
-             .ToLocal(&key)) {
-      return napi_generic_failure;
+    v8::Local<v8::Name> key;
+    if (desc.utf8name != nullptr) {
+      v8::Local<v8::String> key_str;
+      if (!v8::String::NewFromUtf8(
+               env->isolate, desc.utf8name, v8::NewStringType::kNormal)
+               .ToLocal(&key_str)) {
+        return napi_generic_failure;
+      }
+      key = key_str;
+    } else if (desc.name != nullptr) {
+      v8::Local<v8::Value> name_value = napi_v8_unwrap_value(desc.name);
+      if (!name_value->IsName()) return napi_name_expected;
+      key = name_value.As<v8::Name>();
+    } else {
+      return napi_name_expected;
     }
 
     if (desc.method != nullptr) {
@@ -974,6 +992,26 @@ napi_status NAPI_CDECL napi_define_properties(
     }
   }
 
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_has_named_property(napi_env env,
+                                               napi_value object,
+                                               const char* utf8name,
+                                               bool* result) {
+  if (!CheckValue(env, object) || utf8name == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  auto context = env->context();
+  v8::Local<v8::Value> targetValue = napi_v8_unwrap_value(object);
+  if (!targetValue->IsObject()) return napi_object_expected;
+  v8::Local<v8::String> key;
+  if (!v8::String::NewFromUtf8(
+           env->isolate, utf8name, v8::NewStringType::kNormal)
+           .ToLocal(&key)) {
+    return napi_generic_failure;
+  }
+  *result = targetValue.As<v8::Object>()->Has(context, key).FromMaybe(false);
   return napi_ok;
 }
 
