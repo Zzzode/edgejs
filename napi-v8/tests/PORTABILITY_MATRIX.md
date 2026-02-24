@@ -37,6 +37,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_dataview` (ported to gtest harness)
 - `test_sharedarraybuffer` (ported to gtest harness)
 - `test_typedarray` (ported to gtest harness)
+- `test_promise` (ported to gtest harness)
 
 ### implement_now
 
@@ -48,7 +49,6 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_finalizer`
 - `test_handle_scope`
 - `test_instance_data`
-- `test_promise`
 - `test_reference_double_free`
 
 ## `node-api` (`node/test/node-api`)

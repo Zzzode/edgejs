@@ -28,6 +28,11 @@ struct napi_threadsafe_function__ {
   std::atomic<bool> finalized{false};
 };
 
+struct napi_deferred__ {
+  napi_env env = nullptr;
+  v8::Global<v8::Promise::Resolver> resolver;
+};
+
 namespace {
 
 struct CallbackPayload {
@@ -1540,6 +1545,69 @@ napi_status NAPI_CDECL napi_define_properties(
   }
 
   return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_promise(napi_env env,
+                                           napi_deferred* deferred,
+                                           napi_value* promise) {
+  if (!CheckEnv(env) || deferred == nullptr || promise == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::TryCatch tc(env->isolate);
+  v8::Local<v8::Promise::Resolver> resolver;
+  if (!v8::Promise::Resolver::New(env->context()).ToLocal(&resolver)) {
+    return ReturnPendingIfCaught(env, tc, "Failed to create Promise resolver");
+  }
+  auto* d = new (std::nothrow) napi_deferred__();
+  if (d == nullptr) return napi_generic_failure;
+  d->env = env;
+  d->resolver.Reset(env->isolate, resolver);
+  *deferred = d;
+  *promise = napi_v8_wrap_value(env, resolver->GetPromise());
+  if (*promise == nullptr) {
+    delete d;
+    *deferred = nullptr;
+    return napi_generic_failure;
+  }
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_resolve_deferred(napi_env env,
+                                             napi_deferred deferred,
+                                             napi_value resolution) {
+  if (!CheckEnv(env) || deferred == nullptr || resolution == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::TryCatch tc(env->isolate);
+  v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
+  if (!resolver->Resolve(env->context(), napi_v8_unwrap_value(resolution)).FromMaybe(false)) {
+    return ReturnPendingIfCaught(env, tc, "Failed to resolve promise");
+  }
+  delete deferred;
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_reject_deferred(napi_env env,
+                                            napi_deferred deferred,
+                                            napi_value rejection) {
+  if (!CheckEnv(env) || deferred == nullptr || rejection == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::TryCatch tc(env->isolate);
+  v8::Local<v8::Promise::Resolver> resolver = deferred->resolver.Get(env->isolate);
+  if (!resolver->Reject(env->context(), napi_v8_unwrap_value(rejection)).FromMaybe(false)) {
+    return ReturnPendingIfCaught(env, tc, "Failed to reject promise");
+  }
+  delete deferred;
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_is_promise(napi_env env, napi_value value, bool* is_promise) {
+  if (!CheckEnv(env) || value == nullptr || is_promise == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  *is_promise = napi_v8_unwrap_value(value)->IsPromise();
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_has_named_property(napi_env env,
