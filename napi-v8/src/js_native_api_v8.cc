@@ -653,6 +653,21 @@ napi_status NAPI_CDECL napi_set_element(napi_env env,
   return napi_ok;
 }
 
+napi_status NAPI_CDECL napi_instanceof(napi_env env,
+                                       napi_value object,
+                                       napi_value constructor,
+                                       bool* result) {
+  if (!CheckValue(env, object) || !CheckValue(env, constructor) || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  v8::Local<v8::Value> ctor = napi_v8_unwrap_value(constructor);
+  if (!ctor->IsFunction()) return napi_function_expected;
+  *result = napi_v8_unwrap_value(object)
+                ->InstanceOf(env->context(), ctor.As<v8::Object>())
+                .FromMaybe(false);
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL napi_has_element(napi_env env,
                                         napi_value object,
                                         uint32_t index,
@@ -1064,6 +1079,31 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL napi_get_prototype(napi_env env,
+                                          napi_value object,
+                                          napi_value* result) {
+  if (!CheckValue(env, object) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
+  if (!target->IsObject()) return napi_object_expected;
+  v8::Local<v8::Value> proto = target.As<v8::Object>()->GetPrototypeV2();
+  *result = napi_v8_wrap_value(env, proto);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL node_api_set_prototype(napi_env env,
+                                              napi_value object,
+                                              napi_value value) {
+  if (!CheckValue(env, object) || !CheckValue(env, value)) return napi_invalid_arg;
+  v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
+  if (!target->IsObject()) return napi_object_expected;
+  if (!target.As<v8::Object>()
+           ->SetPrototypeV2(env->context(), napi_v8_unwrap_value(value))
+           .FromMaybe(false)) {
+    return napi_generic_failure;
+  }
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL napi_get_value_bool(napi_env env,
                                            napi_value value,
                                            bool* result) {
@@ -1310,6 +1350,11 @@ napi_status NAPI_CDECL napi_wrap(napi_env env,
   if (!value->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> object = value.As<v8::Object>();
   v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Value> existing;
+  if (object->GetPrivate(env->context(), wrapKey).ToLocal(&existing) &&
+      existing->IsExternal()) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   if (!object->SetPrivate(env->context(), wrapKey, v8::External::New(env->isolate, native_object))
            .FromMaybe(false)) {
     return napi_generic_failure;
@@ -1350,6 +1395,8 @@ napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void
   v8::Local<v8::Object> object = napi_v8_unwrap_value(js_object).As<v8::Object>();
   v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
   object->DeletePrivate(env->context(), wrapKey).FromMaybe(false);
+  v8::Local<v8::Private> wrapRefKey = env->wrap_ref_private_key.Get(env->isolate);
+  object->DeletePrivate(env->context(), wrapRefKey).FromMaybe(false);
   if (result != nullptr) *result = out;
   return napi_ok;
 }
@@ -1568,11 +1615,69 @@ napi_status NAPI_CDECL napi_get_instance_data(node_api_basic_env basic_env,
   return napi_ok;
 }
 
+napi_status NAPI_CDECL napi_run_script(napi_env env,
+                                       napi_value script,
+                                       napi_value* result) {
+  if (!CheckValue(env, script) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> source = napi_v8_unwrap_value(script);
+  if (!source->IsString()) return napi_string_expected;
+  v8::TryCatch tc(env->isolate);
+  v8::Local<v8::Script> compiled;
+  if (!v8::Script::Compile(env->context(), source.As<v8::String>()).ToLocal(&compiled)) {
+    if (tc.HasCaught()) {
+      env->last_exception.Reset(env->isolate, tc.Exception());
+      return napi_pending_exception;
+    }
+    return napi_generic_failure;
+  }
+  v8::Local<v8::Value> out;
+  if (!compiled->Run(env->context()).ToLocal(&out)) {
+    if (tc.HasCaught()) {
+      env->last_exception.Reset(env->isolate, tc.Exception());
+      return napi_pending_exception;
+    }
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_adjust_external_memory(
+    node_api_basic_env basic_env, int64_t change_in_bytes, int64_t* adjusted_value) {
+  static int64_t total = 0;
+  napi_env env = const_cast<napi_env>(basic_env);
+  if (!CheckEnv(env) || adjusted_value == nullptr) return napi_invalid_arg;
+  total += change_in_bytes;
+  if (total < 0) total = 0;
+  *adjusted_value = total;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL node_api_post_finalizer(node_api_basic_env env,
+                                               napi_finalize finalize_cb,
+                                               void* finalize_data,
+                                               void* finalize_hint) {
+  napi_env napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv) || finalize_cb == nullptr) return napi_invalid_arg;
+  finalize_cb(napiEnv, finalize_data, finalize_hint);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_add_finalizer(napi_env env,
+                                          napi_value js_object,
+                                          void* finalize_data,
+                                          node_api_basic_finalize finalize_cb,
+                                          void* finalize_hint,
+                                          napi_ref* result) {
+  if (!CheckValue(env, js_object) || finalize_cb == nullptr) return napi_invalid_arg;
+  return napi_wrap(env, js_object, finalize_data, finalize_cb, finalize_hint, result);
+}
+
 napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result) {
   if (result == nullptr) return napi_invalid_arg;
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv)) return napi_invalid_arg;
-  *result = napiEnv->module_api_version;
+  *result = 10;
   return napi_ok;
 }
 

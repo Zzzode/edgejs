@@ -153,6 +153,11 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_20_node_general.cc
     ported/node-api/test_general/test_general.c
   )
+  add_fixture_test(napi_v8_test_21_general
+    runners/test_21_general.cc
+    ported/js-native-api/test_general/test_general.c
+  )
+  target_compile_definitions(napi_v8_test_21_general PRIVATE NAPI_EXPERIMENTAL)
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
 endif()
