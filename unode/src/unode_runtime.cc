@@ -11,11 +11,13 @@
 #include <stdlib.h>
 extern char** _environ;
 #else
+#include <unistd.h>
 extern char** environ;
 #endif
 
 #include "unode_fs.h"
 #include "unode_module_loader.h"
+#include "unode_os.h"
 
 namespace {
 
@@ -169,6 +171,36 @@ std::string NapiValueToUtf8(napi_env env, napi_value value) {
   return out;
 }
 
+const char* DetectPlatform() {
+#if defined(_WIN32)
+  return "win32";
+#elif defined(__APPLE__)
+  return "darwin";
+#elif defined(__linux__)
+  return "linux";
+#elif defined(__sun)
+  return "sunos";
+#elif defined(_AIX)
+  return "aix";
+#else
+  return "unknown";
+#endif
+}
+
+const char* DetectArch() {
+#if defined(__x86_64__) || defined(_M_X64)
+  return "x64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  return "arm64";
+#elif defined(__arm__) || defined(_M_ARM)
+  return "arm";
+#elif defined(__i386__) || defined(_M_IX86)
+  return "ia32";
+#else
+  return "unknown";
+#endif
+}
+
 void MaybeInvokeWriteCallback(napi_env env, napi_value maybe_fn) {
   if (maybe_fn == nullptr) return;
   napi_valuetype type = napi_undefined;
@@ -313,6 +345,7 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
     return 1;
   }
   UnodeInstallFsBinding(env);
+  UnodeInstallOsBinding(env);
   status = UnodeInstallModuleLoader(env, entry_script_path);
   if (status != napi_ok) {
     if (error_out != nullptr) {
@@ -672,13 +705,44 @@ napi_status UnodeInstallProcessObject(napi_env env) {
   if (status != napi_ok) {
     return status;
   }
-  // process.arch and process.versions - stubs for Node test common.
+  // process.arch/process.platform and process.versions - stubs for Node test common.
   napi_value arch_str = nullptr;
-  status = napi_create_string_utf8(env, "arm64", NAPI_AUTO_LENGTH, &arch_str);
+  status = napi_create_string_utf8(env, DetectArch(), NAPI_AUTO_LENGTH, &arch_str);
   if (status != napi_ok || arch_str == nullptr) {
     return (status == napi_ok) ? napi_generic_failure : status;
   }
   status = napi_set_named_property(env, process_obj, "arch", arch_str);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value platform_str = nullptr;
+  status = napi_create_string_utf8(env, DetectPlatform(), NAPI_AUTO_LENGTH, &platform_str);
+  if (status != napi_ok || platform_str == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "platform", platform_str);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value exec_path = nullptr;
+  status = napi_create_string_utf8(env, "unode", NAPI_AUTO_LENGTH, &exec_path);
+  if (status != napi_ok || exec_path == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "execPath", exec_path);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value pid_value = nullptr;
+#if defined(_WIN32)
+  status = napi_create_int32(env, 1, &pid_value);
+#else
+  status = napi_create_int32(env, static_cast<int32_t>(getpid()), &pid_value);
+#endif
+  if (status != napi_ok || pid_value == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "pid", pid_value);
   if (status != napi_ok) {
     return status;
   }

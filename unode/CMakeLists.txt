@@ -55,6 +55,7 @@ add_library(unode_runtime STATIC
   src/unode_runtime.cc
   src/unode_module_loader.cc
   src/unode_fs.cc
+  src/unode_os.cc
 )
 target_include_directories(unode_runtime
   PUBLIC

@@ -83,6 +83,10 @@ function mustNotMutateObjectDeep(obj) {
 }
 
 const isWindows = typeof process !== 'undefined' && process.platform === 'win32';
+const isAIX = typeof process !== 'undefined' && process.platform === 'aix';
+const isIBMi = false;
+const isSunOS = typeof process !== 'undefined' && process.platform === 'sunos';
+const isDebug = false;
 const isMainThread = true;
 const isDumbTerminal = typeof process !== 'undefined' &&
   process.env &&
@@ -106,6 +110,10 @@ module.exports = {
   invalidArgTypeHelper,
   mustNotMutateObjectDeep,
   isWindows,
+  isAIX,
+  isIBMi,
+  isSunOS,
+  isDebug,
   isMainThread,
   isDumbTerminal,
   canCreateSymLink,

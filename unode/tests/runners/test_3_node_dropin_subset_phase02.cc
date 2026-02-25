@@ -211,6 +211,70 @@ TEST_F(Test3NodeDropinSubsetPhase02, ConsoleTableCompatTest) {
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }
 
+TEST_F(Test3NodeDropinSubsetPhase02, OsCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, OsEolCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os-eol.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, OsPriorityCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os-process-priority.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, OsUserInfoCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os-userinfo-handles-getter-errors.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, OsHomedirCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os-homedir-no-envvar.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, OsConstantsCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os-constants-signals.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, OsFastCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os-fast.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, OsCheckedCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-os-checked-function.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
 #ifdef NAPI_V8_NODE_ROOT_PATH
 TEST_F(Test3NodeDropinSubsetPhase02, RawRequireCacheFromNodeTest) {
   EnvScope s(runtime_.get());

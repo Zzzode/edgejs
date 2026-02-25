@@ -4,6 +4,7 @@ const {
   codes: {
     ERR_INVALID_ARG_TYPE,
     ERR_INVALID_ARG_VALUE,
+    ERR_OUT_OF_RANGE,
   },
 } = require('internal/errors');
 
@@ -55,11 +56,21 @@ function validateInteger(value, name, min = Number.MIN_SAFE_INTEGER, max = Numbe
   }
 }
 
+function validateInt32(value, name, min = -2147483648, max = 2147483647) {
+  if (typeof value !== 'number') {
+    throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
+  }
+  if (!Number.isInteger(value) || Number.isNaN(value) || value < min || value > max) {
+    throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
+  }
+}
+
 module.exports = {
   validateObject,
   validateAbortSignal,
   validateBoolean,
   validateFunction,
+  validateInt32,
   validateInteger,
   validateString,
   validateUint32,

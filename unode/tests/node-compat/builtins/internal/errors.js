@@ -58,12 +58,42 @@ class ERR_INVALID_ARG_TYPE extends TypeError {
   }
 }
 
+class ERR_OUT_OF_RANGE extends RangeError {
+  constructor(name, range, actual) {
+    super(`The value of "${name}" is out of range. It must be ${range}. Received ${String(actual)}`);
+    this.code = 'ERR_OUT_OF_RANGE';
+  }
+}
+
+class ERR_SYSTEM_ERROR extends Error {
+  constructor(info) {
+    const ctx = info || {};
+    const syscall = ctx.syscall || 'unknown';
+    const code = ctx.code || 'UNKNOWN';
+    const message = ctx.message || 'unknown error';
+    super(`A system error occurred: ${syscall} returned ${code} (${message})`);
+    this.name = 'SystemError';
+    this.code = 'ERR_SYSTEM_ERROR';
+    this.info = ctx;
+    if (ctx.errno !== undefined) this.errno = ctx.errno;
+    if (ctx.syscall !== undefined) this.syscall = ctx.syscall;
+  }
+}
+ERR_SYSTEM_ERROR.HideStackFramesError = ERR_SYSTEM_ERROR;
+
+function hideStackFrames(fn) {
+  return fn;
+}
+
 module.exports = {
   AbortError,
+  hideStackFrames,
   codes: {
     ERR_INVALID_ARG_VALUE,
     ERR_INVALID_CURSOR_POS,
     ERR_USE_AFTER_CLOSE,
     ERR_INVALID_ARG_TYPE,
+    ERR_OUT_OF_RANGE,
+    ERR_SYSTEM_ERROR,
   },
 };
