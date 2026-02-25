@@ -19,6 +19,9 @@ NAPI_EXTERN napi_status napi_v8_wrap_existing_value(napi_env env,
                                                     v8::Local<v8::Value> value,
                                                     napi_value* result);
 
+// Unofficial/test-only helper. Requests a full GC cycle for testing.
+NAPI_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
+
 #ifdef __cplusplus
 }
 #endif
