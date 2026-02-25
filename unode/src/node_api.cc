@@ -119,28 +119,20 @@ napi_status UnodeInstallConsole(napi_env env) {
     return (status == napi_ok) ? napi_generic_failure : status;
   }
 
+  napi_value console_obj = nullptr;
   bool has_console = false;
   status = napi_has_named_property(env, global, "console", &has_console);
-  if (status != napi_ok) {
-    return status;
-  }
+  if (status != napi_ok) return status;
   if (has_console) {
-    napi_value console_value = nullptr;
-    status = napi_get_named_property(env, global, "console", &console_value);
-    if (status != napi_ok) {
-      return status;
+    status = napi_get_named_property(env, global, "console", &console_obj);
+    if (status != napi_ok || console_obj == nullptr) {
+      return (status == napi_ok) ? napi_generic_failure : status;
     }
-    bool has_log = false;
-    status = napi_has_named_property(env, console_value, "log", &has_log);
-    if (status == napi_ok && has_log) {
-      return napi_ok;
+  } else {
+    status = napi_create_object(env, &console_obj);
+    if (status != napi_ok || console_obj == nullptr) {
+      return (status == napi_ok) ? napi_generic_failure : status;
     }
-  }
-
-  napi_value console_obj = nullptr;
-  status = napi_create_object(env, &console_obj);
-  if (status != napi_ok || console_obj == nullptr) {
-    return (status == napi_ok) ? napi_generic_failure : status;
   }
   napi_value log_fn = nullptr;
   status = napi_create_function(env, "log", NAPI_AUTO_LENGTH, ConsoleLogCallback, nullptr, &log_fn);

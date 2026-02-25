@@ -41,7 +41,8 @@ cmake \
   -S "${PROJECT_DIR}" \
   -B "${BUILD_DIR}" \
   -DUNODE_V8_MONOLITH_LIB="${NAPI_V8_V8_LIBRARY}" \
-  -DUNODE_V8_EXTRA_LIBS="${NAPI_V8_V8_EXTRA_LIBS:-}"
+  -DUNODE_V8_EXTRA_LIBS="${NAPI_V8_V8_EXTRA_LIBS:-}" \
+  -DUNODE_BUILD_CLI=OFF
 
 cmake --build "${BUILD_DIR}" -j4
 ctest --test-dir "${BUILD_DIR}" --output-on-failure

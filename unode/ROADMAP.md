@@ -9,6 +9,9 @@ criteria.
 - Keep divergence minimal and documented.
 - The only intended source adaptation is replacing direct V8 API usage with
   N-API usage.
+- Hard enforcement: `unode/src` must not include V8 headers (`v8.h`,
+  `libplatform/libplatform.h`) and must not use `v8::` symbols.
+- Any required V8 host/bootstrap code must live outside `unode/src`.
 
 ## Phase 0 - Project Bootstrap
 

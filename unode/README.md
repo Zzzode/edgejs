@@ -18,6 +18,10 @@ paths, `unode` system bindings should be implemented through `napi-v8` APIs.
 - Only exception: any source path using direct V8 APIs should be adapted to use
   N-API APIs instead.
 - Prefer compatibility shims and adapter layers over rewriting upstream logic.
+- Hard boundary: files under `unode/src` must never include V8 headers
+  (`v8.h`, `libplatform/libplatform.h`) or use `v8::` symbols.
+- Host/bootstrap code that requires V8 must live outside `unode/src` (for
+  example, under `napi-v8`), while `unode/src` remains N-API/Node-API only.
 
 ## Non-Goals (for early phases)
 
