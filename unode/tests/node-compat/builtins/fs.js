@@ -1124,9 +1124,7 @@ function fsyncSync(fd) {
 function mkdtempSync(prefix, options) {
   options = getOptions(options, { encoding: 'utf8' });
   prefix = getValidatedPath(prefix, 'prefix');
-  const suffix = 'XXXXXX';
-  let template = String(prefix).endsWith(suffix) ? prefix : prefix.replace(/X+$/, '') + suffix;
-  return binding.mkdtemp(template);
+  return binding.mkdtemp(prefix);
 }
 
 function mkdtemp(prefix, options, callback) {
@@ -1137,11 +1135,9 @@ function mkdtemp(prefix, options, callback) {
   callback = makeCallback(callback);
   options = getOptions(options, { encoding: 'utf8' });
   prefix = getValidatedPath(prefix, 'prefix');
-  const suffix = 'XXXXXX';
-  let template = String(prefix).endsWith(suffix) ? prefix : prefix.replace(/X+$/, '') + suffix;
   setImmediateOrSync(() => {
     try {
-      const path = binding.mkdtemp(template);
+      const path = binding.mkdtemp(prefix);
       callback(null, path);
     } catch (e) {
       callback(e);

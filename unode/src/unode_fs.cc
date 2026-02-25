@@ -1295,12 +1295,8 @@ napi_value BindingMkdtemp(napi_env env, napi_callback_info info) {
   }
   std::string tmpl = PathFromValue(env, argv[0]);
   if (tmpl.empty()) return nullptr;
-  // Ensure template ends with exactly 6 X's so result basename length matches (e.g. Node test).
-  const char* suffix = "XXXXXX";
-  const size_t suffix_len = 6;
-  while (tmpl.size() > suffix_len && tmpl.back() == 'X') {
-    tmpl.pop_back();
-  }
+  // Match Node: append exactly 6 X's (no stripping). Template = prefix + "XXXXXX".
+  static constexpr const char suffix[] = "XXXXXX";
   tmpl.append(suffix);
   uv_fs_t req;
   int err = uv_fs_mkdtemp(nullptr, &req, tmpl.c_str(), nullptr);
