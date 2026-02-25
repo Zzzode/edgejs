@@ -29,6 +29,11 @@ struct napi_threadsafe_function__ {
   std::atomic<bool> finalized{false};
 };
 
+struct napi_env_cleanup_hook__ {
+  napi_cleanup_hook hook = nullptr;
+  void* arg = nullptr;
+};
+
 struct napi_deferred__ {
   napi_env env = nullptr;
   v8::Global<v8::Promise::Resolver> resolver;
@@ -144,6 +149,20 @@ inline bool CallbackInfoOwnsValue(const napi_callback_info__* cbinfo, napi_value
 
 inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
+}
+
+void RunEnvCleanupHooks(napi_env env) {
+  if (!CheckEnv(env)) return;
+  for (auto it = env->env_cleanup_hooks.rbegin(); it != env->env_cleanup_hooks.rend(); ++it) {
+    auto* entry = static_cast<napi_env_cleanup_hook__*>(*it);
+    if (entry != nullptr && entry->hook != nullptr) {
+      entry->hook(entry->arg);
+    }
+  }
+  for (void* raw : env->env_cleanup_hooks) {
+    delete static_cast<napi_env_cleanup_hook__*>(raw);
+  }
+  env->env_cleanup_hooks.clear();
 }
 
 void RemoveBufferRecord(napi_env env, napi_buffer_record* record) {
@@ -443,9 +462,7 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 }
 
 napi_env__::~napi_env__() {
-  if (node_api_cleanup_runner != nullptr) {
-    node_api_cleanup_runner(this);
-  }
+  RunEnvCleanupHooks(this);
   napi_v8_finalize_buffer_records(this);
 
   for (auto* raw_record : wrap_finalizers) {
@@ -2762,6 +2779,36 @@ napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
   env->last_exception.Reset(env->isolate, napi_v8_unwrap_value(err));
   env->isolate->ThrowException(napi_v8_unwrap_value(err));
   return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
+                                                 napi_cleanup_hook fun,
+                                                 void* arg) {
+  auto* napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv) || fun == nullptr) return napi_invalid_arg;
+  auto* entry = new (std::nothrow) napi_env_cleanup_hook__();
+  if (entry == nullptr) return napi_generic_failure;
+  entry->hook = fun;
+  entry->arg = arg;
+  napiEnv->env_cleanup_hooks.push_back(entry);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_remove_env_cleanup_hook(node_api_basic_env env,
+                                                    napi_cleanup_hook fun,
+                                                    void* arg) {
+  auto* napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv) || fun == nullptr) return napi_invalid_arg;
+  auto& hooks = napiEnv->env_cleanup_hooks;
+  for (auto it = hooks.begin(); it != hooks.end(); ++it) {
+    auto* entry = static_cast<napi_env_cleanup_hook__*>(*it);
+    if (entry != nullptr && entry->hook == fun && entry->arg == arg) {
+      delete entry;
+      hooks.erase(it);
+      return napi_ok;
+    }
+  }
+  return napi_invalid_arg;
 }
 
 napi_status NAPI_CDECL napi_create_buffer(napi_env env,
