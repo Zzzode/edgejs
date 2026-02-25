@@ -5,7 +5,6 @@
 
 #include <gtest/gtest.h>
 
-#include "../../src/unode_node_api.h"
 #include "napi_v8_unofficial_testing.h"
 
 class V8Runtime {
