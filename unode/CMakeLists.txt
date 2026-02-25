@@ -67,10 +67,24 @@ target_link_libraries(unode_runtime
     unode_node_api
 )
 
+add_library(unode_cli STATIC
+  src/unode_cli.cc
+)
+target_include_directories(unode_cli
+  PUBLIC
+    "${UNODE_ROOT}/src"
+  PRIVATE
+    "${NAPI_V8_ROOT}/include"
+)
+target_link_libraries(unode_cli
+  PUBLIC
+    unode_runtime
+)
+
 option(UNODE_BUILD_CLI "Build unode CLI binary" ON)
 if(UNODE_BUILD_CLI)
   add_executable(unode
-    "${NAPI_V8_ROOT}/src/unode_host_main.cc"
+    "${UNODE_ROOT}/src/unode_main.cc"
   )
   target_include_directories(unode
     PRIVATE
@@ -79,8 +93,7 @@ if(UNODE_BUILD_CLI)
   )
   target_link_libraries(unode
     PRIVATE
-      unode_runtime
-      napi_v8
+      unode_cli
   )
   if(NAPI_V8_V8_DEFINES)
     target_compile_definitions(unode PRIVATE ${NAPI_V8_V8_DEFINES})

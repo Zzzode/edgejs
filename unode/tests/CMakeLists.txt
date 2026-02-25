@@ -33,6 +33,7 @@ if(NAPI_V8_V8_LIBRARY)
         napi_v8
         unode_node_api
         unode_runtime
+        unode_cli
     )
     target_compile_definitions(${target_name}
       PRIVATE
@@ -51,6 +52,9 @@ if(NAPI_V8_V8_LIBRARY)
 
   add_unode_node_api_test(unode_test_0_runtime_phase01
     "${UNODE_ROOT}/tests/runners/test_0_runtime_phase01.cc"
+  )
+  add_unode_node_api_test(unode_test_1_cli_phase01
+    "${UNODE_ROOT}/tests/runners/test_1_cli_phase01.cc"
   )
 else()
   message(STATUS "Skipping unode node-api tests: set NAPI_V8_V8_LIBRARY for napi-v8 runtime linkage")

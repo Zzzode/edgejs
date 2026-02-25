@@ -40,7 +40,7 @@ echo "Using V8 defines: ${NAPI_V8_V8_DEFINES}"
 cmake \
   -S "${PROJECT_DIR}" \
   -B "${BUILD_DIR}" \
-  -DUNODE_BUILD_CLI=OFF
+  -DUNODE_BUILD_CLI=ON
 
 cmake --build "${BUILD_DIR}" -j4
 ctest --test-dir "${BUILD_DIR}" --output-on-failure
