@@ -1,6 +1,7 @@
 #include "internal/napi_v8_env.h"
 #include "node_api.h"
 #include "node_api_types.h"
+#include "unode_node_api.h"
 
 #include <atomic>
 #include <iostream>
@@ -88,6 +89,20 @@ napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   return undefined;
 }
 
+// Installs a JS-callable bridge that triggers GC for upstream tests.
+napi_value ForceGcCallback(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (!CheckEnv(env)) {
+    napi_throw_error(env, nullptr, "Invalid environment");
+    return nullptr;
+  }
+  env->isolate->LowMemoryNotification();
+  env->isolate->PerformMicrotaskCheckpoint();
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 void RunNodeApiCleanupHooks(napi_env env) {
   napi_v8_run_async_cleanup_hooks(env);
   napi_v8_run_env_cleanup_hooks(env);
@@ -144,6 +159,41 @@ napi_status UnodeInstallConsole(napi_env env) {
     return status;
   }
   return napi_set_named_property(env, global, "console", console_obj);
+}
+
+napi_status UnodeInstallForceGc(napi_env env) {
+  if (!CheckEnv(env)) {
+    return napi_invalid_arg;
+  }
+  napi_value global = nullptr;
+  napi_status status = napi_get_global(env, &global);
+  if (status != napi_ok || global == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value gc_fn = nullptr;
+  status = napi_create_function(
+      env, "__napi_force_gc", NAPI_AUTO_LENGTH, ForceGcCallback, nullptr, &gc_fn);
+  if (status != napi_ok || gc_fn == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  return napi_set_named_property(env, global, "__napi_force_gc", gc_fn);
+}
+
+napi_status UnodePerformMicrotaskCheckpoint(napi_env env) {
+  if (!CheckEnv(env)) {
+    return napi_invalid_arg;
+  }
+  env->isolate->PerformMicrotaskCheckpoint();
+  return napi_ok;
+}
+
+napi_status UnodeForceGc(napi_env env) {
+  if (!CheckEnv(env)) {
+    return napi_invalid_arg;
+  }
+  env->isolate->LowMemoryNotification();
+  env->isolate->PerformMicrotaskCheckpoint();
+  return napi_ok;
 }
 
 void napi_v8_run_async_cleanup_hooks(napi_env env) {

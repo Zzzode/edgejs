@@ -4,9 +4,10 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <vector>
 
 #include "test_env.h"
+#include "../../src/unode_node_api.h"
+#include "../../src/unode_runtime.h"
 
 inline std::string ReadTextFile(const std::string& path) {
   std::ifstream in(path);
@@ -15,48 +16,13 @@ inline std::string ReadTextFile(const std::string& path) {
   return ss.str();
 }
 
-inline static std::string NapiValueExceptionToString(napi_env env, napi_value exception) {
-  if (exception == nullptr) return "";
-  napi_value exception_string = nullptr;
-  if (napi_coerce_to_string(env, exception, &exception_string) != napi_ok || exception_string == nullptr) {
-    return "";
-  }
-  size_t length = 0;
-  if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) != napi_ok) {
-    return "";
-  }
-  std::vector<char> buffer(length + 1, '\0');
-  size_t copied = 0;
-  if (napi_get_value_string_utf8(env, exception_string, buffer.data(), buffer.size(), &copied) != napi_ok) {
-    return "";
-  }
-  return std::string(buffer.data(), copied);
-}
-
 inline bool RunScript(EnvScope& s, const std::string& source_text, const char* label) {
-  napi_value script = nullptr;
-  if (napi_create_string_utf8(s.env, source_text.c_str(), NAPI_AUTO_LENGTH, &script) != napi_ok) {
+  std::string error;
+  if (UnodeRunScriptSource(s.env, source_text.c_str(), &error) != 0) {
+    ADD_FAILURE() << "JS exception (" << label << "): " << (error.empty() ? "<empty>" : error);
     return false;
   }
-  napi_value result = nullptr;
-  napi_status status = napi_run_script(s.env, script, &result);
-  if (status == napi_ok) {
-    s.isolate->PerformMicrotaskCheckpoint();
-    return true;
-  }
-  napi_value exception = nullptr;
-  if (napi_get_and_clear_last_exception(s.env, &exception) == napi_ok && exception != nullptr) {
-    std::string msg = NapiValueExceptionToString(s.env, exception);
-    ADD_FAILURE() << "JS exception (" << label << "): " << (msg.empty() ? "<empty>" : msg);
-  }
-  return false;
-}
-
-inline void ForceGcCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
-  v8::Isolate* isolate = info.GetIsolate();
-  isolate->LowMemoryNotification();
-  isolate->PerformMicrotaskCheckpoint();
-  info.GetReturnValue().Set(v8::Undefined(isolate));
+  return true;
 }
 
 inline bool InstallUpstreamJsShim(EnvScope& s, napi_value addon_exports) {
@@ -65,11 +31,7 @@ inline bool InstallUpstreamJsShim(EnvScope& s, napi_value addon_exports) {
   if (napi_set_named_property(s.env, global, "__napi_test_addon", addon_exports) != napi_ok) {
     return false;
   }
-  v8::Local<v8::Function> gc_fn;
-  if (!v8::Function::New(s.context, ForceGcCallback).ToLocal(&gc_fn)) return false;
-  if (!s.context->Global()
-           ->Set(s.context, v8::String::NewFromUtf8Literal(s.isolate, "__napi_force_gc"), gc_fn)
-           .FromMaybe(false)) {
+  if (UnodeInstallForceGc(s.env) != napi_ok) {
     return false;
   }
 

@@ -2714,6 +2714,8 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
     }
     return napi_generic_failure;
   }
+  // Match host behavior expected by tests: flush queued microtasks after script execution.
+  env->isolate->PerformMicrotaskCheckpoint();
   *result = napi_v8_wrap_value(env, out);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
