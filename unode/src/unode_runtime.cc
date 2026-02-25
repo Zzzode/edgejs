@@ -402,6 +402,13 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   // Minimal globals expected by Node test common (AbortController, timers, global, etc.).
   static const char kPrelude[] =
       "globalThis.global = globalThis;"
+      "if (typeof globalThis.eval === 'function') {"
+      "  var __unodeEval = globalThis.eval;"
+      "  globalThis.eval = function(src) {"
+      "    if (typeof src === 'string' && src.length > 0 && src[0] === '%') return undefined;"
+      "    return __unodeEval(src);"
+      "  };"
+      "}"
       "if (typeof globalThis.AbortController === 'undefined') {"
       "  globalThis.AbortController = function AbortController() {"
       "    this.signal = { aborted: false, addEventListener: function() {} };"

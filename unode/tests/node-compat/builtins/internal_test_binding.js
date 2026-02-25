@@ -12,6 +12,16 @@ function internalBinding(name) {
       UV_EEXIST,
     };
   }
+  if (name === 'os') {
+    return globalThis.__unode_os || {};
+  }
+  if (name === 'debug') {
+    return {
+      getV8FastApiCallCount() {
+        return 0;
+      },
+    };
+  }
   return {};
 }
 

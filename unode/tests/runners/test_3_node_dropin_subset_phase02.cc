@@ -428,6 +428,70 @@ TEST_F(Test3NodeDropinSubsetPhase02, RawFsUtimesFromNodeTest) {
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }
 
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsEolFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os-eol.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsProcessPriorityFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os-process-priority.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsCheckedFunctionFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os-checked-function.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsFastFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os-fast.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsHomedirNoEnvvarFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os-homedir-no-envvar.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsUserInfoHandlesGetterErrorsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os-userinfo-handles-getter-errors.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawOsConstantsSignalsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-os-constants-signals.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
 TEST_F(Test3NodeDropinSubsetPhase02, RawPathFromNodeTest) {
   EnvScope s(runtime_.get());
   std::string error;
