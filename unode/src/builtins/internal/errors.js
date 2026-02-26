@@ -12,8 +12,10 @@ class AbortError extends Error {
 }
 
 class ERR_INVALID_ARG_VALUE extends TypeError {
-  constructor(name, value) {
-    super(`The argument '${name}' is invalid. Received ${String(value)}`);
+  constructor(name, value, reason = 'is invalid') {
+    const formatted = typeof value === 'string' ? `'${value}'` : String(value);
+    const label = String(name).includes('.') ? 'property' : 'argument';
+    super(`The ${label} '${name}' ${reason}. Received ${formatted}`);
     this.code = 'ERR_INVALID_ARG_VALUE';
   }
 }
@@ -77,6 +79,11 @@ class ERR_INVALID_ARG_TYPE extends TypeError {
         }
         if (parts.every((p) => /^[A-Z]/.test(p))) {
           return `an instance of ${joinWithOr(parts)}`;
+        }
+        if (classParts.length === 0 && typeParts.length >= 2) {
+          const [first, ...rest] = typeParts;
+          if (rest.length === 1) return `of type ${first} or ${rest[0]}`;
+          return `of type ${first} or one of ${rest.slice(0, -1).join(', ')} or ${rest[rest.length - 1]}`;
         }
         return `one of type ${parts.slice(0, -1).join(', ')} or ${parts[parts.length - 1]}`;
       }
@@ -163,7 +170,19 @@ class ERR_INVALID_BUFFER_SIZE extends RangeError {
 
 class ERR_MISSING_ARGS extends TypeError {
   constructor(...args) {
-    super(`The "${args.join('" and "')}" arguments must be specified`);
+    let names = '';
+    if (args.length === 1 && Array.isArray(args[0])) {
+      names = args[0].map((a) => `"${a}"`).join(' or ');
+    } else if (args.length === 1) {
+      names = `"${args[0]}"`;
+    } else if (args.length === 2) {
+      names = `"${args[0]}" and "${args[1]}"`;
+    } else {
+      names = args.slice(0, -1).map((a) => `"${a}"`).join(', ');
+      names += `, and "${args[args.length - 1]}"`;
+    }
+    const noun = args.length === 1 ? 'argument' : 'arguments';
+    super(`The ${names} ${noun} must be specified`);
     this.code = 'ERR_MISSING_ARGS';
   }
 }
@@ -287,6 +306,320 @@ class ERR_STREAM_NULL_VALUES extends TypeError {
   }
 }
 
+function mapDnsCode(code) {
+  if (typeof code === 'string') return code;
+  if (code === -3001) return 'EAI_MEMORY';
+  if (code === -2) return 'ENOENT';
+  if (code === -78) return 'ENOTFOUND';
+  if (code === -12) return 'ENOMEM';
+  if (code === -89) return 'ECANCELLED';
+  if (code === -60 || code === -110) return 'ETIMEOUT';
+  return String(code);
+}
+
+function DNSException(code, syscall, hostname) {
+  const errCode = mapDnsCode(code);
+  const hostPart = hostname ? ` ${hostname}` : '';
+  const err = new Error(`${syscall} ${errCode}${hostPart}`);
+  if (typeof Error.captureStackTrace === 'function') {
+    Error.captureStackTrace(err, DNSException);
+  }
+  if (typeof err.stack === 'string') {
+    const lines = err.stack.split('\n');
+    if (lines.length > 1) lines[1] = '    at Object.<anonymous> (<anonymous>)';
+    err.stack = lines.join('\n');
+  }
+  err.code = errCode;
+  err.errno = errCode;
+  err.syscall = syscall;
+  if (hostname !== undefined) err.hostname = hostname;
+  return err;
+}
+
+class ERR_DNS_SET_SERVERS_FAILED extends Error {
+  constructor(message, servers) {
+    super(`c-ares failed to set servers: "${message}" [${servers}]`);
+    this.code = 'ERR_DNS_SET_SERVERS_FAILED';
+  }
+}
+
+class ERR_INVALID_IP_ADDRESS extends TypeError {
+  constructor(address) {
+    super(`Invalid IP address: ${address}`);
+    this.code = 'ERR_INVALID_IP_ADDRESS';
+  }
+}
+
+class ERR_SOCKET_BAD_PORT extends RangeError {
+  constructor(name, port, allowZero = true) {
+    const op = allowZero ? '>=' : '>';
+    super(`${name} should be ${op} 0 and < 65536. Received ${String(port)}`);
+    this.code = 'ERR_SOCKET_BAD_PORT';
+  }
+}
+
+class ERR_INVALID_ADDRESS_FAMILY extends RangeError {
+  constructor(addressType, host, port) {
+    super(`Invalid address family: ${addressType} ${host}:${port}`);
+    this.code = 'ERR_INVALID_ADDRESS_FAMILY';
+    this.host = host;
+    this.port = port;
+  }
+}
+
+class ERR_IP_BLOCKED extends Error {
+  constructor(ip) {
+    super(`IP(${ip}) is blocked by net.BlockList`);
+    this.code = 'ERR_IP_BLOCKED';
+  }
+}
+
+class ERR_SERVER_ALREADY_LISTEN extends Error {
+  constructor() {
+    super('Listen method has been called more than once without closing.');
+    this.code = 'ERR_SERVER_ALREADY_LISTEN';
+  }
+}
+
+class ERR_SOCKET_CLOSED extends Error {
+  constructor() {
+    super('Socket is closed');
+    this.code = 'ERR_SOCKET_CLOSED';
+  }
+}
+
+class ERR_SOCKET_CLOSED_BEFORE_CONNECTION extends Error {
+  constructor() {
+    super('Socket closed before the connection was established');
+    this.code = 'ERR_SOCKET_CLOSED_BEFORE_CONNECTION';
+  }
+}
+
+class NodeAggregateError extends AggregateError {
+  constructor(errors, message, code = undefined) {
+    super(errors, message);
+    this.code = code;
+  }
+}
+
+class ErrnoException extends Error {
+  constructor(err, syscall, original) {
+    let code = 'UNKNOWN';
+    if (typeof process?.binding === 'function') {
+      try {
+        code = process.binding('uv').errname(err);
+      } catch {}
+    }
+    if (code === 'UNKNOWN' && typeof err === 'number') {
+      if (err === -22) code = 'EINVAL';
+      if (err === -17) code = 'EEXIST';
+      if (err === -98) code = 'EADDRINUSE';
+      if (err === -111) code = 'ECONNREFUSED';
+      if (err === -9) code = 'EBADF';
+    }
+    super(original ? `${syscall} ${code} ${original}` : `${syscall} ${code}`);
+    this.errno = err;
+    this.code = code;
+    this.syscall = syscall;
+  }
+}
+
+class ExceptionWithHostPort extends Error {
+  constructor(err, syscall, address, port, additional) {
+    let code = 'UNKNOWN';
+    if (typeof process?.binding === 'function') {
+      try {
+        code = process.binding('uv').errname(err);
+      } catch {}
+    }
+    if (code === 'UNKNOWN' && err === -17) code = 'EEXIST';
+    let details = '';
+    if (port && port > 0) details = ` ${address}:${port}`;
+    else if (address) details = ` ${address}`;
+    if (additional) details += ` - Local (${additional})`;
+    super(`${syscall} ${code}${details}`);
+    this.errno = err;
+    this.code = code;
+    this.syscall = syscall;
+    this.address = address;
+    if (port) this.port = port;
+  }
+}
+
+class ERR_SOCKET_ALREADY_BOUND extends Error {
+  constructor() {
+    super('Socket is already bound');
+    this.code = 'ERR_SOCKET_ALREADY_BOUND';
+  }
+}
+
+class ERR_SOCKET_BAD_BUFFER_SIZE extends TypeError {
+  constructor() {
+    super('Buffer size must be a positive integer');
+    this.code = 'ERR_SOCKET_BAD_BUFFER_SIZE';
+  }
+}
+
+class ERR_SOCKET_BUFFER_SIZE extends Error {
+  constructor(ctx) {
+    const code = (ctx && ctx.code) || 'UNKNOWN';
+    const syscall = (ctx && ctx.syscall) || 'uv_buffer_size';
+    const message = (ctx && ctx.message) || 'unknown error';
+    super(`Could not get or set buffer size: ${syscall} returned ${code} (${message})`);
+    this.name = 'SystemError';
+    this.code = 'ERR_SOCKET_BUFFER_SIZE';
+    this.info = ctx && typeof ctx === 'object' ? ctx : {};
+    let errnoValue = this.info.errno;
+    let syscallValue = this.info.syscall ?? syscall;
+    Object.defineProperty(this, 'errno', {
+      __proto__: null,
+      configurable: true,
+      enumerable: true,
+      get() { return errnoValue; },
+      set(v) { errnoValue = v; },
+    });
+    Object.defineProperty(this, 'syscall', {
+      __proto__: null,
+      configurable: true,
+      enumerable: true,
+      get() { return syscallValue; },
+      set(v) { syscallValue = v; },
+    });
+    const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
+    this[inspectSymbol] = () => (
+      `SystemError [ERR_SOCKET_BUFFER_SIZE]: ${this.message}\n` +
+      "  code: 'ERR_SOCKET_BUFFER_SIZE',\n" +
+      '  info: {\n' +
+      `    errno: ${this.info.errno},\n` +
+      `    code: '${this.info.code}',\n` +
+      `    message: '${this.info.message}',\n` +
+      `    syscall: '${this.info.syscall}'\n` +
+      '  },\n' +
+      `  errno: [Getter/Setter: ${this.errno}],\n` +
+      `  syscall: [Getter/Setter: '${this.syscall}']\n` +
+      '}'
+    );
+  }
+
+}
+
+class ERR_SOCKET_BAD_TYPE extends TypeError {
+  constructor() {
+    super('Bad socket type specified. Valid types are: udp4, udp6');
+    this.code = 'ERR_SOCKET_BAD_TYPE';
+  }
+}
+
+class ERR_INVALID_FD_TYPE extends TypeError {
+  constructor(type) {
+    super(`Unsupported fd type: ${type}`);
+    this.code = 'ERR_INVALID_FD_TYPE';
+  }
+}
+
+class ERR_SOCKET_DGRAM_IS_CONNECTED extends Error {
+  constructor() {
+    super('Already connected');
+    this.code = 'ERR_SOCKET_DGRAM_IS_CONNECTED';
+  }
+}
+
+class ERR_SOCKET_DGRAM_NOT_CONNECTED extends Error {
+  constructor() {
+    super('Not connected');
+    this.code = 'ERR_SOCKET_DGRAM_NOT_CONNECTED';
+  }
+}
+
+class ERR_SOCKET_DGRAM_NOT_RUNNING extends Error {
+  constructor() {
+    super('Not running');
+    this.code = 'ERR_SOCKET_DGRAM_NOT_RUNNING';
+  }
+}
+
+class ERR_UNESCAPED_CHARACTERS extends TypeError {
+  constructor(field = 'Request path') {
+    super(`${field} contains unescaped characters`);
+    this.code = 'ERR_UNESCAPED_CHARACTERS';
+  }
+}
+
+class ERR_INVALID_PROTOCOL extends TypeError {
+  constructor(protocol, expected) {
+    super(`Protocol "${protocol}" not supported. Expected "${expected}"`);
+    this.code = 'ERR_INVALID_PROTOCOL';
+  }
+}
+
+class ERR_INVALID_HTTP_TOKEN extends TypeError {
+  constructor(name, value) {
+    super(`${name} must be a valid HTTP token ["${String(value)}"]`);
+    this.code = 'ERR_INVALID_HTTP_TOKEN';
+  }
+}
+ERR_INVALID_HTTP_TOKEN.HideStackFramesError = ERR_INVALID_HTTP_TOKEN;
+
+class ERR_HTTP_INVALID_HEADER_VALUE extends TypeError {
+  constructor(value, name) {
+    super(`Invalid value "${String(value)}" for header "${String(name)}"`);
+    this.code = 'ERR_HTTP_INVALID_HEADER_VALUE';
+  }
+}
+ERR_HTTP_INVALID_HEADER_VALUE.HideStackFramesError = ERR_HTTP_INVALID_HEADER_VALUE;
+
+class ERR_INVALID_CHAR extends TypeError {
+  constructor(field, value) {
+    super(`Invalid character in ${field || 'content'} ["${String(value)}"]`);
+    this.code = 'ERR_INVALID_CHAR';
+  }
+}
+ERR_INVALID_CHAR.HideStackFramesError = ERR_INVALID_CHAR;
+
+class ERR_METHOD_NOT_IMPLEMENTED extends Error {
+  constructor(name) {
+    super(`The ${name} method is not implemented`);
+    this.code = 'ERR_METHOD_NOT_IMPLEMENTED';
+  }
+}
+ERR_METHOD_NOT_IMPLEMENTED.HideStackFramesError = ERR_METHOD_NOT_IMPLEMENTED;
+
+class ERR_HTTP_BODY_NOT_ALLOWED extends Error {
+  constructor() {
+    super('Adding content for this request method or response status is not allowed.');
+    this.code = 'ERR_HTTP_BODY_NOT_ALLOWED';
+  }
+}
+ERR_HTTP_BODY_NOT_ALLOWED.HideStackFramesError = ERR_HTTP_BODY_NOT_ALLOWED;
+
+class ERR_HTTP_CONTENT_LENGTH_MISMATCH extends Error {
+  constructor(actual, expected) {
+    super(`Response body's content-length of ${actual} byte(s) does not match the content-length of ${expected} byte(s) set in header`);
+    this.code = 'ERR_HTTP_CONTENT_LENGTH_MISMATCH';
+  }
+}
+ERR_HTTP_CONTENT_LENGTH_MISMATCH.HideStackFramesError = ERR_HTTP_CONTENT_LENGTH_MISMATCH;
+
+class ERR_HTTP_HEADERS_SENT extends Error {
+  constructor(verb = 'set') {
+    super(`Cannot ${verb} headers after they are sent to the client`);
+    this.code = 'ERR_HTTP_HEADERS_SENT';
+  }
+}
+
+class ERR_HTTP_SOCKET_ASSIGNED extends Error {
+  constructor() {
+    super('ServerResponse has an already assigned socket');
+    this.code = 'ERR_HTTP_SOCKET_ASSIGNED';
+  }
+}
+
+ERR_INVALID_ARG_TYPE.HideStackFramesError = ERR_INVALID_ARG_TYPE;
+ERR_INVALID_ARG_VALUE.HideStackFramesError = ERR_INVALID_ARG_VALUE;
+ERR_OUT_OF_RANGE.HideStackFramesError = ERR_OUT_OF_RANGE;
+ERR_STREAM_NULL_VALUES.HideStackFramesError = ERR_STREAM_NULL_VALUES;
+ERR_STREAM_WRITE_AFTER_END.HideStackFramesError = ERR_STREAM_WRITE_AFTER_END;
+
 function aggregateTwoErrors(innerError, outerError) {
   if (!innerError) return outerError;
   if (!outerError) return innerError;
@@ -300,6 +633,10 @@ function hideStackFrames(fn) {
   return fn;
 }
 
+function UVExceptionWithHostPort(err, syscall, address, port, additional) {
+  return new ExceptionWithHostPort(err, syscall, address, port, additional);
+}
+
 function genericNodeError(message, errorProperties) {
   const err = new Error(message);
   if (errorProperties && typeof errorProperties === 'object') {
@@ -310,6 +647,11 @@ function genericNodeError(message, errorProperties) {
 
 module.exports = {
   AbortError,
+  DNSException,
+  ErrnoException,
+  ExceptionWithHostPort,
+  UVExceptionWithHostPort,
+  NodeAggregateError,
   hideStackFrames,
   aggregateTwoErrors,
   genericNodeError,
@@ -338,6 +680,32 @@ module.exports = {
     ERR_INVALID_RETURN_VALUE,
     ERR_STREAM_WRITE_AFTER_END,
     ERR_STREAM_NULL_VALUES,
+    ERR_DNS_SET_SERVERS_FAILED,
+    ERR_INVALID_ADDRESS_FAMILY,
+    ERR_INVALID_IP_ADDRESS,
+    ERR_IP_BLOCKED,
+    ERR_SERVER_ALREADY_LISTEN,
+    ERR_SOCKET_BAD_PORT,
+    ERR_SOCKET_ALREADY_BOUND,
+    ERR_SOCKET_BAD_BUFFER_SIZE,
+    ERR_SOCKET_BUFFER_SIZE,
+    ERR_SOCKET_CLOSED,
+    ERR_SOCKET_CLOSED_BEFORE_CONNECTION,
+    ERR_SOCKET_BAD_TYPE,
+    ERR_INVALID_FD_TYPE,
+    ERR_SOCKET_DGRAM_IS_CONNECTED,
+    ERR_SOCKET_DGRAM_NOT_CONNECTED,
+    ERR_SOCKET_DGRAM_NOT_RUNNING,
+    ERR_UNESCAPED_CHARACTERS,
+    ERR_INVALID_PROTOCOL,
+    ERR_INVALID_HTTP_TOKEN,
+    ERR_HTTP_INVALID_HEADER_VALUE,
+    ERR_INVALID_CHAR,
+    ERR_METHOD_NOT_IMPLEMENTED,
+    ERR_HTTP_BODY_NOT_ALLOWED,
+    ERR_HTTP_CONTENT_LENGTH_MISMATCH,
+    ERR_HTTP_HEADERS_SENT,
+    ERR_HTTP_SOCKET_ASSIGNED,
   },
   kEnhanceStackBeforeInspector,
 };

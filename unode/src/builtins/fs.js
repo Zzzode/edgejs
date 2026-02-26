@@ -2,6 +2,7 @@
 
 const binding = globalThis.__unode_fs;
 const encodingBinding = globalThis.__unode_encoding || null;
+let warnedInvalidExistsSyncPath = false;
 if (!binding) {
   throw new Error('fs builtin requires __unode_fs binding');
 }
@@ -84,6 +85,12 @@ function getValidatedPath(path, argName) {
     throw err;
   }
   if (typeof path === 'object' && path && path.href !== undefined) {
+    const protocol = typeof path.protocol === 'string' ? path.protocol : '';
+    if (protocol && protocol !== 'file:') {
+      const err = new TypeError('The URL must be of scheme file');
+      err.code = 'ERR_INVALID_URL_SCHEME';
+      throw err;
+    }
     path = path.pathname || path.href;
     if (typeof path === 'string' && path.startsWith('file://')) path = path.slice(7) || '/';
   } else if (typeof path === 'object' && path && typeof path.length === 'number' && path.toString && path.constructor && path.constructor.name === 'Buffer') {
@@ -359,6 +366,14 @@ function existsSync(path) {
   try {
     path = getValidatedPath(path);
   } catch {
+    if (!warnedInvalidExistsSyncPath && typeof process?.emitWarning === 'function') {
+      warnedInvalidExistsSyncPath = true;
+      process.emitWarning(
+        'Passing invalid argument types to fs.existsSync is deprecated',
+        'DeprecationWarning',
+        'DEP0187'
+      );
+    }
     return false;
   }
   return binding.existsSync(path);
@@ -370,8 +385,10 @@ function exists(path, callback) {
     err.code = 'ERR_INVALID_ARG_TYPE';
     throw err;
   }
-  const setImmediate = globalThis.setImmediate || function (fn) { fn(); };
-  setImmediate(() => {
+  const schedule = typeof globalThis.queueMicrotask === 'function' ?
+    globalThis.queueMicrotask :
+    (fn) => fn();
+  schedule(() => {
     try {
       path = getValidatedPath(path);
       const ok = binding.existsSync(path);

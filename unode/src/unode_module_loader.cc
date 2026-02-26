@@ -230,6 +230,13 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
   static const fs::path runtime_builtins_dir =
       fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
   fs::path resolved;
+  if (id == "internal/test/binding") {
+    fs::path internal_test_binding = runtime_builtins_dir / "internal_test_binding.js";
+    if (ResolveAsFile(internal_test_binding, &resolved)) {
+      *out = resolved.lexically_normal();
+      return true;
+    }
+  }
   fs::path candidate = runtime_builtins_dir / (id + ".js");
   if (ResolveAsFile(candidate, &resolved)) {
     *out = resolved.lexically_normal();
@@ -481,11 +488,13 @@ bool EvaluateJsModule(napi_env env,
                       napi_value require_fn) {
   const std::string source = ReadTextFile(resolved_path);
   if (source.empty()) {
-    return ThrowLoaderError(env, "Failed to read module source");
+    return ThrowLoaderError(env, ("Failed to read module source: " + resolved_path.string()).c_str());
   }
 
   const std::string wrapped_source =
-      "(function(exports, require, module, __filename, __dirname) {\n" + source + "\n})";
+      "(function(internalBinding, primordials) {"
+      "return function(exports, require, module, __filename, __dirname) {\n" + source + "\n};"
+      "})(globalThis.internalBinding, globalThis.primordials)";
   napi_value script_source = nullptr;
   if (napi_create_string_utf8(env, wrapped_source.c_str(), NAPI_AUTO_LENGTH, &script_source) != napi_ok ||
       script_source == nullptr) {
@@ -505,11 +514,11 @@ bool EvaluateJsModule(napi_env env,
     return ThrowLoaderError(env, "Failed to build module path values");
   }
 
-  napi_value argv[5] = {exports_obj, require_fn, module_obj, filename_value, dirname_value};
   napi_value global = GetGlobal(env);
   if (global == nullptr) {
     return ThrowLoaderError(env, "Failed to fetch global object");
   }
+  napi_value argv[5] = {exports_obj, require_fn, module_obj, filename_value, dirname_value};
   napi_value call_result = nullptr;
   if (napi_call_function(env, global, wrapped_fn, 5, argv, &call_result) != napi_ok) {
     return false;  // Preserve JS exception.

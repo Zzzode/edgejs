@@ -18,12 +18,20 @@ extern char** environ;
 #include "unode_fs.h"
 #include "unode_buffer.h"
 #include "unode_encoding.h"
+#include "unode_http_parser.h"
 #include "unode_module_loader.h"
 #include "unode_os.h"
+#include "unode_pipe_wrap.h"
+#include "unode_stream_wrap.h"
 #include "unode_string_decoder.h"
+#include "unode_tcp_wrap.h"
+#include "unode_udp_wrap.h"
 #include "unode_url.h"
+#include "unode_cares_wrap.h"
 
 namespace {
+
+std::string g_unode_current_script_path;
 
 void CopyProcessEnvironmentToObject(napi_env env, napi_value env_obj) {
   char** env_iter =
@@ -175,6 +183,31 @@ std::string NapiValueToUtf8(napi_env env, napi_value value) {
   return out;
 }
 
+std::string EscapeForSingleQuotedJs(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (char ch : in) {
+    switch (ch) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\'':
+        out += "\\'";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      default:
+        out.push_back(ch);
+        break;
+    }
+  }
+  return out;
+}
+
 const char* DetectPlatform() {
 #if defined(_WIN32)
   return "win32";
@@ -203,6 +236,13 @@ const char* DetectArch() {
 #else
   return "unknown";
 #endif
+}
+
+void ClearPendingExceptionIfAny(napi_env env) {
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return;
+  napi_value ignored = nullptr;
+  napi_get_and_clear_last_exception(env, &ignored);
 }
 
 void MaybeInvokeWriteCallback(napi_env env, napi_value maybe_fn) {
@@ -384,11 +424,29 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
     return 1;
   }
   UnodeInstallFsBinding(env);
+  ClearPendingExceptionIfAny(env);
   UnodeInstallBufferBinding(env);
+  ClearPendingExceptionIfAny(env);
   UnodeInstallOsBinding(env);
+  ClearPendingExceptionIfAny(env);
   UnodeInstallEncodingBinding(env);
+  ClearPendingExceptionIfAny(env);
   UnodeInstallStringDecoderBinding(env);
+  ClearPendingExceptionIfAny(env);
+  UnodeInstallHttpParserBinding(env);
+  ClearPendingExceptionIfAny(env);
+  UnodeInstallStreamWrapBinding(env);
+  ClearPendingExceptionIfAny(env);
+  UnodeInstallTcpWrapBinding(env);
+  ClearPendingExceptionIfAny(env);
+  UnodeInstallPipeWrapBinding(env);
+  ClearPendingExceptionIfAny(env);
+  UnodeInstallCaresWrapBinding(env);
+  ClearPendingExceptionIfAny(env);
+  UnodeInstallUdpWrapBinding(env);
+  ClearPendingExceptionIfAny(env);
   UnodeInstallUrlBinding(env);
+  ClearPendingExceptionIfAny(env);
   status = UnodeInstallModuleLoader(env, entry_script_path);
   if (status != napi_ok) {
     if (error_out != nullptr) {
@@ -449,6 +507,13 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   // Minimal globals expected by Node test common (AbortController, timers, global, etc.).
   static const char kPrelude[] =
       "globalThis.global = globalThis;"
+      "try {"
+      "  var __itb = require('internal/test/binding_runtime');"
+      "  if (__itb && typeof __itb.internalBinding === 'function') globalThis.internalBinding = __itb.internalBinding;"
+      "  if (__itb && __itb.primordials) globalThis.primordials = __itb.primordials;"
+      "  if (typeof internalBinding === 'undefined' && typeof globalThis.internalBinding === 'function') internalBinding = globalThis.internalBinding;"
+      "  if (typeof primordials === 'undefined' && globalThis.primordials) primordials = globalThis.primordials;"
+      "} catch (_) {}"
       "if (typeof globalThis.eval === 'function') {"
       "  var __unodeEval = globalThis.eval;"
       "  globalThis.eval = function(src) {"
@@ -458,35 +523,105 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
       "}"
       "if (typeof globalThis.AbortController === 'undefined') {"
       "  globalThis.AbortController = function AbortController() {"
-      "    this.signal = { aborted: false, addEventListener: function() {} };"
+      "    var listeners = [];"
+      "    this.signal = {"
+      "      aborted: false,"
+      "      addEventListener: function(type, fn) { if (type === 'abort' && typeof fn === 'function') listeners.push(fn); },"
+      "      removeEventListener: function(type, fn) { if (type !== 'abort') return; listeners = listeners.filter(function(l){ return l !== fn; }); }"
+      "    };"
+      "    this.abort = function() {"
+      "      if (this.signal.aborted) return;"
+      "      this.signal.aborted = true;"
+      "      var copy = listeners.slice();"
+      "      listeners.length = 0;"
+      "      for (var i = 0; i < copy.length; i++) { try { copy[i](); } catch (_) {} }"
+      "    };"
       "  };"
       "}"
       "if (typeof globalThis.AbortSignal === 'undefined') {"
-      "  globalThis.AbortSignal = { abort: function() { return { aborted: true }; } };"
+      "  globalThis.AbortSignal = {"
+      "    abort: function() {"
+      "      var c = new globalThis.AbortController();"
+      "      c.abort();"
+      "      return c.signal;"
+      "    }"
+      "  };"
+      "}"
+      "if (typeof globalThis.setTimeout === 'undefined' ||"
+      "    typeof globalThis.clearTimeout === 'undefined' ||"
+      "    typeof globalThis.setInterval === 'undefined' ||"
+      "    typeof globalThis.clearInterval === 'undefined' ||"
+      "    typeof globalThis.setImmediate === 'undefined' ||"
+      "    typeof globalThis.clearImmediate === 'undefined') {"
+      "  try {"
+      "    var __timers = require('timers');"
+      "    if (typeof globalThis.setTimeout === 'undefined') globalThis.setTimeout = __timers.setTimeout;"
+      "    if (typeof globalThis.clearTimeout === 'undefined') globalThis.clearTimeout = __timers.clearTimeout;"
+      "    if (typeof globalThis.setInterval === 'undefined') globalThis.setInterval = __timers.setInterval;"
+      "    if (typeof globalThis.clearInterval === 'undefined') globalThis.clearInterval = __timers.clearInterval;"
+      "    if (typeof globalThis.setImmediate === 'undefined') globalThis.setImmediate = __timers.setImmediate;"
+      "    if (typeof globalThis.clearImmediate === 'undefined') globalThis.clearImmediate = __timers.clearImmediate;"
+      "  } catch (_) {}"
       "}"
       "if (typeof globalThis.setImmediate === 'undefined') {"
       "  globalThis.setImmediate = function(f) {"
       "    var args = Array.prototype.slice.call(arguments, 1);"
       "    if (typeof f === 'function') globalThis.queueMicrotask(function() { f.apply(null, args); });"
+      "    return { unref: function(){ return this; }, ref: function(){ return this; } };"
       "  };"
       "}"
       "if (typeof globalThis.clearImmediate === 'undefined') {"
       "  globalThis.clearImmediate = function() {};"
       "}"
       "if (typeof globalThis.setInterval === 'undefined') {"
-      "  globalThis.setInterval = function() { return 0; };"
+      "  globalThis.setInterval = function() { return { unref: function(){ return this; }, ref: function(){ return this; } }; };"
       "}"
       "if (typeof globalThis.clearInterval === 'undefined') {"
       "  globalThis.clearInterval = function() {};"
       "}"
       "if (typeof globalThis.setTimeout === 'undefined') {"
-      "  globalThis.setTimeout = function(f) { if (typeof f === 'function') f(); return 0; };"
+      "  globalThis.setTimeout = function() { return { unref: function(){ return this; }, ref: function(){ return this; } }; };"
       "}"
       "if (typeof globalThis.clearTimeout === 'undefined') {"
       "  globalThis.clearTimeout = function() {};"
       "}"
       "if (typeof globalThis.queueMicrotask === 'undefined') {"
       "  globalThis.queueMicrotask = function(f) { if (typeof f === 'function') f(); };"
+      "}"
+      "if (globalThis.process) {"
+      "  if (typeof globalThis.process.getuid !== 'function') globalThis.process.getuid = function(){ return 0; };"
+      "  if (!globalThis.process.stdin) {"
+      "    globalThis.process.stdin = { destroy: function(){}, on: function(){ return this; }, once: function(){ return this; } };"
+      "  } else if (typeof globalThis.process.stdin.destroy !== 'function') {"
+      "    globalThis.process.stdin.destroy = function(){};"
+      "  }"
+      "  if (typeof globalThis.process.binding !== 'function') {"
+      "    globalThis.process.binding = function(name) {"
+      "      if (name === 'uv') {"
+      "        return {"
+      "          errname: function(code) {"
+      "            switch (Number(code)) {"
+      "              case -2: return 'ENOENT';"
+      "              case -9: return 'EBADF';"
+      "              case -13: return 'EACCES';"
+      "              case -17: return 'EEXIST';"
+      "              case -22: return 'EINVAL';"
+      "              case -48: return 'EADDRINUSE';"
+      "              case -88: return 'ENOTSOCK';"
+      "              case -98: return 'EADDRINUSE';"
+      "              case -111: return 'ECONNREFUSED';"
+      "              default: return 'UNKNOWN';"
+      "            }"
+      "          }"
+      "        };"
+      "      }"
+      "      if (typeof globalThis.internalBinding === 'function') return globalThis.internalBinding(name);"
+      "      throw new Error('No such module: ' + String(name));"
+      "    };"
+      "  }"
+      "}"
+      "if (typeof globalThis.gc !== 'function') {"
+      "  globalThis.gc = function() {};"
       "}"
       "globalThis.__unode_detached_arraybuffers = globalThis.__unode_detached_arraybuffers || new WeakSet();"
       "var __unode_original_structuredClone = globalThis.structuredClone;"
@@ -507,11 +642,45 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
       "if (typeof globalThis.fetch === 'undefined') {"
       "  globalThis.fetch = function() { return Promise.reject(new Error('fetch not implemented')); };"
       "}"
+      "if (typeof globalThis.WebSocket === 'undefined') {"
+      "  globalThis.WebSocket = function WebSocket() {};"
+      "}"
+      "if (typeof globalThis.CloseEvent === 'undefined') {"
+      "  globalThis.CloseEvent = function CloseEvent() {};"
+      "}"
+      "if (typeof globalThis.MessageEvent === 'undefined') {"
+      "  globalThis.MessageEvent = function MessageEvent() {};"
+      "}"
       "if (typeof globalThis.URL === 'undefined') {"
       "  globalThis.URL = function URL(u) {"
       "    if (!(this instanceof URL)) return new URL(u);"
-      "    this.href = String(u);"
-      "    this.pathname = (u && u.pathname) ? u.pathname : '';"
+      "    var s = String(u);"
+      "    var p = null;"
+      "    try { if (typeof internalBinding === 'function') { var __u = internalBinding('url'); if (__u && typeof __u.parse === 'function') p = __u.parse(s); } } catch (_) {}"
+      "    if (!p || typeof p.protocol !== 'string' || p.protocol.length === 0) {"
+      "      var e = new TypeError('Invalid URL');"
+      "      e.code = 'ERR_INVALID_URL';"
+      "      throw e;"
+      "    }"
+      "    var protocol = String(p.protocol).toLowerCase();"
+      "    var ix = s.indexOf('://');"
+      "    var rest = ix >= 0 ? s.slice(ix + 3) : '';"
+      "    var isFile = protocol === 'file:';"
+      "    if (!isFile && (rest.length === 0 || rest[0] === ':' || rest[0] === '/')) {"
+      "      var e2 = new TypeError('Invalid URL');"
+      "      e2.code = 'ERR_INVALID_URL';"
+      "      throw e2;"
+      "    }"
+      "    Object.defineProperty(this, 'href', { value: s, enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'protocol', { value: protocol, enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'hostname', { value: p.hostname || '', enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'pathname', { value: p.pathname || '/', enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'search', { value: p.search || '', enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'hash', { value: p.hash || '', enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'username', { value: p.username || '', enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'password', { value: p.password || '', enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, 'port', { value: p.port || '', enumerable: false, configurable: true, writable: true });"
+      "    Object.defineProperty(this, Symbol.toStringTag, { value: 'URL', enumerable: false, configurable: true });"
       "  };"
       "}"
       "if (typeof globalThis.Buffer !== 'function') {"
@@ -548,8 +717,17 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
     return 1;
   }
 
+  std::string entry_source;
+  const char* source_to_run = source_text;
+  if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
+    entry_source = "(function(){ return require('" +
+                   EscapeForSingleQuotedJs(entry_script_path) +
+                   "'); })();";
+    source_to_run = entry_source.c_str();
+  }
+
   napi_value script = nullptr;
-  status = napi_create_string_utf8(env, source_text, NAPI_AUTO_LENGTH, &script);
+  status = napi_create_string_utf8(env, source_to_run, NAPI_AUTO_LENGTH, &script);
   if (status != napi_ok || script == nullptr) {
     if (error_out != nullptr) {
       *error_out = "napi_create_string_utf8 failed: " + StatusToString(status);
@@ -724,9 +902,18 @@ napi_status UnodeInstallProcessObject(napi_env env) {
   }
   CopyProcessEnvironmentToObject(env, env_obj);
   napi_value argv_arr = nullptr;
-  status = napi_create_array_with_length(env, 0, &argv_arr);
+  const bool has_script_path = !g_unode_current_script_path.empty();
+  status = napi_create_array_with_length(env, has_script_path ? 2 : 0, &argv_arr);
   if (status != napi_ok || argv_arr == nullptr) {
     return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  if (has_script_path) {
+    napi_value exec_argv0 = nullptr;
+    napi_create_string_utf8(env, "unode", NAPI_AUTO_LENGTH, &exec_argv0);
+    if (exec_argv0 != nullptr) napi_set_element(env, argv_arr, 0, exec_argv0);
+    napi_value script_argv1 = nullptr;
+    napi_create_string_utf8(env, g_unode_current_script_path.c_str(), NAPI_AUTO_LENGTH, &script_argv1);
+    if (script_argv1 != nullptr) napi_set_element(env, argv_arr, 1, script_argv1);
   }
   status = napi_set_named_property(env, process_obj, "argv", argv_arr);
   if (status != napi_ok) {
@@ -929,5 +1116,8 @@ int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error
     }
     return 1;
   }
-  return RunScriptWithGlobals(env, source.c_str(), script_path, error_out);
+  g_unode_current_script_path = script_path;
+  const int rc = RunScriptWithGlobals(env, source.c_str(), script_path, error_out);
+  g_unode_current_script_path.clear();
+  return rc;
 }

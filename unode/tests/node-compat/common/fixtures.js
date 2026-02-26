@@ -1,6 +1,8 @@
 'use strict';
 
 const path = require('path');
+const fs = require('fs');
+const { pathToFileURL } = require('url');
 
 // When running raw Node tests (NODE_TEST_DIR set), use node/test/fixtures so paths match Node.
 const fixturesDir = typeof process !== 'undefined' && process.env && process.env.NODE_TEST_DIR
@@ -9,6 +11,15 @@ const fixturesDir = typeof process !== 'undefined' && process.env && process.env
 
 function fixturesPath(...args) {
   return path.join(fixturesDir, ...args);
+}
+
+function fixturesFileURL(...args) {
+  return pathToFileURL(fixturesPath(...args));
+}
+
+function readFixtureSync(args, enc) {
+  if (Array.isArray(args)) return fs.readFileSync(fixturesPath(...args), enc);
+  return fs.readFileSync(fixturesPath(args), enc);
 }
 
 // Same string as Node test/fixtures/utf8_test_text.txt (used by test-fs-append-file-sync etc.)
@@ -27,7 +38,10 @@ const utf8TestText = '永和九年，嵗在癸丑，暮春之初，會於會稽�
   '所以興懐，其致一也。後之攬者，亦將有感扵斯文。';
 
 module.exports = {
+  fixturesDir,
   path: fixturesPath,
+  fileURL: fixturesFileURL,
+  readSync: readFixtureSync,
   utf8TestText,
   get utf8TestTextPath() {
     return fixturesPath('utf8_test_text.txt');

@@ -5,6 +5,7 @@ const {
     ERR_INVALID_ARG_TYPE,
     ERR_INVALID_ARG_VALUE,
     ERR_OUT_OF_RANGE,
+    ERR_SOCKET_BAD_PORT,
   },
 } = require('internal/errors');
 
@@ -32,12 +33,18 @@ function validateUint32(value, name, positive) {
     throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
   }
   if (value < 0 || value > 0xFFFFFFFF || (positive && value === 0)) {
-    throw new ERR_INVALID_ARG_VALUE(name, value);
+    throw new ERR_OUT_OF_RANGE(name, '>= 0 && <= 4294967295', value);
   }
 }
 
-function validateObject(value, name) {
-  if (value === null || typeof value !== 'object') {
+function validateObject(value, name, options = undefined) {
+  const allowArray = options?.allowArray === true;
+  const allowFunction = options?.allowFunction === true;
+  const nullable = options?.nullable === true;
+
+  if ((!nullable && value === null) ||
+      (!allowArray && Array.isArray(value)) ||
+      (typeof value !== 'object' && (!allowFunction || typeof value !== 'function'))) {
     throw new ERR_INVALID_ARG_TYPE(name, 'object', value);
   }
 }
@@ -69,6 +76,13 @@ function validateInt32(value, name, min = -2147483648, max = 2147483647) {
   }
 }
 
+function isInt32(value) {
+  return typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= -2147483648 &&
+    value <= 2147483647;
+}
+
 function validateArray(value, name) {
   if (!Array.isArray(value)) {
     throw new ERR_INVALID_ARG_TYPE(name, ['Array'], value);
@@ -89,15 +103,41 @@ function validateNumber(value, name, min, max) {
   if (typeof value !== 'number') {
     throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
   }
-  if ((min !== undefined || max !== undefined) && !Number.isFinite(value)) {
-    throw new ERR_OUT_OF_RANGE(name, 'a finite number', value);
+  if ((min !== undefined && value < min) ||
+      (max !== undefined && value > max) ||
+      ((min !== undefined || max !== undefined) && Number.isNaN(value))) {
+    const range = `${min !== undefined ? `>= ${min}` : ''}` +
+      `${min !== undefined && max !== undefined ? ' && ' : ''}` +
+      `${max !== undefined ? `<= ${max}` : ''}`;
+    throw new ERR_OUT_OF_RANGE(name, range, value);
   }
-  if (min !== undefined && value < min) {
-    throw new ERR_OUT_OF_RANGE(name, `>= ${min}`, value);
+}
+
+function validateOneOf(value, name, oneOf) {
+  if (!Array.isArray(oneOf) || !oneOf.includes(value)) {
+    const formatted = Array.isArray(oneOf)
+      ? oneOf.map((v) => (typeof v === 'string' ? `'${v}'` : String(v))).join(', ')
+      : String(oneOf);
+    const label = String(name).includes('.') ? 'property' : 'argument';
+    const received = typeof value === 'string' ? `'${value}'` : String(value);
+    const err = new TypeError(
+      `The ${label} '${name}' must be one of: ${formatted}. Received ${received}`
+    );
+    err.code = 'ERR_INVALID_ARG_VALUE';
+    throw err;
   }
-  if (max !== undefined && value > max) {
-    throw new ERR_OUT_OF_RANGE(name, `<= ${max}`, value);
+}
+
+function validatePort(value, name = 'Port', allowZero = true) {
+  if ((typeof value !== 'number' && typeof value !== 'string') ||
+      (typeof value === 'string' && value.trim().length === 0)) {
+    throw new ERR_SOCKET_BAD_PORT(name, value, allowZero);
   }
+  const port = +value;
+  if ((port >>> 0) !== port || port > 0xFFFF || (port === 0 && !allowZero)) {
+    throw new ERR_SOCKET_BAD_PORT(name, value, allowZero);
+  }
+  return port | 0;
 }
 
 module.exports = {
@@ -107,9 +147,12 @@ module.exports = {
   validateBoolean,
   validateBuffer,
   validateFunction,
+  isInt32,
   validateInt32,
   validateInteger,
   validateNumber,
+  validateOneOf,
+  validatePort,
   validateString,
   validateUint32,
 };

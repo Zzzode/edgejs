@@ -70,11 +70,20 @@ target_link_libraries(unode_node_api
 add_library(unode_runtime STATIC
   src/unode_runtime.cc
   src/unode_module_loader.cc
+  "${NAPI_V8_NODE_ROOT}/deps/llhttp/src/api.c"
+  "${NAPI_V8_NODE_ROOT}/deps/llhttp/src/http.c"
+  "${NAPI_V8_NODE_ROOT}/deps/llhttp/src/llhttp.c"
   src/unode_fs.cc
   src/unode_buffer.cc
   src/unode_os.cc
   src/unode_encoding.cc
   src/unode_string_decoder.cc
+  src/unode_http_parser.cc
+  src/unode_stream_wrap.cc
+  src/unode_tcp_wrap.cc
+  src/unode_pipe_wrap.cc
+  src/unode_cares_wrap.cc
+  src/unode_udp_wrap.cc
   src/unode_url.cc
 )
 target_include_directories(unode_runtime
@@ -82,6 +91,7 @@ target_include_directories(unode_runtime
     "${UNODE_ROOT}/src"
   PRIVATE
     "${NAPI_V8_ROOT}/include"
+    "${NAPI_V8_NODE_ROOT}/deps/llhttp/include"
 )
 target_link_libraries(unode_runtime
   PUBLIC

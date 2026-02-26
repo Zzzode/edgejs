@@ -1,6 +1,7 @@
 'use strict';
 
-const { URL, URLSearchParams } = globalThis;
+const NativeURL = globalThis.URL;
+const NativeURLSearchParams = globalThis.URLSearchParams;
 const { Buffer } = require('buffer');
 const path = require('path');
 const { internalBinding } = require('internal/test/binding_runtime');
@@ -71,7 +72,38 @@ class SimpleURLSearchParams {
   }
 }
 
-const URLSearchParamsImpl = typeof URLSearchParams === 'function' ? URLSearchParams : SimpleURLSearchParams;
+const URLSearchParamsImpl = typeof NativeURLSearchParams === 'function' ? NativeURLSearchParams : SimpleURLSearchParams;
+
+function FallbackURL(input) {
+  if (!(this instanceof FallbackURL)) return new FallbackURL(input);
+  const href = String(input);
+  const parsed = typeof bindingUrl.parse === 'function' ? bindingUrl.parse(href) : null;
+  if (!parsed || typeof parsed !== 'object' || typeof parsed.protocol !== 'string' || parsed.protocol.length === 0) {
+    const err = new TypeError('Invalid URL');
+    err.code = 'ERR_INVALID_URL';
+    throw err;
+  }
+  const protocol = String(parsed.protocol).toLowerCase();
+  const remainder = href.slice((href.indexOf('://') + 3) >>> 0);
+  const isFile = protocol === 'file:';
+  if (!isFile && (remainder.length === 0 || remainder[0] === ':' || remainder[0] === '/')) {
+    const err = new TypeError('Invalid URL');
+    err.code = 'ERR_INVALID_URL';
+    throw err;
+  }
+  Object.defineProperty(this, 'href', { __proto__: null, value: href, enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'protocol', { __proto__: null, value: protocol, enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'hostname', { __proto__: null, value: parsed.hostname || '', enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'pathname', { __proto__: null, value: parsed.pathname || '/', enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'search', { __proto__: null, value: parsed.search || '', enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'hash', { __proto__: null, value: parsed.hash || '', enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'username', { __proto__: null, value: parsed.username || '', enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'password', { __proto__: null, value: parsed.password || '', enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, 'port', { __proto__: null, value: parsed.port || '', enumerable: false, configurable: true, writable: true });
+  Object.defineProperty(this, Symbol.toStringTag, { __proto__: null, value: 'URL', enumerable: false, configurable: true });
+}
+
+const URLImpl = typeof NativeURL === 'function' ? NativeURL : FallbackURL;
 
 function domainToASCII(domain) {
   return typeof bindingUrl.domainToASCII === 'function' ?
@@ -86,7 +118,7 @@ function domainToUnicode(domain) {
 }
 
 function isURL(self) {
-  if (self instanceof URL) return true;
+  if (typeof URLImpl === 'function' && self instanceof URLImpl) return true;
   return self != null &&
     typeof self === 'object' &&
     self[Symbol.toStringTag] === 'URL';
@@ -148,7 +180,7 @@ function fileURLToPath(input, options = undefined) {
   if (!String(protocol || '').startsWith('file')) throw new ERR_INVALID_URL_SCHEME('file');
   let inputUrl;
   try {
-    inputUrl = new URL(String(href));
+    inputUrl = new URLImpl(String(href));
   } catch {
     inputUrl = href;
   }
@@ -185,14 +217,14 @@ function pathToFileURL(filepath, options = undefined) {
     const href = typeof bindingUrl.pathToFileURL === 'function' ?
       bindingUrl.pathToFileURL(resolved.slice(hostnameEndIndex), windows, hostname) :
       `file://${hostname}${resolved.slice(hostnameEndIndex).replace(/\\/g, '/')}`;
-    return new URL(href);
+    return new URLImpl(href);
   }
   const last = filepath.charCodeAt(filepath.length - 1);
   if ((last === 47 || (windows && last === 92)) && resolved[resolved.length - 1] !== path.sep) resolved += '/';
   const href = typeof bindingUrl.pathToFileURL === 'function' ?
     bindingUrl.pathToFileURL(resolved, windows) :
     `file://${resolved.replace(/\\/g, '/')}`;
-  return new URL(href);
+  return new URLImpl(href);
 }
 
 function urlToHttpOptions(urlObj) {
@@ -241,7 +273,7 @@ function urlToHttpOptions(urlObj) {
 }
 
 module.exports = {
-  URL,
+  URL: URLImpl,
   URLSearchParams: URLSearchParamsImpl,
   domainToASCII,
   domainToUnicode,

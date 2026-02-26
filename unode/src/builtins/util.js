@@ -1,6 +1,6 @@
 'use strict';
 
-const inspectCustom = Symbol('nodejs.util.inspect.custom');
+const inspectCustom = Symbol.for('nodejs.util.inspect.custom');
 const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 function quoteString(str) {
@@ -146,6 +146,20 @@ function inherits(ctor, superCtor) {
   Object.setPrototypeOf(ctor, superCtor);
 }
 
+function getSystemErrorName(err) {
+  if (typeof err !== 'number') {
+    throw new TypeError('The "err" argument must be of type number');
+  }
+  if (typeof process?.binding !== 'function') {
+    throw new Error('process.binding is not available');
+  }
+  const uv = process.binding('uv');
+  if (!uv || typeof uv.errname !== 'function') {
+    throw new Error('uv.errname is not available');
+  }
+  return uv.errname(err);
+}
+
 function getCallSites() {
   return [];
 }
@@ -154,8 +168,10 @@ module.exports = {
   inspect,
   format,
   inherits,
+  getSystemErrorName,
   getCallSites,
 };
+module.exports.debuglog = require('internal/util/debuglog').debuglog;
 module.exports.inspect.custom = inspectCustom;
 module.exports.inspect.defaultOptions = {
   breakLength: 80,

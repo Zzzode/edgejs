@@ -21,6 +21,15 @@ class Domain extends EventEmitter {
       return originalEmit.call(this, type, ...args);
     };
   }
+
+  run(fn, ...args) {
+    if (typeof fn !== 'function') return;
+    try {
+      return fn.apply(this, args);
+    } catch (err) {
+      this.emit('error', err);
+    }
+  }
 }
 
 function create() {

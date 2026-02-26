@@ -104,8 +104,13 @@ function matchesExpected(err, expected) {
   if (Object.prototype.hasOwnProperty.call(expected, 'name') && err.name !== expected.name) {
     return false;
   }
-  if (Object.prototype.hasOwnProperty.call(expected, 'code') && err.code !== expected.code) {
-    return false;
+  if (Object.prototype.hasOwnProperty.call(expected, 'code')) {
+    const codeExpectation = expected.code;
+    if ((codeExpectation && typeof codeExpectation.test === 'function')) {
+      if (!codeExpectation.test(String((err && err.code) || ''))) return false;
+    } else if (err.code !== codeExpectation) {
+      return false;
+    }
   }
   if (Object.prototype.hasOwnProperty.call(expected, 'message')) {
     const msgExpectation = expected.message;

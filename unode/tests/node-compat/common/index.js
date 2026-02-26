@@ -107,6 +107,10 @@ function mustNotMutateObjectDeep(obj) {
   return obj;
 }
 
+function platformTimeout(ms) {
+  return Number(ms) || 0;
+}
+
 const isWindows = typeof process !== 'undefined' && process.platform === 'win32';
 const isAIX = typeof process !== 'undefined' && process.platform === 'aix';
 const isIBMi = false;
@@ -116,6 +120,8 @@ const isMainThread = true;
 const isDumbTerminal = typeof process !== 'undefined' &&
   process.env &&
   process.env.TERM === 'dumb';
+const localhostIPv4 = '127.0.0.1';
+const localhostIPv6 = '::1';
 const hasCrypto = (() => {
   try {
     return !!require('crypto');
@@ -174,6 +180,7 @@ module.exports = {
   expectsError,
   invalidArgTypeHelper,
   mustNotMutateObjectDeep,
+  platformTimeout,
   isWindows,
   isAIX,
   isIBMi,
@@ -181,6 +188,8 @@ module.exports = {
   isDebug,
   isMainThread,
   isDumbTerminal,
+  localhostIPv4,
+  localhostIPv6,
   hasCrypto,
   canCreateSymLink,
   printSkipMessage,

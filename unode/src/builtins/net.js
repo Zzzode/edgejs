@@ -1,6 +1,4 @@
 'use strict';
-function getDefaultAutoSelectFamilyAttemptTimeout() {
-  return 10;
-}
-function setDefaultAutoSelectFamilyAttemptTimeout() {}
-module.exports = { getDefaultAutoSelectFamilyAttemptTimeout, setDefaultAutoSelectFamilyAttemptTimeout };
+
+const path = require('path');
+module.exports = require(path.resolve(__dirname, '../../../node/lib/net.js'));

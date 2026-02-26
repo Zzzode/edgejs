@@ -2,7 +2,21 @@
 
 const UV_ENOENT = -2;
 const UV_EEXIST = -17;
+const UV_EOF = -4095;
+const UV_EINVAL = -22;
+const UV_EBADF = -9;
+const UV_ENOTCONN = -57;
+const UV_ECANCELED = -89;
+const UV_ETIMEDOUT = -60;
+const UV_ENOMEM = -12;
+const UV_ENOTSOCK = -88;
+const UV_UNKNOWN = -4094;
+const UV_EAI_MEMORY = -3001;
 const kHasBackingStore = new WeakSet();
+const kImmediateInfo = new Int32Array(3);
+const kTimeoutInfo = new Int32Array(1);
+const kTickInfo = new Int32Array(1);
+const kIsBuildingSnapshotBuffer = new Uint8Array([0]);
 const basePrimordials = require('../util/primordials');
 
 function uncurryThis(fn) {
@@ -16,12 +30,15 @@ const primordials = {
   ArrayIsArray: Array.isArray,
   ArrayPrototypeForEach: uncurryThis(Array.prototype.forEach),
   BigInt,
+  Date,
+  DateNow: Date.now,
   Float32Array,
   Float64Array,
   MathFloor: Math.floor,
   MathMin: Math.min,
   MathTrunc: Math.trunc,
   Number,
+  NumberParseInt: Number.parseInt,
   NumberIsInteger: Number.isInteger,
   NumberIsNaN: Number.isNaN,
   NumberIsFinite: Number.isFinite,
@@ -32,6 +49,8 @@ const primordials = {
   ObjectGetOwnPropertyDescriptor: Object.getOwnPropertyDescriptor,
   ObjectPrototypeHasOwnProperty: uncurryThis(Object.prototype.hasOwnProperty),
   ObjectSetPrototypeOf: Object.setPrototypeOf,
+  RegExp,
+  RegExpPrototypeTest: uncurryThis(RegExp.prototype.test),
   RegExpPrototypeSymbolReplace: uncurryThis(RegExp.prototype[Symbol.replace]),
   StringPrototypeCharCodeAt: uncurryThis(String.prototype.charCodeAt),
   StringPrototypeSlice: uncurryThis(String.prototype.slice),
@@ -60,18 +79,139 @@ function getNativeInternalBinding() {
   return null;
 }
 
+class UnodePipeStub {}
+class UnodePipeConnectWrapStub {}
+
 function internalBinding(name) {
-  if (name === 'uv') return { UV_ENOENT, UV_EEXIST };
+  if (name === 'uv') {
+    return {
+      UV_ENOENT,
+      UV_EEXIST,
+      UV_EOF,
+      UV_EINVAL,
+      UV_EBADF,
+      UV_ENOTCONN,
+      UV_ECANCELED,
+      UV_ETIMEDOUT,
+      UV_ENOMEM,
+      UV_ENOTSOCK,
+      UV_UNKNOWN,
+      UV_EAI_MEMORY,
+    };
+  }
+  if (name === 'constants') {
+    return {
+      os: {
+        UV_UDP_REUSEADDR: 4,
+      },
+    };
+  }
+  if (name === 'timers') {
+    return {
+      immediateInfo: kImmediateInfo,
+      timeoutInfo: kTimeoutInfo,
+      toggleTimerRef() {},
+      toggleImmediateRef() {},
+      scheduleTimer() {},
+      getLibuvNow() {
+        return Date.now();
+      },
+    };
+  }
+  if (name === 'task_queue') {
+    return {
+      tickInfo: kTickInfo,
+      runMicrotasks() {},
+      setTickCallback() {},
+      enqueueMicrotask(fn) {
+        if (typeof queueMicrotask === 'function') return queueMicrotask(fn);
+        if (typeof fn === 'function') fn();
+      },
+    };
+  }
+  if (name === 'trace_events') {
+    return {
+      getCategoryEnabledBuffer() {
+        return new Uint8Array(1);
+      },
+      trace() {},
+    };
+  }
+  if (name === 'mksnapshot') {
+    return {
+      setSerializeCallback() {},
+      setDeserializeCallback() {},
+      setDeserializeMainFunction() {},
+      isBuildingSnapshotBuffer: kIsBuildingSnapshotBuffer,
+    };
+  }
   if (name === 'errors') {
     return {
+      noSideEffectsToString(value) {
+        return String(value);
+      },
+      triggerUncaughtException(err) {
+        throw err;
+      },
       exitCodes: {
         kNoFailure: 0,
         kGenericUserError: 1,
       },
     };
   }
+  if (name === 'symbols') {
+    const syms = {
+      async_id_symbol: Symbol('async_id_symbol'),
+      owner_symbol: Symbol('owner_symbol'),
+      resource_symbol: Symbol('resource_symbol'),
+      trigger_async_id_symbol: Symbol('trigger_async_id_symbol'),
+    };
+    return {
+      ...syms,
+      symbols: syms,
+    };
+  }
   if (name === 'os') return globalThis.__unode_os || {};
   if (name === 'buffer') return globalThis.__unode_buffer || {};
+  if (name === 'http_parser') return globalThis.__unode_http_parser || {};
+  if (name === 'stream_wrap') return globalThis.__unode_stream_wrap || {};
+  if (name === 'js_stream') {
+    class JSStream {
+      close(cb) {
+        if (typeof cb === 'function') cb();
+      }
+      readBuffer() {}
+      emitEOF() {}
+      finishWrite(req, status) {
+        if (req && typeof req.oncomplete === 'function') req.oncomplete(status || 0, this, req);
+      }
+      finishShutdown(req, status) {
+        if (req && typeof req.oncomplete === 'function') req.oncomplete(status || 0, this, req);
+      }
+    }
+    return { JSStream };
+  }
+  if (name === 'tcp_wrap') return globalThis.__unode_tcp_wrap || {};
+  if (name === 'udp_wrap') return globalThis.__unode_udp_wrap || {};
+  if (name === 'pipe_wrap') {
+    if (globalThis.__unode_pipe_wrap) return globalThis.__unode_pipe_wrap;
+    return {
+      Pipe: UnodePipeStub,
+      PipeConnectWrap: UnodePipeConnectWrapStub,
+      constants: {
+        SOCKET: 0,
+        SERVER: 1,
+      },
+    };
+  }
+  if (name === 'cares_wrap') {
+    if (globalThis.__unode_cares_wrap) return globalThis.__unode_cares_wrap;
+    return {
+      convertIpv6StringToBuffer() {
+        return null;
+      },
+    };
+  }
   if (name === 'string_decoder') {
     if (globalThis.__unode_string_decoder) return globalThis.__unode_string_decoder;
     const nativeInternalBinding = getNativeInternalBinding();

@@ -125,10 +125,56 @@ function deprecate(fn) {
   return fn;
 }
 
+function guessHandleType(fd) {
+  if (typeof fd === 'number' && Number.isInteger(fd) && fd >= 0) {
+    const map = globalThis.__unode_fd_types;
+    if (map && typeof map === 'object') {
+      const type = map[String(fd)];
+      if (typeof type === 'string') return type;
+    }
+    return 'UNKNOWN';
+  }
+  return 'UNKNOWN';
+}
+
+function once(callback, { preserveReturnValue = false } = kEmptyObject) {
+  let called = false;
+  let value;
+  return function wrappedOnce(...args) {
+    if (called) return value;
+    called = true;
+    value = callback.apply(this, args);
+    return preserveReturnValue ? value : undefined;
+  };
+}
+
 function lazyDOMException(message, name) {
   const err = new Error(message);
   err.name = name || 'DOMException';
   return err;
+}
+
+class WeakReference {
+  #ref;
+  #count = 0;
+
+  constructor(value) {
+    this.#ref = typeof WeakRef === 'function' ? new WeakRef(value) : { deref: () => value };
+  }
+
+  get() {
+    return this.#ref && typeof this.#ref.deref === 'function' ? this.#ref.deref() : undefined;
+  }
+
+  incRef() {
+    this.#count++;
+    return this.#count;
+  }
+
+  decRef() {
+    if (this.#count > 0) this.#count--;
+    return this.#count;
+  }
 }
 
 module.exports = {
@@ -138,6 +184,7 @@ module.exports = {
   customInspectSymbol,
   defineLazyProperties,
   deprecate,
+  guessHandleType,
   encodingsMap,
   kEmptyObject,
   kIsEncodingSymbol,
@@ -145,5 +192,7 @@ module.exports = {
   getCIDR,
   normalizeEncoding,
   spliceOne,
+  once,
   promisify,
+  WeakReference,
 };
