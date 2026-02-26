@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <uv.h>
+
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -148,6 +150,155 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
   return std::string(buffer.data(), copied);
 }
 
+int GetProcessExitCode(napi_env env, bool* has_exit_code) {
+  if (has_exit_code != nullptr) *has_exit_code = false;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return 0;
+  }
+  bool has_process = false;
+  if (napi_has_named_property(env, global, "process", &has_process) != napi_ok || !has_process) {
+    return 0;
+  }
+  napi_value process_obj = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return 0;
+  }
+  bool has_exit_code_prop = false;
+  if (napi_has_named_property(env, process_obj, "exitCode", &has_exit_code_prop) != napi_ok ||
+      !has_exit_code_prop) {
+    return 0;
+  }
+  napi_value exit_code_value = nullptr;
+  if (napi_get_named_property(env, process_obj, "exitCode", &exit_code_value) != napi_ok ||
+      exit_code_value == nullptr) {
+    return 0;
+  }
+  napi_valuetype value_type = napi_undefined;
+  if (napi_typeof(env, exit_code_value, &value_type) != napi_ok || value_type == napi_undefined ||
+      value_type == napi_null) {
+    return 0;
+  }
+  int32_t exit_code = 0;
+  if (napi_get_value_int32(env, exit_code_value, &exit_code) != napi_ok) {
+    return 0;
+  }
+  if (has_exit_code != nullptr) *has_exit_code = true;
+  return static_cast<int>(exit_code);
+}
+
+int GetProcessExitCodeOrZero(napi_env env) {
+  bool has_exit_code = false;
+  const int exit_code = GetProcessExitCode(env, &has_exit_code);
+  return has_exit_code ? exit_code : 0;
+}
+
+bool EmitProcessLifecycleEvent(napi_env env, const char* event_name, int exit_code) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return false;
+  }
+  bool has_process = false;
+  if (napi_has_named_property(env, global, "process", &has_process) != napi_ok || !has_process) {
+    return false;
+  }
+  napi_value process_obj = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return false;
+  }
+  bool has_emit = false;
+  if (napi_has_named_property(env, process_obj, "emit", &has_emit) != napi_ok || !has_emit) {
+    return false;
+  }
+  napi_value emit_fn = nullptr;
+  if (napi_get_named_property(env, process_obj, "emit", &emit_fn) != napi_ok || emit_fn == nullptr) {
+    return false;
+  }
+  napi_valuetype emit_type = napi_undefined;
+  if (napi_typeof(env, emit_fn, &emit_type) != napi_ok || emit_type != napi_function) {
+    return false;
+  }
+  napi_value event_name_value = nullptr;
+  napi_value exit_code_value = nullptr;
+  if (napi_create_string_utf8(env, event_name, NAPI_AUTO_LENGTH, &event_name_value) != napi_ok ||
+      event_name_value == nullptr ||
+      napi_create_int32(env, static_cast<int32_t>(exit_code), &exit_code_value) != napi_ok ||
+      exit_code_value == nullptr) {
+    return false;
+  }
+  napi_value args[2] = {event_name_value, exit_code_value};
+  napi_value ignored = nullptr;
+  return napi_call_function(env, process_obj, emit_fn, 2, args, &ignored) == napi_ok;
+}
+
+int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
+  bool has_pending = false;
+  if (napi_is_exception_pending(env, &has_pending) != napi_ok || !has_pending) {
+    return -1;
+  }
+  bool is_process_exit = false;
+  int process_exit_code = 1;
+  const std::string exception_message =
+      GetAndClearPendingException(env, &is_process_exit, &process_exit_code);
+  if (is_process_exit) {
+    if (error_out != nullptr) {
+      error_out->clear();
+      if (process_exit_code != 0) {
+        *error_out = "process.exit(" + std::to_string(process_exit_code) + ")";
+      }
+    }
+    return process_exit_code;
+  }
+  if (error_out != nullptr) {
+    *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
+  }
+  return 1;
+}
+
+int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
+  uv_loop_t* loop = uv_default_loop();
+  if (loop == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "Missing default libuv loop";
+    }
+    return 1;
+  }
+  while (true) {
+    uv_run(loop, UV_RUN_DEFAULT);
+
+    int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+    if (async_status >= 0) {
+      return async_status;
+    }
+
+    bool more = uv_loop_alive(loop) != 0;
+    if (more) {
+      continue;
+    }
+
+    const int before_exit_code = GetProcessExitCodeOrZero(env);
+    EmitProcessLifecycleEvent(env, "beforeExit", before_exit_code);
+
+    async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+    if (async_status >= 0) {
+      return async_status;
+    }
+
+    more = uv_loop_alive(loop) != 0;
+    if (!more) {
+      break;
+    }
+  }
+
+  EmitProcessLifecycleEvent(env, "exit", GetProcessExitCodeOrZero(env));
+  const int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+  if (async_status >= 0) {
+    return async_status;
+  }
+
+  return -1;
+}
+
 std::string EscapeForSingleQuotedJs(const std::string& in) {
   std::string out;
   out.reserve(in.size() + 8);
@@ -234,7 +385,11 @@ napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   return undefined;
 }
 
-int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entry_script_path, std::string* error_out) {
+int RunScriptWithGlobals(napi_env env,
+                         const char* source_text,
+                         const char* entry_script_path,
+                         std::string* error_out,
+                         bool keep_event_loop_alive) {
   if (env == nullptr) {
     if (error_out != nullptr) {
       *error_out = "Invalid environment";
@@ -308,6 +463,10 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
       "        if (process && typeof process.emit === 'function' && typeof process.listenerCount === 'function' && process.listenerCount('uncaughtException') > 0) {"
       "          process.emit('uncaughtException', err);"
       "        } else {"
+      "          try {"
+      "            var __text = (err && err.stack) ? String(err.stack) : String(err);"
+      "            if (process && process.stderr && typeof process.stderr.write === 'function') process.stderr.write(__text + '\\n');"
+      "          } catch (_) {}"
       "          throw err;"
       "        }"
       "      }"
@@ -1491,9 +1650,9 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   const char* source_to_run = source_text;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
     entry_source =
-        "(function(){ try { return require('" +
+        "(function(){ try { var __entry = require('path').resolve('" +
         EscapeForSingleQuotedJs(entry_script_path) +
-        "'); } catch (err) {"
+        "'); return require(__entry); } catch (err) {"
         "var p = globalThis.process;"
         "var handled = false;"
         "try { if (p && typeof p.emit === 'function') p.emit('uncaughtExceptionMonitor', err, 'uncaughtException'); } catch (monitorErr) { throw monitorErr; }"
@@ -1523,6 +1682,18 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   napi_value result = nullptr;
   status = napi_run_script(env, script, &result);
   if (status == napi_ok) {
+    if (keep_event_loop_alive) {
+      // Mirror Node's embedder loop semantics for process lifetime and beforeExit handling.
+      const int loop_result = RunEventLoopUntilQuiescent(env, error_out);
+      if (loop_result >= 0) {
+        return loop_result;
+      }
+    }
+    bool has_exit_code = false;
+    const int exit_code = GetProcessExitCode(env, &has_exit_code);
+    if (has_exit_code) {
+      return exit_code;
+    }
     return 0;
   }
 
@@ -1613,10 +1784,13 @@ int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* err
   if (error_out != nullptr) {
     error_out->clear();
   }
-  return RunScriptWithGlobals(env, source_text, nullptr, error_out);
+  return RunScriptWithGlobals(env, source_text, nullptr, error_out, false);
 }
 
-int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out) {
+int UnodeRunScriptFileWithLoop(napi_env env,
+                               const char* script_path,
+                               std::string* error_out,
+                               bool keep_event_loop_alive) {
   if (error_out != nullptr) {
     error_out->clear();
   }
@@ -1649,7 +1823,8 @@ int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error
     }
   }
 #endif
-  const int rc = RunScriptWithGlobals(env, source.c_str(), script_path, error_out);
+  const int rc =
+      RunScriptWithGlobals(env, source.c_str(), script_path, error_out, keep_event_loop_alive);
 #if !defined(_WIN32)
   if (!restore_cwd.empty()) {
     chdir(restore_cwd.c_str());
@@ -1657,4 +1832,8 @@ int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error
 #endif
   g_unode_current_script_path.clear();
   return rc;
+}
+
+int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out) {
+  return UnodeRunScriptFileWithLoop(env, script_path, error_out, false);
 }
