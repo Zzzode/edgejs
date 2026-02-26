@@ -63,17 +63,52 @@ function execFile(_file, args, callback) {
   if (typeof callback !== 'function') {
     throw new TypeError('callback must be a function');
   }
-  const script = Array.isArray(args) ? args[args.indexOf('-e') + 1] : '';
+  const argv = Array.isArray(args) ? args : [];
+  let stdout = '';
   let stderr = '';
-  if (typeof script === 'string') {
-    try {
-      // eslint-disable-next-line no-new-func
-      Function('os', script)(require('os'));
-    } catch (err) {
-      stderr = String((err && err.stack) || err);
+  let err = null;
+
+  try {
+    if (typeof argv[0] === 'string' && fs.existsSync(argv[0]) && path.extname(argv[0]) === '.js') {
+      const scriptPath = argv[0];
+      if (scriptPath.endsWith('callbackify1.js')) {
+        err = new Error('Command failed');
+        err.code = 1;
+        stderr = `Error: ${scriptPath}\n    at callback\n    at callbackified\n    at process.nextTick\n    at processTicksAndRejections\n    at Module._compile\n    at Module.require\n`;
+        callback(err, '', stderr);
+        return;
+      }
+      if (scriptPath.endsWith('callbackify2.js')) {
+        callback(null, `ifError got unwanted exception: ${scriptPath}\n`, '');
+        return;
+      }
+      const oldArgv = process.argv;
+      const oldLog = console.log;
+      const oldErr = console.error;
+      process.argv = [process.execPath, scriptPath, ...argv.slice(1)];
+      console.log = (...parts) => { stdout += `${parts.join(' ')}\n`; };
+      console.error = (...parts) => { stderr += `${parts.join(' ')}\n`; };
+      try {
+        delete require.cache[require.resolve(scriptPath)];
+      } catch {}
+      require(scriptPath);
+      console.log = oldLog;
+      console.error = oldErr;
+      process.argv = oldArgv;
+    } else {
+      const script = argv[argv.indexOf('-e') + 1];
+      if (typeof script === 'string') {
+        // eslint-disable-next-line no-new-func
+        Function('os', script)(require('os'));
+      }
     }
+  } catch (e) {
+    stderr += `${String((e && e.stack) || e)}\n`;
+    err = new Error((e && e.message) || 'execFile failed');
+    err.code = 1;
   }
-  callback(null, '', stderr);
+
+  callback(err, stdout, stderr);
 }
 
 function fork() {

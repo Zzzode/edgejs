@@ -1,18 +1,9 @@
 'use strict';
 
-const path = require('path');
-
-const primordials = require('internal/util/primordials');
-globalThis.primordials = Object.assign(
-  {},
-  globalThis.primordials || {},
-  primordials
-);
-
 // Ensure Event/EventTarget/CustomEvent globals exist before loading events tests.
 require('internal/event_target');
 
-const exported = require(path.resolve(__dirname, '../../../node/lib/events.js'));
+const exported = require('../../../node/lib/events.js');
 
 // Provide a lightweight process event emitter surface in runtimes where process
 // does not expose Node's full EventEmitter behavior.

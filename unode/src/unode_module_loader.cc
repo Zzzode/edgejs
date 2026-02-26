@@ -17,6 +17,8 @@ namespace fs = std::filesystem;
 struct ModuleLoaderState {
   std::unordered_map<std::string, napi_ref> module_cache;
   napi_ref cache_object_ref = nullptr;
+  napi_ref primordials_ref = nullptr;
+  napi_ref internal_binding_ref = nullptr;
   std::string entry_dir;
 };
 
@@ -283,6 +285,20 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
   return false;
 }
 
+// Directory to use when loading binding_runtime in the prelude, so it is found regardless of
+// entry_dir. Prefer UNODE_FALLBACK_BUILTINS_DIR / g_fallback_builtins_override, else runtime builtins.
+static std::string GetBuiltinsDirForBootstrap() {
+  const char* fallback = !g_fallback_builtins_override.empty()
+                             ? g_fallback_builtins_override.c_str()
+                             : std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
+  if (fallback != nullptr && fallback[0] != '\0') {
+    return fs::absolute(fs::path(fallback)).lexically_normal().string();
+  }
+  static const fs::path runtime_builtins_dir =
+      fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
+  return runtime_builtins_dir.string();
+}
+
 bool ResolveModulePath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
   fs::path raw_path;
   if (!specifier.empty() && specifier[0] == '/') {
@@ -482,6 +498,7 @@ napi_value RequireResolveCallback(napi_env env, napi_callback_info info) {
 napi_value CreateRequireFunction(napi_env env, RequireContext* context);
 
 bool EvaluateJsModule(napi_env env,
+                      ModuleLoaderState* state,
                       const fs::path& resolved_path,
                       napi_value module_obj,
                       napi_value exports_obj,
@@ -491,18 +508,67 @@ bool EvaluateJsModule(napi_env env,
     return ThrowLoaderError(env, ("Failed to read module source: " + resolved_path.string()).c_str());
   }
 
+  // Node-aligned: compile the wrapper as a function, then call it from C++ with (internalBinding, primordials)
+  // as arguments (realm->primordials() in Node). No JS expression like globalThis.primordials at call time.
   const std::string wrapped_source =
       "(function(internalBinding, primordials) {"
       "return function(exports, require, module, __filename, __dirname) {\n" + source + "\n};"
-      "})(globalThis.internalBinding, globalThis.primordials)";
+      "})";
   napi_value script_source = nullptr;
   if (napi_create_string_utf8(env, wrapped_source.c_str(), NAPI_AUTO_LENGTH, &script_source) != napi_ok ||
       script_source == nullptr) {
     return ThrowLoaderError(env, "Failed to create wrapped module source");
   }
 
-  napi_value wrapped_fn = nullptr;
-  if (napi_run_script(env, script_source, &wrapped_fn) != napi_ok || wrapped_fn == nullptr) {
+  napi_value outer_fn = nullptr;
+  if (napi_run_script(env, script_source, &outer_fn) != napi_ok || outer_fn == nullptr) {
+    return false;  // Preserve JS exception.
+  }
+
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) {
+    return ThrowLoaderError(env, "Failed to fetch global object");
+  }
+
+  napi_value internal_binding_val = nullptr;
+  napi_value primordials_val = nullptr;
+  if (state != nullptr && state->internal_binding_ref != nullptr) {
+    napi_get_reference_value(env, state->internal_binding_ref, &internal_binding_val);
+  }
+  if (internal_binding_val == nullptr) {
+    napi_get_named_property(env, global, "internalBinding", &internal_binding_val);
+  }
+  if (state != nullptr && state->primordials_ref != nullptr) {
+    napi_get_reference_value(env, state->primordials_ref, &primordials_val);
+  }
+  if (primordials_val == nullptr) {
+    napi_get_named_property(env, global, "__unode_primordials", &primordials_val);
+  }
+  if (primordials_val == nullptr) {
+    napi_get_named_property(env, global, "primordials", &primordials_val);
+  }
+  // Never pass JS undefined to the wrapper when __unode_primordials exists (e.g. ref was set to
+  // undefined by mistake). Prefer the container so builtins that destructure primordials don't throw.
+  napi_value undefined_val = nullptr;
+  if (napi_get_undefined(env, &undefined_val) == napi_ok && undefined_val != nullptr &&
+      primordials_val != nullptr) {
+    bool is_undefined = false;
+    if (napi_strict_equals(env, primordials_val, undefined_val, &is_undefined) == napi_ok &&
+        is_undefined) {
+      primordials_val = nullptr;
+      napi_get_named_property(env, global, "__unode_primordials", &primordials_val);
+    }
+  }
+  if (primordials_val == nullptr) {
+    napi_get_undefined(env, &primordials_val);
+  }
+
+  napi_value wrapper_args[2] = {internal_binding_val != nullptr ? internal_binding_val : nullptr, primordials_val};
+  if (wrapper_args[0] == nullptr) {
+    napi_get_undefined(env, &wrapper_args[0]);
+  }
+  napi_value inner_fn = nullptr;
+  if (napi_call_function(env, global, outer_fn, 2, wrapper_args, &inner_fn) != napi_ok || inner_fn == nullptr) {
     return false;  // Preserve JS exception.
   }
 
@@ -514,13 +580,9 @@ bool EvaluateJsModule(napi_env env,
     return ThrowLoaderError(env, "Failed to build module path values");
   }
 
-  napi_value global = GetGlobal(env);
-  if (global == nullptr) {
-    return ThrowLoaderError(env, "Failed to fetch global object");
-  }
   napi_value argv[5] = {exports_obj, require_fn, module_obj, filename_value, dirname_value};
   napi_value call_result = nullptr;
-  if (napi_call_function(env, global, wrapped_fn, 5, argv, &call_result) != napi_ok) {
+  if (napi_call_function(env, global, inner_fn, 5, argv, &call_result) != napi_ok) {
     return false;  // Preserve JS exception.
   }
   return true;
@@ -775,7 +837,7 @@ bool LoadResolvedModule(napi_env env, ModuleLoaderState* state, const fs::path& 
   if (ext == ".json") {
     ok = ParseJsonModule(env, resolved_path, module_obj);
   } else {
-    ok = EvaluateJsModule(env, resolved_path, module_obj, exports_obj, require_fn);
+    ok = EvaluateJsModule(env, state, resolved_path, module_obj, exports_obj, require_fn);
   }
   if (!ok) {
     RemoveCachedModule(env, state, resolved_key);
@@ -798,6 +860,34 @@ void UnodeSetFallbackBuiltinsDir(const char* path) {
   g_fallback_builtins_override = (path != nullptr && path[0] != '\0') ? path : "";
 }
 
+void UnodeSetPrimordials(napi_env env, napi_value primordials) {
+  if (env == nullptr || primordials == nullptr) return;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return;
+  ModuleLoaderState& state = it->second;
+  if (state.primordials_ref != nullptr) {
+    napi_delete_reference(env, state.primordials_ref);
+    state.primordials_ref = nullptr;
+  }
+  if (napi_create_reference(env, primordials, 1, &state.primordials_ref) != napi_ok) {
+    state.primordials_ref = nullptr;
+  }
+}
+
+void UnodeSetInternalBinding(napi_env env, napi_value internal_binding) {
+  if (env == nullptr || internal_binding == nullptr) return;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return;
+  ModuleLoaderState& state = it->second;
+  if (state.internal_binding_ref != nullptr) {
+    napi_delete_reference(env, state.internal_binding_ref);
+    state.internal_binding_ref = nullptr;
+  }
+  if (napi_create_reference(env, internal_binding, 1, &state.internal_binding_ref) != napi_ok) {
+    state.internal_binding_ref = nullptr;
+  }
+}
+
 napi_status UnodeInstallModuleLoader(napi_env env, const char* entry_script_path) {
   if (env == nullptr) {
     return napi_invalid_arg;
@@ -818,6 +908,14 @@ napi_status UnodeInstallModuleLoader(napi_env env, const char* entry_script_path
   if (state.cache_object_ref != nullptr) {
     napi_delete_reference(env, state.cache_object_ref);
     state.cache_object_ref = nullptr;
+  }
+  if (state.primordials_ref != nullptr) {
+    napi_delete_reference(env, state.primordials_ref);
+    state.primordials_ref = nullptr;
+  }
+  if (state.internal_binding_ref != nullptr) {
+    napi_delete_reference(env, state.internal_binding_ref);
+    state.internal_binding_ref = nullptr;
   }
   state.entry_dir = entry_path.parent_path().string();
 
@@ -849,6 +947,17 @@ napi_status UnodeInstallModuleLoader(napi_env env, const char* entry_script_path
       napi_set_named_property(env, require_fn, "cache", cache_obj) != napi_ok ||
       napi_set_named_property(env, global, "__filename", filename_value) != napi_ok ||
       napi_set_named_property(env, global, "__dirname", dirname_value) != napi_ok) {
+    return napi_generic_failure;
+  }
+
+  // Bootstrap require: resolves from builtins dir so the prelude can load internal/test/binding_runtime
+  // before the entry script runs, regardless of entry_dir. Declares internalBinding once.
+  const std::string bootstrap_base_dir = GetBuiltinsDirForBootstrap();
+  auto* bootstrap_context = new RequireContext{&state, bootstrap_base_dir};
+  g_require_contexts.push_back(bootstrap_context);
+  napi_value bootstrap_require_fn = CreateRequireFunction(env, bootstrap_context);
+  if (bootstrap_require_fn != nullptr &&
+      napi_set_named_property(env, global, "__unode_bootstrap_require", bootstrap_require_fn) != napi_ok) {
     return napi_generic_failure;
   }
   return napi_ok;

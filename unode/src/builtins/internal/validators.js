@@ -29,8 +29,11 @@ function validateString(value, name) {
 }
 
 function validateUint32(value, name, positive) {
-  if (!Number.isInteger(value)) {
+  if (typeof value !== 'number') {
     throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
+  }
+  if (!Number.isInteger(value)) {
+    throw new ERR_OUT_OF_RANGE(name, '>= 0 && <= 4294967295', value);
   }
   if (value < 0 || value > 0xFFFFFFFF || (positive && value === 0)) {
     throw new ERR_OUT_OF_RANGE(name, '>= 0 && <= 4294967295', value);

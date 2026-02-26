@@ -609,6 +609,22 @@ void UnodeInstallStringDecoderBinding(napi_env env) {
   set_i32("kEncodingField", kEncodingField);
   set_i32("kSize", kSize);
 
+  // Node's internal/util expects internalBinding('string_decoder').encodings.
+  {
+    const char* names[] = {"ascii", "utf8", "base64", "base64url", "utf16le", "hex", "buffer", "latin1"};
+    napi_value enc_arr = nullptr;
+    if (napi_create_array_with_length(env, sizeof(names) / sizeof(names[0]), &enc_arr) == napi_ok &&
+        enc_arr != nullptr) {
+      for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        napi_value s = nullptr;
+        if (napi_create_string_utf8(env, names[i], NAPI_AUTO_LENGTH, &s) == napi_ok && s != nullptr) {
+          napi_set_element(env, enc_arr, i, s);
+        }
+      }
+      napi_set_named_property(env, binding, "encodings", enc_arr);
+    }
+  }
+
   SetMethod(env, binding, "decode", DecodeBinding);
   SetMethod(env, binding, "flush", FlushBinding);
 

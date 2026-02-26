@@ -631,6 +631,21 @@ DEFINE_RAW_NODE_TEST(RawQuerystringMulticharSeparatorFromNodeTest, "test-queryst
 DEFINE_RAW_NODE_TEST(RawQuerystringMaxKeysNonFiniteFromNodeTest, "test-querystring-maxKeys-non-finite.js")
 DEFINE_RAW_NODE_TEST(RawQuerystringEscapeFromNodeTest, "test-querystring-escape.js")
 
+// Raw Node util tests
+DEFINE_RAW_NODE_TEST(RawUtilFromNodeTest, "test-util.js")
+// DEFINE_RAW_NODE_TEST(RawUtilTypesFromNodeTest, "test-util-types.js")
+DEFINE_RAW_NODE_TEST(RawUtilTypesExistsFromNodeTest, "test-util-types-exists.js")
+DEFINE_RAW_NODE_TEST(RawUtilTextDecoderFromNodeTest, "test-util-text-decoder.js")
+DEFINE_RAW_NODE_TEST(RawUtilStripvtcontrolcharactersFromNodeTest, "test-util-stripvtcontrolcharacters.js")
+DEFINE_RAW_NODE_TEST(RawUtilSleepFromNodeTest, "test-util-sleep.js")
+DEFINE_RAW_NODE_TEST(RawUtilPromisifyFromNodeTest, "test-util-promisify.js")
+DEFINE_RAW_NODE_TEST(RawUtilParseEnvFromNodeTest, "test-util-parse-env.js")
+DEFINE_RAW_NODE_TEST(RawUtilInheritsFromNodeTest, "test-util-inherits.js")
+DEFINE_RAW_NODE_TEST(RawUtilGetcallsitesFromNodeTest, "test-util-getcallsites.js")
+DEFINE_RAW_NODE_TEST(RawUtilFormatFromNodeTest, "test-util-format.js")
+DEFINE_RAW_NODE_TEST(RawUtilDeprecateFromNodeTest, "test-util-deprecate.js")
+DEFINE_RAW_NODE_TEST(RawUtilCallbackifyFromNodeTest, "test-util-callbackify.js")
+
 // Raw Node url tests
 DEFINE_RAW_NODE_TEST(RawUrlDomainAsciiUnicodeFromNodeTest, "test-url-domain-ascii-unicode.js")
 DEFINE_RAW_NODE_TEST(RawUrlFileurltopathFromNodeTest, "test-url-fileurltopath.js")

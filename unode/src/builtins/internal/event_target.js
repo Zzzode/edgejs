@@ -1,5 +1,6 @@
 'use strict';
 
+const { customInspectSymbol } = require('internal/util');
 const kEvents = Symbol('kEvents');
 const kResistStopPropagation = Symbol('kResistStopPropagation');
 const kWeakHandler = Symbol('kWeakHandler');
@@ -69,19 +70,36 @@ class Event {
   stopImmediatePropagation() { this._stop = true; this._stopImmediate = true; }
   preventDefault() { if (this[kCancelable]) this[kCanceled] = true; }
   composedPath() { return this[kDispatchPath].slice(); }
+  [customInspectSymbol](depth, options) {
+    const name = this.constructor.name;
+    if (depth < 0) return name;
+    const { inspect } = require('util');
+    const opts = { ...options, depth: typeof options?.depth === 'number' ? options.depth - 1 : options?.depth };
+    return `${name} ${inspect({ type: this[kType], defaultPrevented: this[kCanceled], cancelable: this[kCancelable], timeStamp: this.timeStamp }, opts)}`;
+  }
 }
 Object.defineProperty(Event.prototype, Symbol.toStringTag, { value: 'Event' });
 defineEventPhases(Event);
 
-class CustomEvent extends Event {
-  constructor(type, options = undefined) {
-    super(type, options);
-    this[kDetail] = options && Object.prototype.hasOwnProperty.call(options, 'detail') ?
-      options.detail :
-      null;
+// Use a named function so constructor.name is reliably 'CustomEvent' (Node test expects it)
+function CustomEvent(type, options = undefined) {
+  if (!new.target) {
+    throw new TypeError('Class constructor CustomEvent cannot be invoked without "new"');
   }
-  get detail() { return this[kDetail]; }
+  const inst = Reflect.construct(Event, [type, options], new.target);
+  inst[kDetail] = options && Object.prototype.hasOwnProperty.call(options, 'detail') ?
+    options.detail :
+    null;
+  return inst;
 }
+Object.setPrototypeOf(CustomEvent, Event);
+CustomEvent.prototype = Object.create(Event.prototype);
+CustomEvent.prototype.constructor = CustomEvent;
+Object.defineProperty(CustomEvent.prototype, 'detail', {
+  get() { return this[kDetail]; },
+  enumerable: true,
+  configurable: true,
+});
 Object.defineProperty(CustomEvent.prototype, Symbol.toStringTag, { value: 'CustomEvent' });
 defineEventPhases(CustomEvent);
 

@@ -1,4 +1,3 @@
 'use strict';
 
-const path = require('path');
-module.exports = require(path.resolve(__dirname, '../../../../node/lib/internal/assert.js'));
+module.exports = require('../../../../node/lib/internal/assert.js');

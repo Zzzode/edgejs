@@ -87,7 +87,10 @@ class ERR_INVALID_ARG_TYPE extends TypeError {
         }
         return `one of type ${parts.slice(0, -1).join(', ')} or ${parts[parts.length - 1]}`;
       }
-      return `of type ${String(exp)}`;
+      const s = String(exp);
+      if (s === 'Object') return 'of type object';
+      if (s === 'Function') return 'of type function';
+      return `of type ${s}`;
     }
     let received;
     if (actual == null) {
@@ -167,6 +170,15 @@ class ERR_INVALID_BUFFER_SIZE extends RangeError {
     this.code = 'ERR_INVALID_BUFFER_SIZE';
   }
 }
+
+class ERR_FALSY_VALUE_REJECTION extends TypeError {
+  constructor(reason) {
+    super(`Promise was rejected with a falsy value: ${reason}`);
+    this.code = 'ERR_FALSY_VALUE_REJECTION';
+    this.reason = reason;
+  }
+}
+ERR_FALSY_VALUE_REJECTION.HideStackFramesError = ERR_FALSY_VALUE_REJECTION;
 
 class ERR_MISSING_ARGS extends TypeError {
   constructor(...args) {
@@ -614,6 +626,13 @@ class ERR_HTTP_SOCKET_ASSIGNED extends Error {
   }
 }
 
+class ERR_IPC_CHANNEL_CLOSED extends Error {
+  constructor() {
+    super('Channel closed');
+    this.code = 'ERR_IPC_CHANNEL_CLOSED';
+  }
+}
+
 ERR_INVALID_ARG_TYPE.HideStackFramesError = ERR_INVALID_ARG_TYPE;
 ERR_INVALID_ARG_VALUE.HideStackFramesError = ERR_INVALID_ARG_VALUE;
 ERR_OUT_OF_RANGE.HideStackFramesError = ERR_OUT_OF_RANGE;
@@ -645,6 +664,11 @@ function genericNodeError(message, errorProperties) {
   return err;
 }
 
+function isStackOverflowError(err) {
+  if (!(err instanceof Error)) return false;
+  return String(err.message || '').includes('Maximum call stack size exceeded');
+}
+
 module.exports = {
   AbortError,
   DNSException,
@@ -653,6 +677,7 @@ module.exports = {
   UVExceptionWithHostPort,
   NodeAggregateError,
   hideStackFrames,
+  isStackOverflowError,
   aggregateTwoErrors,
   genericNodeError,
   codes: {
@@ -665,6 +690,7 @@ module.exports = {
     ERR_UNKNOWN_ENCODING,
     ERR_INVALID_THIS,
     ERR_INVALID_BUFFER_SIZE,
+    ERR_FALSY_VALUE_REJECTION,
     ERR_MISSING_ARGS,
     ERR_SYSTEM_ERROR,
     ERR_UNHANDLED_ERROR,
@@ -706,6 +732,7 @@ module.exports = {
     ERR_HTTP_CONTENT_LENGTH_MISMATCH,
     ERR_HTTP_HEADERS_SENT,
     ERR_HTTP_SOCKET_ASSIGNED,
+    ERR_IPC_CHANNEL_CLOSED,
   },
   kEnhanceStackBeforeInspector,
 };

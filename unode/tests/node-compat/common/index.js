@@ -171,6 +171,10 @@ function getArrayBufferViews(buffer) {
   return views;
 }
 
+function getTTYfd() {
+  return -1;
+}
+
 module.exports = {
   mustCall,
   mustCallAtLeast,
@@ -197,4 +201,5 @@ module.exports = {
   skipIf32Bits,
   spawnPromisified,
   getArrayBufferViews,
+  getTTYfd,
 };

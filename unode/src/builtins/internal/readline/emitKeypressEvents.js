@@ -1,6 +1,5 @@
 'use strict';
 
-const primordials = require('internal/util/primordials');
 const {
   SafeStringIterator,
   Symbol,

@@ -28,7 +28,12 @@ function runWithContext(code, context) {
 }
 
 function runInNewContext(code, context) {
-  return runWithContext(code, context);
+  const result = runWithContext(code, context);
+  if (typeof result === 'function') {
+    const altProto = Object.create(Function.prototype);
+    Object.setPrototypeOf(result, altProto);
+  }
+  return result;
 }
 
 function runInThisContext(code) {

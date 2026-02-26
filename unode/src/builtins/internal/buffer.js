@@ -1,13 +1,6 @@
 'use strict';
 
 const path = require('path');
-const { internalBinding, primordials } = require('internal/test/binding_runtime');
-
-if (typeof globalThis.internalBinding !== 'function') {
-  globalThis.internalBinding = internalBinding;
-}
-if (!globalThis.primordials) {
-  globalThis.primordials = primordials;
-}
+const { internalBinding } = require('internal/test/binding_runtime');
 
 module.exports = require(path.resolve(__dirname, '../../../../node/lib/internal/buffer.js'));

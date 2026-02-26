@@ -27,6 +27,7 @@ extern char** environ;
 #include "unode_tcp_wrap.h"
 #include "unode_udp_wrap.h"
 #include "unode_url.h"
+#include "unode_util.h"
 #include "unode_cares_wrap.h"
 
 namespace {
@@ -446,18 +447,12 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   UnodeInstallUdpWrapBinding(env);
   ClearPendingExceptionIfAny(env);
   UnodeInstallUrlBinding(env);
+  UnodeInstallUtilBinding(env);
   ClearPendingExceptionIfAny(env);
   status = UnodeInstallModuleLoader(env, entry_script_path);
   if (status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "UnodeInstallModuleLoader failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-  status = UnodeInstallConsole(env);
-  if (status != napi_ok) {
-    if (error_out != nullptr) {
-      *error_out = "UnodeInstallConsole failed: " + StatusToString(status);
     }
     return 1;
   }
@@ -504,16 +499,109 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
     return 1;
   }
 
-  // Minimal globals expected by Node test common (AbortController, timers, global, etc.).
-  static const char kPrelude[] =
+  // Create empty primordials container on the native side first (Node-aligned). The prelude's
+  // require('internal/test/binding_runtime') will receive this via the loader wrapper and fill
+  // it in place, so one object identity is used for all modules regardless of load order.
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "napi_get_global failed";
+    }
+    return 1;
+  }
+  napi_value primordials_container = nullptr;
+  if (napi_create_object(env, &primordials_container) != napi_ok || primordials_container == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "napi_create_object(primordials) failed";
+    }
+    return 1;
+  }
+  if (napi_set_named_property(env, global, "__unode_primordials", primordials_container) != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "napi_set_named_property(__unode_primordials) failed";
+    }
+    return 1;
+  }
+
+  // Bootstrap: load binding_runtime using a require that resolves from builtins dir (so it is found
+  // regardless of entry script path). Declare internalBinding and primordials once; do not run entry
+  // script until these are set. No try/catch so we fail fast if binding_runtime is missing.
+  static const char kBootstrapPrelude[] =
       "globalThis.global = globalThis;"
+      "var __unodeBootstrapRequire = globalThis.__unode_bootstrap_require;"
+      "if (typeof __unodeBootstrapRequire !== 'function') throw new Error('__unode_bootstrap_require is not a function');"
+      "var __itb = __unodeBootstrapRequire('internal/test/binding_runtime');"
+      "if (!__itb || typeof __itb.internalBinding !== 'function') throw new Error('internal/test/binding_runtime did not export internalBinding');"
+      "globalThis.internalBinding = __itb.internalBinding;"
+      "if (globalThis.__unode_primordials && typeof globalThis.__unode_primordials.SymbolFor === 'function') globalThis.primordials = globalThis.__unode_primordials;"
+      "else if (__itb && __itb.primordials) globalThis.primordials = __itb.primordials;";
+  napi_value bootstrap_prelude = nullptr;
+  status = napi_create_string_utf8(env, kBootstrapPrelude, NAPI_AUTO_LENGTH, &bootstrap_prelude);
+  if (status == napi_ok && bootstrap_prelude != nullptr) {
+    napi_value bootstrap_ignored = nullptr;
+    status = napi_run_script(env, bootstrap_prelude, &bootstrap_ignored);
+  }
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      std::string msg = "Bootstrap prelude failed (internalBinding not set): " + StatusToString(status);
+      if (status == napi_pending_exception) {
+        bool is_exit = false;
+        int exit_code = 0;
+        std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += " ";
+          msg += exc;
+        }
+      }
+      *error_out = msg;
+    }
+    return 1;
+  }
+
+  // Store primordials and internalBinding in the loader so they are passed from C++ when calling
+  // the module wrapper (Node-aligned: fn->Call with argv from C++, not from globalThis in JS).
+  // Only store when the value is not JS undefined (napi_get_named_property can return non-null
+  // handle for missing/undefined property).
+  napi_value global_for_refs = nullptr;
+  if (napi_get_global(env, &global_for_refs) == napi_ok && global_for_refs != nullptr) {
+    napi_value primordials_val = nullptr;
+    napi_value internal_binding_val = nullptr;
+    napi_value undefined_val = nullptr;
+    napi_get_undefined(env, &undefined_val);
+    bool primordials_is_undefined = true;
+    if (napi_get_named_property(env, global_for_refs, "primordials", &primordials_val) == napi_ok &&
+        primordials_val != nullptr && undefined_val != nullptr) {
+      napi_strict_equals(env, primordials_val, undefined_val, &primordials_is_undefined);
+    }
+    if (primordials_val != nullptr && !primordials_is_undefined) {
+      UnodeSetPrimordials(env, primordials_val);
+    }
+    bool internal_binding_is_undefined = true;
+    if (napi_get_named_property(env, global_for_refs, "internalBinding", &internal_binding_val) ==
+            napi_ok &&
+        internal_binding_val != nullptr && undefined_val != nullptr) {
+      napi_strict_equals(env, internal_binding_val, undefined_val, &internal_binding_is_undefined);
+    }
+    if (internal_binding_val != nullptr && !internal_binding_is_undefined) {
+      UnodeSetInternalBinding(env, internal_binding_val);
+    }
+  }
+
+  // Install console after bootstrap prelude and loader refs are set, so require('console') resolves
+  // from the builtins dir and its dependency (util) receives primordials/internalBinding.
+  status = UnodeInstallConsole(env);
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "UnodeInstallConsole failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+
+  // Minimal globals expected by Node test common (AbortController, timers, etc.). Optional.
+  static const char kPrelude[] =
       "try {"
-      "  var __itb = require('internal/test/binding_runtime');"
-      "  if (__itb && typeof __itb.internalBinding === 'function') globalThis.internalBinding = __itb.internalBinding;"
-      "  if (__itb && __itb.primordials) globalThis.primordials = __itb.primordials;"
-      "  if (typeof internalBinding === 'undefined' && typeof globalThis.internalBinding === 'function') internalBinding = globalThis.internalBinding;"
-      "  if (typeof primordials === 'undefined' && globalThis.primordials) primordials = globalThis.primordials;"
-      "} catch (_) {}"
+      "if (typeof internalBinding === 'undefined' && typeof globalThis.internalBinding === 'function') internalBinding = globalThis.internalBinding;"
+      "if (typeof primordials === 'undefined' && globalThis.primordials) primordials = globalThis.primordials;"
       "if (typeof globalThis.eval === 'function') {"
       "  var __unodeEval = globalThis.eval;"
       "  globalThis.eval = function(src) {"
@@ -703,7 +791,8 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
       "  alloc:function(n){return new Uint8Array(n);},allocUnsafe:function(n){return new Uint8Array(n);},"
       "  byteLength:function(x){if(typeof x==='string')return __encodeUtf8(x).byteLength;"
       "  return x&&x.byteLength!==undefined?x.byteLength:0;}};"
-      "}";
+      "}"
+      "} catch (_) {}";
   napi_value prelude = nullptr;
   status = napi_create_string_utf8(env, kPrelude, NAPI_AUTO_LENGTH, &prelude);
   if (status == napi_ok && prelude != nullptr) {
@@ -770,9 +859,12 @@ napi_status UnodeInstallConsole(napi_env env) {
   if (env == nullptr) {
     return napi_invalid_arg;
   }
+  // Install console using the bootstrap require, which resolves from the builtins dir
+  // (GetBuiltinsDirForBootstrap) and is already set up in UnodeInstallModuleLoader. This way
+  // we always load the JS console builtin when it exists, regardless of entry script path.
   napi_value script = nullptr;
   static const char kInstallConsole[] =
-      "(function(){ globalThis.console = require('console'); })();";
+      "(function(){ globalThis.console = globalThis.__unode_bootstrap_require('console'); })();";
   napi_status status = napi_create_string_utf8(env, kInstallConsole, NAPI_AUTO_LENGTH, &script);
   if (status != napi_ok || script == nullptr) {
     return (status == napi_ok) ? napi_generic_failure : status;
@@ -783,7 +875,7 @@ napi_status UnodeInstallConsole(napi_env env) {
     return napi_ok;
   }
 
-  // Fallback for scripts whose base directory has no JS console builtin.
+  // Fallback for when no JS console builtin could be loaded.
   bool has_pending = false;
   if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
     napi_value exc = nullptr;

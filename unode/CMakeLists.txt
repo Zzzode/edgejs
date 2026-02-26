@@ -85,6 +85,7 @@ add_library(unode_runtime STATIC
   src/unode_cares_wrap.cc
   src/unode_udp_wrap.cc
   src/unode_url.cc
+  src/unode_util.cc
 )
 target_include_directories(unode_runtime
   PUBLIC

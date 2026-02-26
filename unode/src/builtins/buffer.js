@@ -1,14 +1,7 @@
 'use strict';
 
 const path = require('path');
-const { internalBinding, primordials } = require('internal/test/binding_runtime');
-
-if (typeof globalThis.internalBinding !== 'function') {
-  globalThis.internalBinding = internalBinding;
-}
-if (!globalThis.primordials) {
-  globalThis.primordials = primordials;
-}
+const { internalBinding } = require('internal/test/binding_runtime');
 
 const exported = require(path.resolve(__dirname, '../../../../node/lib/buffer.js'));
 const { Buffer } = exported;
@@ -113,26 +106,8 @@ if (typeof exported.isAscii === 'function') {
   };
 }
 
-let inspectMaxBytes = typeof exported.INSPECT_MAX_BYTES === 'number' ? exported.INSPECT_MAX_BYTES : 50;
-Object.defineProperty(exported, 'INSPECT_MAX_BYTES', {
-  configurable: true,
-  enumerable: true,
-  get() {
-    return inspectMaxBytes;
-  },
-  set(value) {
-    if (typeof value !== 'number') {
-      const err = new TypeError('The "value" argument must be of type number');
-      err.code = 'ERR_INVALID_ARG_TYPE';
-      throw err;
-    }
-    if ((Number.isFinite(value) && value < 0) || Number.isNaN(value)) {
-      const err = new RangeError('The value of "value" is out of range');
-      err.code = 'ERR_OUT_OF_RANGE';
-      throw err;
-    }
-    inspectMaxBytes = Number.isFinite(value) ? Math.trunc(value) : value;
-  },
-});
+// Do not override INSPECT_MAX_BYTES; Node's buffer.js uses its own module-scope
+// variable for Buffer's [customInspectSymbol], so the property must remain
+// Node's getter/setter for the inspect test (test-buffer-inspect.js) to pass.
 
 module.exports = exported;

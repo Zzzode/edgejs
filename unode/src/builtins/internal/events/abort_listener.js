@@ -1,6 +1,6 @@
 'use strict';
 
-const { SymbolDispose } = require('internal/util/primordials');
+const { SymbolDispose } = primordials;
 
 function addAbortListener(signal, listener) {
   if (!signal || typeof signal.addEventListener !== 'function') {
