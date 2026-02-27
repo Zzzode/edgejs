@@ -1,6 +1,7 @@
 include(GoogleTest)
 
 set(NAPI_V8_GTEST_ROOT "${NAPI_V8_NODE_ROOT}/deps/googletest")
+set(UNODE_GTEST_PER_TEST_TIMEOUT_SECONDS 5)
 
 if(NAPI_V8_V8_LIBRARY)
   add_library(unode_gtest STATIC
@@ -49,6 +50,8 @@ if(NAPI_V8_V8_LIBRARY)
       ${target_name}
       DISCOVERY_TIMEOUT 30
       TEST_PREFIX "unode.${target_name}."
+      PROPERTIES
+        TIMEOUT ${UNODE_GTEST_PER_TEST_TIMEOUT_SECONDS}
     )
     # CMake 3.31 can emit duplicated add_test entries for very large gtest lists.
     # Deduplicate generated manifest entries so each gtest runs once in ctest.

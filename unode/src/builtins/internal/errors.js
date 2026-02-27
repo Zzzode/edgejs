@@ -695,6 +695,43 @@ function isStackOverflowError(err) {
   return String(err.message || '').includes('Maximum call stack size exceeded');
 }
 
+const kUvErrMap = new Map();
+function uvErrmapGet(err) {
+  const n = Number(err);
+  if (!Number.isFinite(n)) return undefined;
+  if (kUvErrMap.has(n)) return kUvErrMap.get(n);
+  const known = {
+    [-2]: 'ENOENT',
+    [-9]: 'EBADF',
+    [-12]: 'ENOMEM',
+    [-13]: 'EACCES',
+    [-22]: 'EINVAL',
+    [-55]: 'ENOBUFS',
+    [-60]: 'ETIMEDOUT',
+  };
+  if (known[n]) {
+    const entryKnown = [known[n], known[n]];
+    kUvErrMap.set(n, entryKnown);
+    return entryKnown;
+  }
+  let name;
+  try {
+    const errno = require('os').constants && require('os').constants.errno;
+    if (errno && typeof errno === 'object') {
+      for (const key of Object.keys(errno)) {
+        if (-Number(errno[key]) === n) {
+          name = key;
+          break;
+        }
+      }
+    }
+  } catch {}
+  if (!name) return undefined;
+  const entry = [name, name];
+  kUvErrMap.set(n, entry);
+  return entry;
+}
+
 module.exports = {
   AbortError,
   DNSException,
@@ -704,6 +741,7 @@ module.exports = {
   NodeAggregateError,
   hideStackFrames,
   isStackOverflowError,
+  uvErrmapGet,
   aggregateTwoErrors,
   genericNodeError,
   codes: {

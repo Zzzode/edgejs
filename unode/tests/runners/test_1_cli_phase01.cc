@@ -167,6 +167,30 @@ TEST_F(Test1CliPhase01, RuntimeSyntaxErrorReturnsNonZero) {
   RemoveTempScript(script_path);
 }
 
+TEST_F(Test1CliPhase01, EvalFlagExecutesSource) {
+  const char* argv[] = {"unode", "-e", "console.log('eval-ok')"};
+  testing::internal::CaptureStdout();
+  std::string error;
+  const int exit_code = UnodeRunCli(3, argv, &error);
+  const std::string stdout_output = testing::internal::GetCapturedStdout();
+
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+  EXPECT_NE(stdout_output.find("eval-ok"), std::string::npos);
+}
+
+TEST_F(Test1CliPhase01, PrintFlagEvaluatesExpression) {
+  const char* argv[] = {"unode", "-p", "40 + 2"};
+  testing::internal::CaptureStdout();
+  std::string error;
+  const int exit_code = UnodeRunCli(3, argv, &error);
+  const std::string stdout_output = testing::internal::GetCapturedStdout();
+
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+  EXPECT_NE(stdout_output.find("42"), std::string::npos);
+}
+
 TEST_F(Test1CliPhase01, BeforeExitCanScheduleMoreWork) {
   const std::string script_path = WriteTempScript(
       "unode_phase01_cli_before_exit_loop",

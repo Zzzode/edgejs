@@ -4,6 +4,10 @@ const assert = require('assert');
 const childProcess = require('child_process');
 const fs = require('fs');
 try { require('internal/event_target'); } catch {}
+const processRef = globalThis.process;
+if (processRef && typeof processRef.getgroups !== 'function') {
+  processRef.getgroups = () => [];
+}
 
 const mustCallChecks = [];
 
@@ -18,7 +22,7 @@ function runCallChecks(exitCode) {
     console.log('Mismatched function calls. Expected %s, actual %d.', seg, c.actual);
     console.log((c.stack || '').split('\n').slice(2).join('\n'));
   });
-  if (failed.length) process.exit(1);
+  if (failed.length && processRef && typeof processRef.exit === 'function') processRef.exit(1);
 }
 
 function _mustCallInner(fn, criteria, field) {
@@ -34,7 +38,9 @@ function _mustCallInner(fn, criteria, field) {
     stack: (new Error()).stack,
     name: fn.name || '<anonymous>',
   };
-  if (mustCallChecks.length === 0) process.on('exit', runCallChecks);
+  if (mustCallChecks.length === 0 && processRef && typeof processRef.on === 'function') {
+    processRef.on('exit', runCallChecks);
+  }
   mustCallChecks.push(context);
   return function () {
     context.actual++;
@@ -123,6 +129,9 @@ const isDumbTerminal = typeof process !== 'undefined' &&
   process.env.TERM === 'dumb';
 const localhostIPv4 = '127.0.0.1';
 const localhostIPv6 = '::1';
+const pwdCommand = isWindows ?
+  ['cmd.exe', ['/d', '/c', 'cd']] :
+  ['pwd', []];
 const PIPE = isWindows ?
   `\\\\.\\pipe\\node-napi-test-${process.pid}` :
   (20000 + (process.pid % 20000));
@@ -136,7 +145,7 @@ function canCreateSymLink() {
 
 function skip(msg) {
   console.log(`1..0 # Skipped: ${msg || ''}`.trim());
-  process.exit(0);
+  if (processRef && typeof processRef.exit === 'function') processRef.exit(0);
 }
 
 function printSkipMessage(msg) {
@@ -201,6 +210,20 @@ function allowGlobals() {
   // No-op in compatibility harness.
 }
 
+function escapePOSIXShell(cmdParts, ...args) {
+  if (isWindows) {
+    return [String.raw({ raw: cmdParts }, ...args)];
+  }
+  const env = { ...(process.env || {}) };
+  let cmd = cmdParts[0];
+  for (let i = 0; i < args.length; i++) {
+    const envVarName = `ESCAPED_${i}`;
+    env[envVarName] = args[i];
+    cmd += '${' + envVarName + '}' + cmdParts[i + 1];
+  }
+  return [cmd, { env }];
+}
+
 module.exports = {
   mustCall,
   mustCallAtLeast,
@@ -220,6 +243,7 @@ module.exports = {
   isDumbTerminal,
   localhostIPv4,
   localhostIPv6,
+  pwdCommand,
   PIPE,
   hasCrypto,
   canCreateSymLink,
@@ -232,4 +256,5 @@ module.exports = {
   getTTYfd,
   runWithInvalidFD,
   allowGlobals,
+  escapePOSIXShell,
 };

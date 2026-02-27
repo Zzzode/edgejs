@@ -38,9 +38,10 @@ const {
   setPriority: _setPriority,
 } = binding;
 
-function getCheckedFunction(fn) {
+function getCheckedFunction(fnOrName) {
   return hideStackFrames(function checkError() {
     const ctx = {};
+    const fn = typeof fnOrName === 'string' ? binding[fnOrName] : fnOrName;
     const ret = fn(ctx);
     if (ret === undefined) {
       throw new ERR_SYSTEM_ERROR.HideStackFramesError(ctx);
@@ -56,10 +57,12 @@ const {
   3: machine,
 } = _getOSInformation();
 
-const getHomeDirectory = getCheckedFunction(_getHomeDirectory);
-const getHostname = getCheckedFunction(_getHostname);
-const getInterfaceAddresses = getCheckedFunction(_getInterfaceAddresses);
-const getUptime = getCheckedFunction(_getUptime);
+// Keep these late-bound so tests that monkey-patch internalBinding('os')
+// before requiring os still observe the patched implementations.
+const getHomeDirectory = getCheckedFunction('getHomeDirectory');
+const getHostname = getCheckedFunction('getHostname');
+const getInterfaceAddresses = getCheckedFunction('getInterfaceAddresses');
+const getUptime = getCheckedFunction('getUptime');
 
 const getOSRelease = () => release;
 const getOSType = () => type;

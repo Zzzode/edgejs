@@ -97,12 +97,14 @@ add_library(unode_runtime STATIC
   src/unode_string_decoder.cc
   src/unode_http_parser.cc
   src/unode_stream_wrap.cc
+  src/unode_process_wrap.cc
   src/unode_tcp_wrap.cc
   src/unode_pipe_wrap.cc
   src/unode_cares_wrap.cc
   src/unode_udp_wrap.cc
   src/unode_url.cc
   src/unode_util.cc
+  src/unode_spawn_sync.cc
   src/unode_timers_host.cc
   src/crypto/unode_crypto_binding.cc
   src/unode_crypto.cc

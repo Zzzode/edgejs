@@ -48,6 +48,9 @@ function getOptionValue(name) {
     case '--dns-result-order':
       return 'verbatim';
     case '--max-http-header-size':
+      if (typeof flags['--max-http-header-size'] === 'number') {
+        return flags['--max-http-header-size'];
+      }
       return 16 * 1024;
     default:
       return false;

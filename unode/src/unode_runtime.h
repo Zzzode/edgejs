@@ -14,6 +14,10 @@ napi_status UnodeInstallProcessObject(napi_env env,
                                       const std::string& process_title);
 napi_status UnodeInstallUnofficialNapiTestingUntilGc(napi_env env, napi_value target);
 int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* error_out);
+int UnodeRunScriptSourceWithLoop(napi_env env,
+                               const char* source_text,
+                               std::string* error_out,
+                               bool keep_event_loop_alive);
 int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out);
 int UnodeRunScriptFileWithLoop(napi_env env,
                                const char* script_path,

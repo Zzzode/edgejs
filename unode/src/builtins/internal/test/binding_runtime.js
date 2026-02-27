@@ -10,6 +10,7 @@ const UV_ECANCELED = -89;
 const UV_ETIMEDOUT = -60;
 const UV_ENOMEM = -12;
 const UV_ENOTSOCK = -88;
+const UV_ESRCH = -3;
 const UV_UNKNOWN = -4094;
 const UV_EAI_MEMORY = -3001;
 const kNativeTimersBinding = (typeof globalThis === 'object' && globalThis) ?
@@ -476,6 +477,15 @@ class UnodeTTYWrap {
 
 function internalBinding(name) {
   if (name === 'uv') {
+    const uvErrorMap = new Map([
+      [-2, ['ENOENT', 'no such file or directory']],
+      [-9, ['EBADF', 'bad file descriptor']],
+      [-12, ['ENOMEM', 'out of memory']],
+      [-13, ['EACCES', 'permission denied']],
+      [-22, ['EINVAL', 'invalid argument']],
+      [-55, ['ENOBUFS', 'no buffer space available']],
+      [-60, ['ETIMEDOUT', 'connection timed out']],
+    ]);
     return {
       UV_ENOENT,
       UV_EEXIST,
@@ -489,6 +499,13 @@ function internalBinding(name) {
       UV_ENOTSOCK,
       UV_UNKNOWN,
       UV_EAI_MEMORY,
+      getErrorMap() {
+        return uvErrorMap;
+      },
+      getErrorMessage(err) {
+        const row = uvErrorMap.get(Number(err));
+        return row ? String(row[1]) : `Unknown system error ${String(err)}`;
+      },
     };
   }
   if (name === 'constants') {
@@ -654,6 +671,48 @@ function internalBinding(name) {
   }
   if (name === 'http_parser') return globalThis.__unode_http_parser || {};
   if (name === 'stream_wrap') return globalThis.__unode_stream_wrap || {};
+  if (name === 'process_wrap') {
+    if (globalThis.__unode_process_wrap && typeof globalThis.__unode_process_wrap === 'object') {
+      return globalThis.__unode_process_wrap;
+    }
+    class Process {
+      constructor() {
+        this.pid = 0;
+        this._alive = false;
+        this.onexit = null;
+      }
+
+      spawn(_options) {
+        if (this._alive) return UV_EINVAL;
+        let nextPid = typeof globalThis.__unode_process_wrap_pid === 'number' ?
+          globalThis.__unode_process_wrap_pid : 30000;
+        nextPid += 1;
+        globalThis.__unode_process_wrap_pid = nextPid;
+        this.pid = nextPid;
+        this._alive = true;
+        return 0;
+      }
+
+      kill(signal) {
+        if (!this._alive) return UV_ESRCH;
+        if (signal === 0) return 0;
+        this._alive = false;
+        const signalCode = signal == null ? 'SIGTERM' : signal;
+        process.nextTick(() => {
+          if (typeof this.onexit === 'function') this.onexit(0, signalCode);
+        });
+        return 0;
+      }
+
+      close() {
+        this._alive = false;
+      }
+
+      ref() {}
+      unref() {}
+    }
+    return { Process };
+  }
   if (name === 'js_stream') {
     class JSStream {
       constructor() {
@@ -920,6 +979,52 @@ function internalBinding(name) {
       TTY: UnodeTTYWrap,
       isTTY(fd) {
         return Number.isInteger(fd) && fd >= 0 && fd <= 2;
+      },
+    };
+  }
+  if (name === 'spawn_sync') {
+    const nativeSpawnSync = globalThis.__unode_spawn_sync;
+    const normalizeResult = (raw) => {
+      const result = raw && typeof raw === 'object' ? raw : {};
+      const outputIn = Array.isArray(result.output) ? result.output : [null, '', ''];
+      const toBuffer = (v) => {
+        if (Buffer.isBuffer(v)) return v;
+        if (typeof v === 'string') return Buffer.from(v, 'utf8');
+        if (v && typeof v === 'object' && typeof v.byteLength === 'number') {
+          try { return Buffer.from(v.buffer, v.byteOffset || 0, v.byteLength); } catch {}
+        }
+        return Buffer.alloc(0);
+      };
+      const output = [null, toBuffer(outputIn[1]), toBuffer(outputIn[2])];
+      return {
+        pid: typeof result.pid === 'number' ? result.pid : 0,
+        output,
+        status: result.status ?? null,
+        signal: result.signal ?? null,
+        error: result.error,
+      };
+    };
+    if (nativeSpawnSync && typeof nativeSpawnSync.spawn === 'function') {
+      return {
+        spawn(options) {
+          return normalizeResult(nativeSpawnSync.spawn(options));
+        },
+      };
+    }
+    return {
+      spawn(options) {
+        const cp = require('child_process');
+        const file = options && options.file ? String(options.file) : '';
+        const args = options && Array.isArray(options.args) ? options.args.slice(1).map((v) => String(v)) : [];
+        const timeout = options && Number.isFinite(options.timeout) ? Number(options.timeout) : 0;
+        const result = cp.spawnSync(file, args, { timeout });
+        return normalizeResult({
+          pid: typeof result.pid === 'number' ? result.pid : 0,
+          output: [null, result.stdout || Buffer.alloc(0), result.stderr || Buffer.alloc(0)],
+          status: result.status ?? null,
+          signal: result.signal ?? null,
+          error: result.error ? UV_EINVAL : undefined,
+        });
       },
     };
   }

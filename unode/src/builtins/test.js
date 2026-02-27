@@ -2,7 +2,7 @@
 
 function runBody(fn) {
   if (typeof fn !== 'function') return;
-  const t = { assert: require('assert') };
+  const t = { assert: require('assert'), mock };
   try {
     if (fn.length >= 2) {
       const done = (err) => {
@@ -74,12 +74,19 @@ function afterEach(fn) { runBody(fn); }
 const mock = {
   method(object, key, implementation) {
     const original = object[key];
+    const calls = [];
     function wrapped() {
-      return implementation.apply(this, arguments);
+      const args = Array.prototype.slice.call(arguments);
+      calls.push({ arguments: args });
+      if (typeof implementation === 'function') {
+        return implementation.apply(this, arguments);
+      }
+      return original.apply(this, arguments);
     }
     wrapped.wrappedMethod = original;
     object[key] = wrapped;
     return {
+      mock: { calls },
       restore() {
         object[key] = original;
       },

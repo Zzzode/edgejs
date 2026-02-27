@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -27,6 +28,26 @@ const auto g_process_start_time = std::chrono::steady_clock::now();
 const auto g_cpu_usage_start = std::chrono::steady_clock::now();
 std::string g_unode_exec_path;
 uint32_t g_process_umask = 0022;
+
+std::string MaybePreferSiblingUnodeBinary(const std::string& detected_exec_path) {
+  if (detected_exec_path.empty()) return detected_exec_path;
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::path detected = fs::path(detected_exec_path).lexically_normal();
+  const std::string filename = detected.filename().string();
+  if (filename.rfind("unode_test_", 0) != 0) {
+    return detected_exec_path;
+  }
+  const fs::path sibling = detected.parent_path().parent_path() / "unode";
+  if (!fs::exists(sibling, ec) || ec) {
+    return detected_exec_path;
+  }
+  const fs::path canonical = fs::weakly_canonical(sibling, ec);
+  if (ec) {
+    return sibling.string();
+  }
+  return canonical.string();
+}
 
 const char* DetectPlatform() {
 #if defined(_WIN32)
@@ -59,6 +80,10 @@ const char* DetectArch() {
 }
 
 std::string DetectExecPath() {
+  const char* forced_exec = std::getenv("UNODE_EXEC_PATH");
+  if (forced_exec != nullptr && forced_exec[0] != '\0') {
+    return forced_exec;
+  }
 #if defined(__APPLE__)
   uint32_t size = 0;
   _NSGetExecutablePath(nullptr, &size);
@@ -67,9 +92,9 @@ std::string DetectExecPath() {
     if (_NSGetExecutablePath(buf.data(), &size) == 0) {
       char resolved[4096] = {'\0'};
       if (realpath(buf.data(), resolved) != nullptr) {
-        return std::string(resolved);
+        return MaybePreferSiblingUnodeBinary(std::string(resolved));
       }
-      return std::string(buf.data());
+      return MaybePreferSiblingUnodeBinary(std::string(buf.data()));
     }
   }
   return "unode";
@@ -78,7 +103,7 @@ std::string DetectExecPath() {
   ssize_t n = readlink("/proc/self/exe", buf.data(), buf.size() - 1);
   if (n > 0) {
     buf[static_cast<size_t>(n)] = '\0';
-    return std::string(buf.data());
+    return MaybePreferSiblingUnodeBinary(std::string(buf.data()));
   }
   return "unode";
 #elif defined(_WIN32)
@@ -651,13 +676,13 @@ napi_status UnodeInstallProcessObject(napi_env env,
 
   napi_value argv_arr = nullptr;
   const bool has_script_path = !current_script_path.empty();
-  const size_t argv_len = has_script_path ? (2 + script_argv.size()) : 0;
+  const size_t argv_len = has_script_path ? (2 + script_argv.size()) : (1 + script_argv.size());
   status = napi_create_array_with_length(env, argv_len, &argv_arr);
   if (status != napi_ok || argv_arr == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  napi_value exec_argv0 = nullptr;
+  napi_create_string_utf8(env, g_unode_exec_path.c_str(), NAPI_AUTO_LENGTH, &exec_argv0);
+  if (exec_argv0 != nullptr) napi_set_element(env, argv_arr, 0, exec_argv0);
   if (has_script_path) {
-    napi_value exec_argv0 = nullptr;
-    napi_create_string_utf8(env, g_unode_exec_path.c_str(), NAPI_AUTO_LENGTH, &exec_argv0);
-    if (exec_argv0 != nullptr) napi_set_element(env, argv_arr, 0, exec_argv0);
     napi_value script_argv1 = nullptr;
     napi_create_string_utf8(env, current_script_path.c_str(), NAPI_AUTO_LENGTH, &script_argv1);
     if (script_argv1 != nullptr) napi_set_element(env, argv_arr, 1, script_argv1);
@@ -666,6 +691,14 @@ napi_status UnodeInstallProcessObject(napi_env env,
       if (napi_create_string_utf8(env, script_argv[i].c_str(), NAPI_AUTO_LENGTH, &arg) == napi_ok &&
           arg != nullptr) {
         napi_set_element(env, argv_arr, static_cast<uint32_t>(i + 2), arg);
+      }
+    }
+  } else {
+    for (size_t i = 0; i < script_argv.size(); ++i) {
+      napi_value arg = nullptr;
+      if (napi_create_string_utf8(env, script_argv[i].c_str(), NAPI_AUTO_LENGTH, &arg) == napi_ok &&
+          arg != nullptr) {
+        napi_set_element(env, argv_arr, static_cast<uint32_t>(i + 1), arg);
       }
     }
   }

@@ -26,6 +26,7 @@
 #include "unode_pipe_wrap.h"
 #include "unode_runtime_platform.h"
 #include "unode_stream_wrap.h"
+#include "unode_process_wrap.h"
 #include "unode_string_decoder.h"
 #include "unode_tcp_wrap.h"
 #include "unode_udp_wrap.h"
@@ -33,6 +34,7 @@
 #include "unode_util.h"
 #include "unode_cares_wrap.h"
 #include "unode_timers_host.h"
+#include "unode_spawn_sync.h"
 
 namespace {
 
@@ -701,6 +703,8 @@ int RunScriptWithGlobals(napi_env env,
   ClearPendingExceptionIfAny(env);
   UnodeInstallStreamWrapBinding(env);
   ClearPendingExceptionIfAny(env);
+  UnodeInstallProcessWrapBinding(env);
+  ClearPendingExceptionIfAny(env);
   UnodeInstallTcpWrapBinding(env);
   ClearPendingExceptionIfAny(env);
   UnodeInstallPipeWrapBinding(env);
@@ -711,6 +715,7 @@ int RunScriptWithGlobals(napi_env env,
   ClearPendingExceptionIfAny(env);
   UnodeInstallUrlBinding(env);
   UnodeInstallUtilBinding(env);
+  UnodeInstallSpawnSyncBinding(env);
   UnodeInstallTimersHostBinding(env);
   UnodeInstallCryptoBinding(env);
   ClearPendingExceptionIfAny(env);
@@ -1320,26 +1325,31 @@ int RunScriptWithGlobals(napi_env env,
       "}"
       "if (typeof globalThis.AbortController === 'undefined') {"
       "  globalThis.AbortController = function AbortController() {"
-      "    var listeners = [];"
-      "    this.signal = {"
-      "      aborted: false,"
-      "      addEventListener: function(type, fn) { if (type === 'abort' && typeof fn === 'function') listeners.push(fn); },"
-      "      removeEventListener: function(type, fn) { if (type !== 'abort') return; listeners = listeners.filter(function(l){ return l !== fn; }); }"
-      "    };"
-      "    this.abort = function() {"
+      "    var E = null;"
+      "    try { E = require('events').EventEmitter; } catch (_) {}"
+      "    var s = (typeof E === 'function') ? new E() : {};"
+      "    s.aborted = false;"
+      "    s.reason = undefined;"
+      "    if (typeof s.addEventListener !== 'function') {"
+      "      s.addEventListener = function(type, fn) { if (type === 'abort' && typeof this.on === 'function') this.on('abort', fn); };"
+      "    }"
+      "    if (typeof s.removeEventListener !== 'function') {"
+      "      s.removeEventListener = function(type, fn) { if (type === 'abort' && typeof this.removeListener === 'function') this.removeListener('abort', fn); };"
+      "    }"
+      "    this.signal = s;"
+      "    this.abort = function(reason) {"
       "      if (this.signal.aborted) return;"
       "      this.signal.aborted = true;"
-      "      var copy = listeners.slice();"
-      "      listeners.length = 0;"
-      "      for (var i = 0; i < copy.length; i++) { try { copy[i](); } catch (_) {} }"
+      "      this.signal.reason = reason;"
+      "      if (typeof this.signal.emit === 'function') this.signal.emit('abort');"
       "    };"
       "  };"
       "}"
       "if (typeof globalThis.AbortSignal === 'undefined') {"
       "  globalThis.AbortSignal = {"
-      "    abort: function() {"
+      "    abort: function(reason) {"
       "      var c = new globalThis.AbortController();"
-      "      c.abort();"
+      "      c.abort(reason);"
       "      return c.signal;"
       "    }"
       "  };"
@@ -1355,8 +1365,13 @@ int RunScriptWithGlobals(napi_env env,
       "} catch (_) {}"
       "if (typeof globalThis.setImmediate === 'undefined') {"
       "  globalThis.setImmediate = function(f) {"
+      "    if (typeof f !== 'function') {"
+      "      var e0 = new TypeError('The \"callback\" argument must be of type function.');"
+      "      e0.code = 'ERR_INVALID_ARG_TYPE';"
+      "      throw e0;"
+      "    }"
       "    var args = Array.prototype.slice.call(arguments, 1);"
-      "    if (typeof f === 'function') globalThis.queueMicrotask(function() { f.apply(null, args); });"
+      "    globalThis.queueMicrotask(function() { f.apply(null, args); });"
       "    return { unref: function(){ return this; }, ref: function(){ return this; } };"
       "  };"
       "}"
@@ -1364,13 +1379,27 @@ int RunScriptWithGlobals(napi_env env,
       "  globalThis.clearImmediate = function() {};"
       "}"
       "if (typeof globalThis.setInterval === 'undefined') {"
-      "  globalThis.setInterval = function() { return { unref: function(){ return this; }, ref: function(){ return this; } }; };"
+      "  globalThis.setInterval = function(cb) {"
+      "    if (typeof cb !== 'function') {"
+      "      var e1 = new TypeError('The \"callback\" argument must be of type function.');"
+      "      e1.code = 'ERR_INVALID_ARG_TYPE';"
+      "      throw e1;"
+      "    }"
+      "    return { unref: function(){ return this; }, ref: function(){ return this; } };"
+      "  };"
       "}"
       "if (typeof globalThis.clearInterval === 'undefined') {"
       "  globalThis.clearInterval = function() {};"
       "}"
       "if (typeof globalThis.setTimeout === 'undefined') {"
-      "  globalThis.setTimeout = function() { return { unref: function(){ return this; }, ref: function(){ return this; } }; };"
+      "  globalThis.setTimeout = function(cb) {"
+      "    if (typeof cb !== 'function') {"
+      "      var e2 = new TypeError('The \"callback\" argument must be of type function.');"
+      "      e2.code = 'ERR_INVALID_ARG_TYPE';"
+      "      throw e2;"
+      "    }"
+      "    return { unref: function(){ return this; }, ref: function(){ return this; } };"
+      "  };"
       "}"
       "if (typeof globalThis.clearTimeout === 'undefined') {"
       "  globalThis.clearTimeout = function() {};"
@@ -1389,9 +1418,14 @@ int RunScriptWithGlobals(napi_env env,
       "  var __cim = globalThis.clearImmediate;"
       "  if (typeof __st === 'function') {"
       "    globalThis.setTimeout = function(cb, ms){"
+      "      if (typeof cb !== 'function') {"
+      "        var e3 = new TypeError('The \"callback\" argument must be of type function.');"
+      "        e3.code = 'ERR_INVALID_ARG_TYPE';"
+      "        throw e3;"
+      "      }"
       "      var args = Array.prototype.slice.call(arguments, 2);"
       "      var h;"
-      "      var wrapped = function(){ __ar.delete(h); if (typeof cb === 'function') return Reflect.apply(cb, this, arguments); };"
+      "      var wrapped = function(){ __ar.delete(h); return Reflect.apply(cb, this, arguments); };"
       "      h = __st.apply(globalThis, [wrapped, ms].concat(args));"
       "      __ar.set(h, 'Timeout');"
       "      return h;"
@@ -1400,6 +1434,11 @@ int RunScriptWithGlobals(napi_env env,
       "  if (typeof __ct === 'function') globalThis.clearTimeout = function(h){ __ar.delete(h); return __ct(h); };"
       "  if (typeof __si === 'function') {"
       "    globalThis.setInterval = function(cb, ms){"
+      "      if (typeof cb !== 'function') {"
+      "        var e4 = new TypeError('The \"callback\" argument must be of type function.');"
+      "        e4.code = 'ERR_INVALID_ARG_TYPE';"
+      "        throw e4;"
+      "      }"
       "      var args = Array.prototype.slice.call(arguments, 2);"
       "      var h = __si.apply(globalThis, [cb, ms].concat(args));"
       "      __ar.set(h, 'Timeout');"
@@ -1409,9 +1448,14 @@ int RunScriptWithGlobals(napi_env env,
       "  if (typeof __ci === 'function') globalThis.clearInterval = function(h){ __ar.delete(h); return __ci(h); };"
       "  if (typeof __sim === 'function') {"
       "    globalThis.setImmediate = function(cb){"
+      "      if (typeof cb !== 'function') {"
+      "        var e5 = new TypeError('The \"callback\" argument must be of type function.');"
+      "        e5.code = 'ERR_INVALID_ARG_TYPE';"
+      "        throw e5;"
+      "      }"
       "      var args = Array.prototype.slice.call(arguments, 1);"
       "      var h;"
-      "      var wrapped = function(){ __ar.delete(h); if (typeof cb === 'function') return Reflect.apply(cb, this, arguments); };"
+      "      var wrapped = function(){ __ar.delete(h); return Reflect.apply(cb, this, arguments); };"
       "      h = __sim.apply(globalThis, [wrapped].concat(args));"
       "      __ar.set(h, 'Immediate');"
       "      return h;"
@@ -1629,7 +1673,7 @@ int RunScriptWithGlobals(napi_env env,
       "        throw ea;"
       "      }"
       "      if (execPath !== process.execPath) {"
-      "        var ef = new Error('process.execve failed with error code ENOENT');"
+      "        var ef = new Error('process.execve failed with error code ENOENT\\n    at execve (node:internal/process/per_thread:1:1)');"
       "        ef.code = 'ENOENT';"
       "        ef.stack = 'Error: process.execve failed with error code ENOENT\\n    at execve (node:internal/process/per_thread:1:1)';"
       "        throw ef;"
@@ -1691,6 +1735,22 @@ int RunScriptWithGlobals(napi_env env,
       "              case -111: return 'ECONNREFUSED';"
       "              default: return 'UNKNOWN';"
       "            }"
+      "          },"
+      "          getErrorMap: function() {"
+      "            return new Map(["
+      "              [-2, ['ENOENT', 'no such file or directory']],"
+      "              [-9, ['EBADF', 'bad file descriptor']],"
+      "              [-12, ['ENOMEM', 'out of memory']],"
+      "              [-13, ['EACCES', 'permission denied']],"
+      "              [-22, ['EINVAL', 'invalid argument']],"
+      "              [-55, ['ENOBUFS', 'no buffer space available']],"
+      "              [-60, ['ETIMEDOUT', 'connection timed out']],"
+      "            ]);"
+      "          },"
+      "          getErrorMessage: function(code) {"
+      "            var map = this.getErrorMap();"
+      "            var row = map.get(Number(code));"
+      "            return row ? String(row[1]) : ('Unknown system error ' + String(code));"
       "          }"
       "        };"
       "      }"
@@ -1719,7 +1779,7 @@ int RunScriptWithGlobals(napi_env env,
       "      if (typeof globalThis.internalBinding === 'function') {"
       "        var __allow = {"
       "          buffer: 1, cares_wrap: 1, constants: 1, contextify: 1, fs: 1, fs_event_wrap: 1,"
-      "          icu: 1, inspector: 1, js_stream: 1, natives: 1, os: 1, pipe_wrap: 1, spawn_sync: 1,"
+      "          icu: 1, inspector: 1, js_stream: 1, natives: 1, os: 1, pipe_wrap: 1, process_wrap: 1, spawn_sync: 1,"
       "          stream_wrap: 1, tcp_wrap: 1, tls_wrap: 1, tty_wrap: 1, udp_wrap: 1, util: 1, uv: 1, zlib: 1"
       "        };"
       "        var out = globalThis.internalBinding(name);"
@@ -2024,11 +2084,18 @@ napi_status UnodeInstallConsole(napi_env env) {
   return napi_set_named_property(env, global, "console", console_obj);
 }
 
-int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* error_out) {
+int UnodeRunScriptSourceWithLoop(napi_env env,
+                               const char* source_text,
+                               std::string* error_out,
+                               bool keep_event_loop_alive) {
   if (error_out != nullptr) {
     error_out->clear();
   }
-  return RunScriptWithGlobals(env, source_text, nullptr, error_out, false);
+  return RunScriptWithGlobals(env, source_text, nullptr, error_out, keep_event_loop_alive);
+}
+
+int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* error_out) {
+  return UnodeRunScriptSourceWithLoop(env, source_text, error_out, false);
 }
 
 int UnodeRunScriptFileWithLoop(napi_env env,
