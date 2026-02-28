@@ -2,9 +2,11 @@
 
 #include <filesystem>
 #include <functional>
+#include <iostream>
 #include <string>
 #include <vector>
 
+#include "../../node/src/node_version.h"
 #include "unofficial_napi.h"
 #include "unode_runtime.h"
 
@@ -112,6 +114,11 @@ int UnodeRunCli(int argc, const char* const* argv, std::string* error_out) {
       *error_out = kUsage;
     }
     return 1;
+  }
+  if (argv[1] != nullptr &&
+      (std::string(argv[1]) == "-v" || std::string(argv[1]) == "--version")) {
+    std::cout << NODE_VERSION << "\n";
+    return 0;
   }
   int mode_index = -1;
   std::string mode;

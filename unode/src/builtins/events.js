@@ -124,21 +124,4 @@ exported.getMaxListeners = function getMaxListenersPatched(emitterOrTarget) {
   return originalGetMaxListeners(emitterOrTarget);
 };
 
-const originalEmit = exported.EventEmitter.prototype.emit;
-exported.EventEmitter.prototype.emit = function emit(type, ...args) {
-  if (type === 'error' &&
-      this.listenerCount &&
-      this.listenerCount('error') === 0 &&
-      typeof process === 'object' &&
-      process &&
-      typeof process.listenerCount === 'function' &&
-      process.listenerCount('uncaughtException') > 0 &&
-      typeof process.emit === 'function') {
-    const err = args[0] instanceof Error ? args[0] : new Error(String(args[0] ?? 'Error'));
-    process.emit('uncaughtException', err);
-    return false;
-  }
-  return originalEmit.call(this, type, ...args);
-};
-
 module.exports = exported;

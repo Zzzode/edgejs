@@ -465,6 +465,13 @@ class ExceptionWithHostPort extends Error {
   }
 }
 
+class ConnResetException extends Error {
+  constructor(msg) {
+    super(msg);
+    this.code = 'ECONNRESET';
+  }
+}
+
 class ERR_SOCKET_ALREADY_BOUND extends Error {
   constructor() {
     super('Socket is already bound');
@@ -734,6 +741,7 @@ function uvErrmapGet(err) {
 
 module.exports = {
   AbortError,
+  ConnResetException,
   DNSException,
   ErrnoException,
   ExceptionWithHostPort,

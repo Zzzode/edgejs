@@ -13,11 +13,13 @@
 
 #include "unode_runtime.h"
 #include "unode_stream_wrap.h"
+#include "unode_tcp_wrap.h"
 
 namespace {
 
 constexpr int kPipeSocket = 0;
 constexpr int kPipeServer = 1;
+constexpr int kPipeIPC = 2;
 
 struct PipeWrap;
 
@@ -245,6 +247,12 @@ napi_value PipeCtor(napi_env env, napi_callback_info info) {
   wrap->env = env;
   wrap->async_id = g_next_pipe_async_id++;
   int ipc = 0;
+  if (argc >= 1 && argv[0] != nullptr) {
+    int32_t type = 0;
+    if (napi_get_value_int32(env, argv[0], &type) == napi_ok && type == kPipeIPC) {
+      ipc = 1;
+    }
+  }
   uv_pipe_init(uv_default_loop(), &wrap->handle, ipc);
   wrap->handle.data = wrap;
   napi_wrap(env, self, wrap, PipeFinalize, nullptr, &wrap->wrapper_ref);
@@ -368,8 +376,8 @@ napi_value PipeReadStop(napi_env env, napi_callback_info info) {
 }
 
 napi_value PipeWriteBuffer(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr};
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
   napi_value self = nullptr;
   napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   PipeWrap* wrap = nullptr;
@@ -378,6 +386,7 @@ napi_value PipeWriteBuffer(napi_env env, napi_callback_info info) {
 
   size_t length = 0;
   void* raw = nullptr;
+  std::string temp_utf8;
   bool is_typed = false;
   napi_is_typedarray(env, argv[1], &is_typed);
   if (is_typed) {
@@ -386,9 +395,9 @@ napi_value PipeWriteBuffer(napi_env env, napi_callback_info info) {
     size_t off;
     napi_get_typedarray_info(env, argv[1], &tt, &length, &raw, &ab, &off);
   } else {
-    std::string s = ValueToUtf8(env, argv[1]);
-    length = s.size();
-    raw = const_cast<char*>(s.data());
+    temp_utf8 = ValueToUtf8(env, argv[1]);
+    length = temp_utf8.size();
+    raw = const_cast<char*>(temp_utf8.data());
   }
 
   auto* wr = new PipeWriteReqWrap();
@@ -401,7 +410,17 @@ napi_value PipeWriteBuffer(napi_env env, napi_callback_info info) {
   wrap->bytes_written += length;
   SetState(kUnodeBytesWritten, static_cast<int32_t>(length));
   SetState(kUnodeLastWriteWasAsync, 1);
-  int rc = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), &wr->buf, 1, OnWriteDone);
+  uv_stream_t* send_handle = nullptr;
+  if (argc >= 3 && argv[2] != nullptr) {
+    send_handle = UnodeTcpWrapGetStream(env, argv[2]);
+    if (send_handle == nullptr) send_handle = UnodePipeWrapGetStream(env, argv[2]);
+  }
+  int rc;
+  if (send_handle != nullptr) {
+    rc = uv_write2(&wr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), &wr->buf, 1, send_handle, OnWriteDone);
+  } else {
+    rc = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), &wr->buf, 1, OnWriteDone);
+  }
   if (rc != 0) {
     napi_value req_obj = GetRefValue(env, wr->req_obj_ref);
     SetReqError(env, req_obj, rc);
@@ -539,6 +558,13 @@ napi_value PipeFchmod(napi_env env, napi_callback_info info) {
 #endif
 }
 
+napi_value PipeUseUserBuffer(napi_env env, napi_callback_info info) {
+  (void)info;
+  napi_value u = nullptr;
+  napi_get_undefined(env, &u);
+  return u;
+}
+
 napi_value PipeRef(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
@@ -633,6 +659,82 @@ napi_value PipeGetPeerName(napi_env env, napi_callback_info info) {
   return MakeInt32(env, rc);
 }
 
+napi_value PipeAcceptPendingHandle(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
+  PipeWrap* wrap = nullptr;
+  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  if (!wrap) {
+    napi_value u = nullptr;
+    napi_get_undefined(env, &u);
+    return u;
+  }
+  int count = uv_pipe_pending_count(&wrap->handle);
+  if (count <= 0) {
+    napi_value u = nullptr;
+    napi_get_undefined(env, &u);
+    return u;
+  }
+
+  uv_handle_type pending_type = uv_pipe_pending_type(&wrap->handle);
+  napi_value handle_obj = nullptr;
+  uv_stream_t* stream = nullptr;
+
+  if (pending_type == UV_TCP) {
+    napi_value global = nullptr;
+    napi_value tcp_binding = nullptr;
+    napi_value tcp_ctor = nullptr;
+    napi_value arg = nullptr;
+    if (napi_get_global(env, &global) != napi_ok ||
+        global == nullptr ||
+        napi_get_named_property(env, global, "__unode_tcp_wrap", &tcp_binding) != napi_ok ||
+        tcp_binding == nullptr ||
+        napi_get_named_property(env, tcp_binding, "TCP", &tcp_ctor) != napi_ok ||
+        tcp_ctor == nullptr ||
+        napi_create_int32(env, 0, &arg) != napi_ok ||
+        arg == nullptr ||
+        napi_new_instance(env, tcp_ctor, 1, &arg, &handle_obj) != napi_ok ||
+        handle_obj == nullptr) {
+      napi_value u = nullptr;
+      napi_get_undefined(env, &u);
+      return u;
+    }
+    stream = UnodeTcpWrapGetStream(env, handle_obj);
+  } else if (pending_type == UV_NAMED_PIPE) {
+    napi_value ctor = GetRefValue(env, g_pipe_ctor_ref);
+    napi_value arg = nullptr;
+    if (ctor == nullptr ||
+        napi_create_int32(env, kPipeSocket, &arg) != napi_ok ||
+        arg == nullptr ||
+        napi_new_instance(env, ctor, 1, &arg, &handle_obj) != napi_ok ||
+        handle_obj == nullptr) {
+      napi_value u = nullptr;
+      napi_get_undefined(env, &u);
+      return u;
+    }
+    stream = UnodePipeWrapGetStream(env, handle_obj);
+  } else {
+    napi_value u = nullptr;
+    napi_get_undefined(env, &u);
+    return u;
+  }
+
+  if (stream == nullptr) {
+    napi_value u = nullptr;
+    napi_get_undefined(env, &u);
+    return u;
+  }
+
+  int rc = uv_accept(reinterpret_cast<uv_stream_t*>(&wrap->handle), stream);
+  if (rc != 0) {
+    napi_value u = nullptr;
+    napi_get_undefined(env, &u);
+    return u;
+  }
+  return handle_obj;
+}
+
 napi_value PipeBytesReadGetter(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
@@ -686,6 +788,15 @@ void SetNamedU32(napi_env env, napi_value obj, const char* key, uint32_t value) 
 
 }  // namespace
 
+uv_stream_t* UnodePipeWrapGetStream(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  napi_valuetype t = napi_undefined;
+  if (napi_typeof(env, value, &t) != napi_ok || t != napi_object) return nullptr;
+  PipeWrap* wrap = nullptr;
+  if (napi_unwrap(env, value, reinterpret_cast<void**>(&wrap)) != napi_ok || wrap == nullptr) return nullptr;
+  return reinterpret_cast<uv_stream_t*>(&wrap->handle);
+}
+
 void UnodeInstallPipeWrapBinding(napi_env env) {
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return;
@@ -707,8 +818,10 @@ void UnodeInstallPipeWrapBinding(napi_env env) {
       {"shutdown", nullptr, PipeShutdown, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"setPendingInstances", nullptr, PipeSetPendingInstances, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"fchmod", nullptr, PipeFchmod, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"useUserBuffer", nullptr, PipeUseUserBuffer, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getsockname", nullptr, PipeGetSockName, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getpeername", nullptr, PipeGetPeerName, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"acceptPendingHandle", nullptr, PipeAcceptPendingHandle, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"ref", nullptr, PipeRef, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"unref", nullptr, PipeUnref, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getAsyncId", nullptr, PipeGetAsyncId, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -751,6 +864,7 @@ void UnodeInstallPipeWrapBinding(napi_env env) {
   napi_create_object(env, &constants);
   SetNamedU32(env, constants, "SOCKET", kPipeSocket);
   SetNamedU32(env, constants, "SERVER", kPipeServer);
+  SetNamedU32(env, constants, "IPC", kPipeIPC);
 
   napi_set_named_property(env, binding, "Pipe", pipe_ctor);
   napi_set_named_property(env, binding, "PipeConnectWrap", connect_wrap_ctor);

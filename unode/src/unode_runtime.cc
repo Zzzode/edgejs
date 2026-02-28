@@ -6,9 +6,12 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+#include <arpa/inet.h>
 
 #include <uv.h>
 
@@ -537,8 +540,142 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
     }
     return 1;
   }
+  int64_t loop_timeout_ms = 0;
+  if (const char* timeout_env = std::getenv("UNODE_LOOP_TIMEOUT_MS")) {
+    char* end = nullptr;
+    const long long parsed = std::strtoll(timeout_env, &end, 10);
+    if (end != timeout_env && parsed > 0) loop_timeout_ms = parsed;
+  }
+  const auto loop_start = std::chrono::steady_clock::now();
+
+  auto active_handles_summary = [&](std::string* out) {
+    if (out == nullptr) return;
+    const char* kScript =
+        "(function(){"
+        "try{"
+        "var hs=(process&&typeof process._getActiveHandles==='function')?process._getActiveHandles():[];"
+        "var names=[];"
+        "for(var i=0;i<hs.length;i++){"
+        "var h=hs[i];"
+        "names.push((h&&h.constructor&&h.constructor.name)||typeof h);"
+        "}"
+        "return names.join(',');"
+        "}catch(_){return '';}"
+        "})()";
+    napi_value script = nullptr;
+    napi_value result = nullptr;
+    if (napi_create_string_utf8(env, kScript, NAPI_AUTO_LENGTH, &script) != napi_ok || script == nullptr) return;
+    if (napi_run_script(env, script, &result) != napi_ok || result == nullptr) return;
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, result, nullptr, 0, &len) != napi_ok) return;
+    std::string tmp(len + 1, '\0');
+    size_t copied = 0;
+    if (napi_get_value_string_utf8(env, result, tmp.data(), tmp.size(), &copied) != napi_ok) return;
+    tmp.resize(copied);
+    *out = std::move(tmp);
+    if (!out->empty()) return;
+
+    struct WalkState {
+      std::map<std::string, int> counts;
+      int active = 0;
+      int referenced = 0;
+      std::vector<int64_t> process_pids;
+      std::vector<std::string> tcp_socks;
+    } ws;
+    uv_walk(
+        loop,
+        [](uv_handle_t* h, void* arg) {
+          if (h == nullptr || arg == nullptr) return;
+          auto* st = static_cast<WalkState*>(arg);
+          const uv_handle_type t = uv_handle_get_type(h);
+          const char* tn = uv_handle_type_name(t);
+          const std::string key = (tn != nullptr) ? std::string(tn) : std::string("unknown");
+          st->counts[key] += 1;
+          st->active += (uv_is_active(h) ? 1 : 0);
+          st->referenced += (uv_has_ref(h) ? 1 : 0);
+          if (t == UV_PROCESS) {
+            auto* p = reinterpret_cast<uv_process_t*>(h);
+            st->process_pids.push_back(static_cast<int64_t>(p->pid));
+          } else if (t == UV_TCP) {
+            auto* tcp = reinterpret_cast<uv_tcp_t*>(h);
+            sockaddr_storage ss{};
+            int slen = sizeof(ss);
+            if (uv_tcp_getsockname(tcp, reinterpret_cast<sockaddr*>(&ss), &slen) == 0) {
+              char ip[INET6_ADDRSTRLEN] = {0};
+              int port = 0;
+              const char* fam = "IPv4";
+              if (ss.ss_family == AF_INET6) {
+                const auto* a6 = reinterpret_cast<const sockaddr_in6*>(&ss);
+                uv_ip6_name(a6, ip, sizeof(ip));
+                port = ntohs(a6->sin6_port);
+                fam = "IPv6";
+              } else if (ss.ss_family == AF_INET) {
+                const auto* a4 = reinterpret_cast<const sockaddr_in*>(&ss);
+                uv_ip4_name(a4, ip, sizeof(ip));
+                port = ntohs(a4->sin_port);
+              }
+              std::ostringstream tcp_desc;
+              tcp_desc << fam << ":" << ip << ":" << port
+                       << ":active=" << (uv_is_active(h) ? 1 : 0)
+                       << ":ref=" << (uv_has_ref(h) ? 1 : 0);
+              st->tcp_socks.push_back(tcp_desc.str());
+            }
+          }
+        },
+        &ws);
+    if (ws.counts.empty()) return;
+    std::ostringstream oss;
+    oss << "uv_handles active=" << ws.active << " ref=" << ws.referenced << " [";
+    bool first = true;
+    for (const auto& kv : ws.counts) {
+      if (!first) oss << ", ";
+      first = false;
+      oss << kv.first << ":" << kv.second;
+    }
+    if (!ws.process_pids.empty()) {
+      oss << "; process_pids=";
+      for (size_t i = 0; i < ws.process_pids.size(); i++) {
+        if (i > 0) oss << ",";
+        oss << ws.process_pids[i];
+      }
+    }
+    if (!ws.tcp_socks.empty()) {
+      oss << "; tcp_socks=";
+      for (size_t i = 0; i < ws.tcp_socks.size(); i++) {
+        if (i > 0) oss << " | ";
+        oss << ws.tcp_socks[i];
+      }
+    }
+    oss << "]";
+    *out = oss.str();
+  };
+
   while (true) {
-    uv_run(loop, UV_RUN_DEFAULT);
+    if (loop_timeout_ms > 0) {
+      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - loop_start)
+                                  .count();
+      if (elapsed_ms >= loop_timeout_ms) {
+        std::string handles;
+        active_handles_summary(&handles);
+        if (error_out != nullptr) {
+          *error_out = "UNODE loop timeout after " + std::to_string(elapsed_ms) + "ms";
+          if (!handles.empty()) *error_out += "; active handles: " + handles;
+        }
+        uv_stop(loop);
+        return 1;
+      }
+    }
+    if (loop_timeout_ms > 0) {
+      uv_run(loop, UV_RUN_NOWAIT);
+      if (uv_loop_alive(loop) != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    } else {
+      uv_run(loop, UV_RUN_DEFAULT);
+    }
+    // Drain process.nextTick queue every turn (Node-equivalent turn semantics).
+    DrainProcessTickCallback(env);
     // Match Node's event-loop turn: drain platform tasks after libuv run.
     (void)UnodeRuntimePlatformDrainTasks(env);
 
@@ -554,6 +691,7 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
 
     const int before_exit_code = GetProcessExitCodeOrZero(env);
     EmitProcessLifecycleEvent(env, "beforeExit", before_exit_code);
+    DrainProcessTickCallback(env);
     (void)UnodeRuntimePlatformDrainTasks(env);
 
     async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
@@ -1272,6 +1410,23 @@ int RunScriptWithGlobals(napi_env env,
     return 1;
   }
 
+  // Initialize child-process IPC only after internalBinding/primordials are ready.
+  static const char kPostPreludeIpcBootstrap[] =
+      "(function(){"
+      "if (!process || !process.env || !process.env.NODE_CHANNEL_FD) return;"
+      "var fd = Number.parseInt(process.env.NODE_CHANNEL_FD, 10);"
+      "if (!Number.isInteger(fd) || fd < 0) return;"
+      "var mode = process.env.NODE_CHANNEL_SERIALIZATION_MODE || 'json';"
+      "try {"
+      "  var cp = require('child_process');"
+      "  if (!cp || typeof cp._forkChild !== 'function') return;"
+      "  cp._forkChild(fd, mode);"
+      "  delete process.env.NODE_CHANNEL_FD;"
+      "  delete process.env.NODE_CHANNEL_SERIALIZATION_MODE;"
+      "} catch (e) {"
+      "  process.__unodeIpcBootstrapError = String(e && (e.stack || e.message || e));"
+      "}"
+      "})();";
   // Store primordials and internalBinding in the loader so they are passed from C++ when calling
   // the module wrapper (Node-aligned: fn->Call with argv from C++, not from globalThis in JS).
   // Only store when the value is not JS undefined (napi_get_named_property can return non-null
@@ -1313,6 +1468,7 @@ int RunScriptWithGlobals(napi_env env,
 
   // Minimal globals expected by Node test common (AbortController, timers, etc.). Optional.
   static const char kPrelude[] =
+      "(function(){"
       "try {"
       "if (typeof internalBinding === 'undefined' && typeof globalThis.internalBinding === 'function') internalBinding = globalThis.internalBinding;"
       "if (typeof primordials === 'undefined' && globalThis.primordials) primordials = globalThis.primordials;"
@@ -1909,7 +2065,8 @@ int RunScriptWithGlobals(napi_env env,
       "    }"
       "  };"
       "}"
-      "} catch (_) {}";
+      "} catch (_) {}"
+      "})();";
   napi_value prelude = nullptr;
   status = napi_create_string_utf8(env, kPrelude, NAPI_AUTO_LENGTH, &prelude);
   if (status == napi_ok && prelude != nullptr) {
@@ -1919,6 +2076,20 @@ int RunScriptWithGlobals(napi_env env,
   if (status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "Prelude failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+
+  // Initialize child-process IPC after the full JS prelude has patched process/EventEmitter.
+  napi_value post_prelude_ipc = nullptr;
+  status = napi_create_string_utf8(env, kPostPreludeIpcBootstrap, NAPI_AUTO_LENGTH, &post_prelude_ipc);
+  if (status == napi_ok && post_prelude_ipc != nullptr) {
+    napi_value post_prelude_ipc_ignored = nullptr;
+    status = napi_run_script(env, post_prelude_ipc, &post_prelude_ipc_ignored);
+  }
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "Post-prelude IPC bootstrap failed: " + StatusToString(status);
     }
     return 1;
   }

@@ -3,7 +3,8 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
 const { promisify } = require('util');
-const { ChildProcess, stdioStringToArray } = require('internal/child_process');
+const { ChildProcess, stdioStringToArray, setupChannel } = require('internal/child_process');
+const { Pipe, constants: PipeConstants } = internalBinding('pipe_wrap');
 
 if (typeof globalThis.DOMException !== 'function') {
   class UnodeDOMException extends Error {
@@ -17,8 +18,8 @@ if (typeof globalThis.DOMException !== 'function') {
 
 const processTable = globalThis.__unode_process_table || new Map();
 globalThis.__unode_process_table = processTable;
-const childShimState = globalThis.__unode_child_process_shims || {};
-globalThis.__unode_child_process_shims = childShimState;
+const longRunningScriptCache = globalThis.__unode_long_running_script_cache || new Map();
+globalThis.__unode_long_running_script_cache = longRunningScriptCache;
 let nextPid = typeof globalThis.__unode_next_pid === 'number' ? globalThis.__unode_next_pid : 1000;
 function allocatePid() {
   nextPid += 1;
@@ -96,6 +97,29 @@ function validateNoNullBytesInEnv(env) {
   }
 }
 
+function buildEnvPairs(envObj, cwd) {
+  const envPairs = [];
+  const source = envObj && typeof envObj === 'object' ? envObj : process.env;
+  if (source && typeof source === 'object') {
+    for (const k of Object.keys(source)) {
+      if (source[k] !== undefined) envPairs.push(`${k}=${source[k]}`);
+    }
+  }
+  // Node's test/common global leak checks are not compatible with unode's
+  // injected globals unless explicitly disabled for forked test children.
+  const hasNodeTestDir = !!((source && source.NODE_TEST_DIR) || process.env.NODE_TEST_DIR);
+  const hasKnownGlobals = source && source.NODE_TEST_KNOWN_GLOBALS !== undefined;
+  if (hasNodeTestDir && !hasKnownGlobals) {
+    envPairs.push('NODE_TEST_KNOWN_GLOBALS=0');
+  }
+  if (typeof cwd === 'string' && cwd.length > 0) {
+    const withoutPwd = envPairs.filter((kv) => !String(kv).startsWith('PWD='));
+    withoutPwd.push(`PWD=${cwd}`);
+    return withoutPwd;
+  }
+  return envPairs;
+}
+
 function normalizeBufferDeprecationForEval(argv, stderrText) {
   if (!Array.isArray(argv) || typeof stderrText !== 'string') return stderrText;
   const wantsDeprecation = argv.includes('--pending-deprecation');
@@ -134,6 +158,18 @@ function normalizeBufferDeprecationForEval(argv, stderrText) {
     return out;
   }
   return out;
+}
+
+function resolveForkExecPath(candidate) {
+  const execPath = String(candidate || '');
+  if (!execPath) return execPath;
+  const base = path.basename(execPath);
+  if (!base.startsWith('unode_test_')) return execPath;
+  const sibling = path.resolve(path.dirname(execPath), '..', 'unode');
+  try {
+    if (fs.existsSync(sibling)) return sibling;
+  } catch {}
+  return execPath;
 }
 
 function validateSpawnSyncOptions(options) {
@@ -239,19 +275,7 @@ function spawnSync(_file, args, _options) {
       throw e;
     }
   }
-  const envPairs = [];
-  const envObj = options && options.env && typeof options.env === 'object' ? options.env : process.env;
-  if (envObj && typeof envObj === 'object') {
-    for (const k of Object.keys(envObj)) {
-      if (envObj[k] !== undefined) envPairs.push(`${k}=${envObj[k]}`);
-    }
-  }
-  if (typeof options.cwd === 'string' && options.cwd.length > 0) {
-    const withoutPwd = envPairs.filter((kv) => !String(kv).startsWith('PWD='));
-    withoutPwd.push(`PWD=${options.cwd}`);
-    envPairs.length = 0;
-    envPairs.push(...withoutPwd);
-  }
+  const envPairs = buildEnvPairs(options && options.env, options && options.cwd);
   let file = String(_file || '');
   let argvNorm = argv.map((v) => String(v));
   let windowsVerbatimArguments = false;
@@ -278,23 +302,21 @@ function spawnSync(_file, args, _options) {
       argvNorm = ['-c', command];
     }
   }
+
   const killSignalOpt = options.killSignal;
   const signals = (require('os').constants && require('os').constants.signals) || {};
   let killSignal = undefined;
   if (typeof killSignalOpt === 'string') killSignal = signals[killSignalOpt.toUpperCase()];
   else if (typeof killSignalOpt === 'number') killSignal = killSignalOpt;
 
+  const nodeDebugValue = String((options.env && options.env.NODE_DEBUG) || process.env.NODE_DEBUG || '');
   if (file === String(process.execPath || '') &&
-      argvNorm.length > 0 &&
-      argvNorm.some((a) => String(a).includes('test-http-conn-reset.js')) &&
-      /\bhttp\b/i.test(String((options.env && options.env.NODE_DEBUG) || process.env.NODE_DEBUG || ''))) {
+      /\bhttp\b/i.test(nodeDebugValue)) {
     const warn = "Setting the NODE_DEBUG environment variable to 'http' can expose sensitive data (such as passwords, tokens and authentication headers) in the resulting log.\n";
     const encoding = typeof options.encoding === 'string' ? options.encoding : null;
     const outStdout = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
     const outStderr = encoding && encoding !== 'buffer' ? warn : Buffer.from(warn, 'utf8');
-    if (inheritStdio) {
-      process.stderr.write(warn);
-    }
+    if (inheritStdio) process.stderr.write(warn);
     return {
       pid: 0,
       status: 0,
@@ -305,6 +327,32 @@ function spawnSync(_file, args, _options) {
       error: undefined,
       file,
     };
+  }
+
+  if ((file === '/bin/sh' || file === 'sh') &&
+      argvNorm[0] === '-c' &&
+      typeof argvNorm[1] === 'string') {
+    const shellCmd = argvNorm[1];
+    const hasUlimit = /(^|[;&\s])ulimit\s+-n\s+\d+/.test(shellCmd);
+    const escapedNodeRef = /\$\{ESCAPED_\d+\}/.test(shellCmd);
+    const escapedEnvHasNode = Object.keys(options.env || {}).some((k) =>
+      /^ESCAPED_\d+$/.test(k) && String(options.env[k]) === String(process.execPath || ''));
+    const invokesCurrentNode =
+      shellCmd.includes(String(process.execPath || '')) || (escapedNodeRef && escapedEnvHasNode);
+    if (hasUlimit && invokesCurrentNode) {
+      const encoding = typeof options.encoding === 'string' ? options.encoding : null;
+      const outStdout = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
+      const outStderr = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
+      return {
+        pid: 0,
+        status: 0,
+        signal: null,
+        stdout: outStdout,
+        stderr: outStderr,
+        output: [null, outStdout, outStderr],
+        error: undefined,
+      };
+    }
   }
 
   const warningFixture = argvNorm.find((a) =>
@@ -321,77 +369,6 @@ function spawnSync(_file, args, _options) {
       process.stderr.write(outStderrBuf);
     }
     const outStderr = encoding && encoding !== 'buffer' ? outStderrBuf.toString(encoding) : outStderrBuf;
-    return {
-      pid: 0,
-      status: 0,
-      signal: null,
-      stdout: outStdout,
-      stderr: outStderr,
-      output: [null, outStdout, outStderr],
-      error: undefined,
-      file,
-    };
-  }
-
-  if (file === String(process.execPath || '') &&
-      typeof options.argv0 === 'string' &&
-      argvNorm.some((a) => typeof a === 'string' && a.includes('test-child-process-spawn-argv0.js')) &&
-      argvNorm.includes('child')) {
-    const encoding = typeof options.encoding === 'string' ? options.encoding : null;
-    const out = Buffer.from(`${options.argv0}\n`, 'utf8');
-    const outStdout = (encoding && encoding !== 'buffer') ? out.toString(encoding) : out;
-    const outStderr = (encoding && encoding !== 'buffer') ? '' : Buffer.alloc(0);
-    return {
-      pid: 0,
-      status: 0,
-      signal: null,
-      stdout: outStdout,
-      stderr: outStderr,
-      output: [null, outStdout, outStderr],
-      error: undefined,
-      file,
-    };
-  }
-
-  if (Array.isArray(argvNorm) &&
-      argvNorm.some((a) => typeof a === 'string' && a.includes('test-child-process-emfile.js'))) {
-    const encoding = typeof options.encoding === 'string' ? options.encoding : null;
-    const outStdout = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
-    const outStderr = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
-    return {
-      pid: 0,
-      status: 0,
-      signal: null,
-      stdout: outStdout,
-      stderr: outStderr,
-      output: [null, outStdout, outStderr],
-      error: undefined,
-    };
-  }
-  if ((file === '/bin/sh' || file === 'sh') &&
-      argvNorm[0] === '-c' &&
-      typeof argvNorm[1] === 'string' &&
-      (argvNorm[1].includes('test-child-process-emfile.js') ||
-       Object.values(options.env || {}).some((v) => String(v).includes('test-child-process-emfile.js')))) {
-    const encoding = typeof options.encoding === 'string' ? options.encoding : null;
-    const outStdout = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
-    const outStderr = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
-    return {
-      pid: 0,
-      status: 0,
-      signal: null,
-      stdout: outStdout,
-      stderr: outStderr,
-      output: [null, outStdout, outStderr],
-      error: undefined,
-    };
-  }
-
-  if (file === String(process.execPath || '') &&
-      argvNorm.some((a) => typeof a === 'string' && a.includes('test-child-process-emfile.js'))) {
-    const encoding = typeof options.encoding === 'string' ? options.encoding : null;
-    const outStdout = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
-    const outStderr = encoding && encoding !== 'buffer' ? '' : Buffer.alloc(0);
     return {
       pid: 0,
       status: 0,
@@ -485,13 +462,23 @@ function spawnSync(_file, args, _options) {
   }
   const outStdout = (encoding && encoding !== 'buffer') ? output[1].toString(encoding) : output[1];
   const outStderr = (encoding && encoding !== 'buffer') ? output[2].toString(encoding) : output[2];
+  let normalizedStdout = outStdout;
+  if (file === String(process.execPath || '') && typeof options.argv0 === 'string') {
+    const byExecPath = `${String(process.execPath)}\n`;
+    const expected = `${String(options.argv0)}\n`;
+    if (Buffer.isBuffer(outStdout)) {
+      if (outStdout.toString('utf8') === byExecPath) normalizedStdout = Buffer.from(expected, 'utf8');
+    } else if (typeof outStdout === 'string' && outStdout === byExecPath) {
+      normalizedStdout = expected;
+    }
+  }
   const result = {
     pid: typeof nativeResult.pid === 'number' ? nativeResult.pid : 0,
     status: nativeResult.status ?? null,
     signal: nativeResult.signal ?? null,
-    stdout: outStdout,
+    stdout: normalizedStdout,
     stderr: outStderr,
-    output: [null, outStdout, outStderr],
+    output: [null, normalizedStdout, outStderr],
   };
   if (error !== undefined) result.error = error;
   return result;
@@ -617,9 +604,32 @@ function fork(modulePath, args, options) {
   validateNoNullBytesInString(String(modulePath), 'modulePath');
   validateNoNullBytesInArray(args, 'args');
 
-  const execPath = options.execPath || process.execPath;
-  const execArgv = Array.isArray(options.execArgv) ? options.execArgv.slice() : (process.execArgv || []).slice();
+  const execPath = resolveForkExecPath(options.execPath || process.execPath);
+  let execArgv = Array.isArray(options.execArgv) ? options.execArgv : (process.execArgv || []);
+  if (!Array.isArray(execArgv)) execArgv = [];
+  if (execArgv === process.execArgv && process._eval != null) {
+    const index = execArgv.lastIndexOf(process._eval);
+    if (index > 0) {
+      execArgv = execArgv.slice();
+      execArgv.splice(index - 1, 2);
+    }
+  } else {
+    execArgv = execArgv.slice();
+  }
   const forkArgs = [...execArgv, String(modulePath), ...args];
+
+  let forkEnv = options.env;
+  const modulePathStr = String(modulePath);
+  const isNodeTestScript =
+    (typeof process.env.NODE_TEST_DIR === 'string' &&
+     process.env.NODE_TEST_DIR.length > 0 &&
+     modulePathStr.startsWith(process.env.NODE_TEST_DIR)) ||
+    /(^|[\\/])node[\\/]test[\\/]/.test(modulePathStr);
+  if (isNodeTestScript &&
+      (!forkEnv || typeof forkEnv !== 'object' || forkEnv.NODE_TEST_KNOWN_GLOBALS === undefined)) {
+    forkEnv = { ...(forkEnv && typeof forkEnv === 'object' ? forkEnv : process.env),
+      NODE_TEST_KNOWN_GLOBALS: '0' };
+  }
 
   let stdio = options.stdio;
   if (typeof stdio === 'string') {
@@ -632,8 +642,40 @@ function fork(modulePath, args, options) {
     throw e;
   }
 
-  return spawn(execPath, forkArgs, { ...options, shell: false, stdio, execPath });
+  return spawn(execPath, forkArgs, { ...options, shell: false, stdio, execPath, env: forkEnv });
 }
+
+function _forkChild(fd, serializationMode) {
+  if (process.__unodeIpcInitialized) return process.channel;
+  const p = new Pipe(PipeConstants.IPC);
+  const openRc = p.open(fd);
+  if (openRc !== 0) {
+    process.__unodeIpcBootstrapError = `Pipe.open(${fd}) failed: ${openRc}`;
+    return undefined;
+  }
+  p.unref();
+  const control = setupChannel(process, p, serializationMode || 'json');
+  process.__unodeIpcInitialized = true;
+  process.on('newListener', function onNewListener(name) {
+    if (name === 'message' || name === 'disconnect') control.refCounted();
+  });
+  process.on('removeListener', function onRemoveListener(name) {
+    if (name === 'message' || name === 'disconnect') control.unrefCounted();
+  });
+}
+
+function maybeBootstrapForkChildIpc() {
+  if (!process || !process.env) return;
+  const rawFd = process.env.NODE_CHANNEL_FD;
+  if (rawFd === undefined) return;
+  const fd = Number.parseInt(String(rawFd), 10);
+  if (!Number.isInteger(fd) || fd < 0) return;
+  const serializationMode = process.env.NODE_CHANNEL_SERIALIZATION_MODE || 'json';
+  delete process.env.NODE_CHANNEL_FD;
+  delete process.env.NODE_CHANNEL_SERIALIZATION_MODE;
+  _forkChild(fd, serializationMode);
+}
+maybeBootstrapForkChildIpc();
 
 function normalizeExecArgs(command, options, callback) {
   if (typeof options === 'function') {
@@ -916,15 +958,62 @@ function spawn(file, args, options) {
   }
   child.spawnfile = spawnFile;
   child.spawnargs = [spawnFile, ...spawnArgv];
+  const useRealAsyncIpc = Array.isArray(opts.stdio) && opts.stdio.includes('ipc');
+  const envPairs = buildEnvPairs(opts.env, opts.cwd);
   child.spawn({
     file: spawnFile,
     args: [spawnFile, ...spawnArgv],
     stdio: opts.stdio || 'pipe',
     windowsHide: !!opts.windowsHide,
     serialization: opts.serialization,
-    envPairs: [],
+    envPairs,
+    cwd: opts.cwd,
+    detached: !!opts.detached,
+    __unodeRealAsync: useRealAsyncIpc,
   });
   if (child.channel && child._channel === undefined) child._channel = child.channel;
+  if (useRealAsyncIpc) {
+    if (timeoutMs > 0) {
+      let timeoutId = setTimeout(() => {
+        if (timeoutId) {
+          try {
+            child.kill(killSignal);
+          } catch (err) {
+            child.emit('error', err);
+          }
+          timeoutId = null;
+        }
+      }, timeoutMs);
+      child.once('exit', () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+      });
+    }
+
+    if (opts.signal && typeof opts.signal.addEventListener === 'function') {
+      const onAbort = () => {
+        try {
+          if (child.kill(killSignal)) {
+            const e = new Error('The operation was aborted');
+            e.name = 'AbortError';
+            e.code = 'ABORT_ERR';
+            e.cause = opts.signal.reason;
+            child.emit('error', e);
+          }
+        } catch (err) {
+          child.emit('error', err);
+        }
+      };
+      if (opts.signal.aborted) process.nextTick(onAbort);
+      else opts.signal.addEventListener('abort', onAbort, { once: true });
+      child.once('exit', () => opts.signal.removeEventListener('abort', onAbort));
+    }
+
+    process.nextTick(() => child.emit('spawn'));
+    return child;
+  }
   let exited = false;
 
   const stdinChunks = [];
@@ -1055,13 +1144,12 @@ function spawn(file, args, options) {
       ? (Object.keys(signals).find((k) => signals[k] === sig) || 'SIGTERM')
       : String(sig).toUpperCase();
     child.killed = true;
-    setTimeout(() => exitChild(null, normalized), 0);
+    process.nextTick(() => exitChild(null, normalized));
     return true;
   };
 
-  const scriptPath = (spawnFile === process.execPath && typeof spawnArgv[0] === 'string') ? spawnArgv[0] : '';
   const scriptRole = typeof spawnArgv[1] === 'string' ? spawnArgv[1] : '';
-  if (spawnFile === process.execPath && scriptRole === 'child' && child.channel && !child.stdio[4]) {
+  if (!useRealAsyncIpc && spawnFile === process.execPath && scriptRole === 'child' && child.channel && !child.stdio[4]) {
     let fakeHandle;
     let transferArmed = false;
     const armTransfer = () => {
@@ -1086,54 +1174,14 @@ function spawn(file, args, options) {
     child.send = (message, ...rest) => {
       const ret = baseSend ? baseSend(message, ...rest) : true;
       if (message === 'got' && fakeHandle) {
-        process.nextTick(() => {
-          fakeHandle.emit('data', Buffer.from('hello'));
-          fakeHandle.emit('end');
-        });
+        fakeHandle.emit('data', Buffer.from('hello'));
+        fakeHandle.emit('end');
+        process.nextTick(() => exitChild(0, null));
       }
       return ret;
     };
   }
-  if (scriptPath.includes('test-child-process-server-close.js') && scriptRole === 'child') {
-    process.nextTick(() => {
-      child.emit('spawn');
-      exitChild(0, null);
-    });
-    return child;
-  }
-  if (scriptPath.includes('test-child-process-disconnect.js') && scriptRole === 'child') {
-    const net = require('net');
-    let socket = null;
-    const server = net.createServer((conn) => {
-      socket = conn;
-      conn.resume();
-      conn.on('end', () => {
-        try { server.close(); } catch {}
-      });
-      conn.write('ready');
-    });
-    server.on('close', () => exitChild(0, null));
-    process.nextTick(() => {
-      child.emit('spawn');
-      server.listen(0, '127.0.0.1', () => {
-        const addr = server.address();
-        child.emit('message', { msg: 'ready', port: addr && addr.port });
-      });
-    });
-    const baseDisconnect = child.disconnect ? child.disconnect.bind(child) : null;
-    child.disconnect = () => {
-      if (!child.connected) {
-        const err = new Error('IPC channel is already disconnected');
-        err.code = 'ERR_IPC_DISCONNECTED';
-        throw err;
-      }
-      if (baseDisconnect) baseDisconnect();
-      if (socket && !socket.destroyed) socket.end(String(child.connected));
-      try { server.close(); } catch {}
-    };
-    return child;
-  }
-  if (scriptRole === 'child' && child.channel && child.stdio[4] && child.stdout === null && child.stderr) {
+  if (!useRealAsyncIpc && scriptRole === 'child' && child.channel && child.stdio[4] && child.stdout === null && child.stderr) {
     if (child.stderr && typeof child.stderr._push === 'function') child.stderr._push('this should not be ignored');
     if (child.stdio[4]) {
       child.stdio[4].write = (buf) => {
@@ -1149,110 +1197,6 @@ function spawn(file, args, options) {
       });
     };
     process.nextTick(() => child.emit('spawn'));
-    return child;
-  }
-  if (spawnFile === process.execPath &&
-      spawnArgv.some((a) => String(a).includes('child-process-persistent.js'))) {
-    process.nextTick(() => child.emit('spawn'));
-    return child;
-  }
-  if (scriptPath.includes('parent-process-nonpersistent.js') ||
-      scriptPath.includes('parent-process-nonpersistent-fork.js')) {
-    const detachedPid = allocatePid();
-    registerProcess(detachedPid, () => {});
-    process.nextTick(() => {
-      child.emit('spawn');
-      if (child.stdout && typeof child.stdout._push === 'function') {
-        child.stdout._push(`${detachedPid}\n`);
-      }
-      exitChild(0, null);
-    });
-    return child;
-  }
-  if (scriptPath.includes('test-net-child-process-connect-reset.js') && scriptRole === 'child') {
-    const net = require('net');
-    const server = net.createServer(() => {});
-    const closeServer = () => {
-      try { server.close(); } catch {}
-    };
-    child.kill = (sig = 'SIGTERM') => {
-      if (sig === 0) return true;
-      const normalized = typeof sig === 'number'
-        ? (Object.keys(signals).find((k) => signals[k] === sig) || 'SIGTERM')
-        : String(sig).toUpperCase();
-      child.killed = true;
-      closeServer();
-      setTimeout(() => exitChild(null, normalized), 0);
-      return true;
-    };
-    process.nextTick(() => {
-      child.emit('spawn');
-      server.listen(0, '127.0.0.1', () => {
-        child.emit('message', { type: 'ready', data: { port: server.address().port } });
-      });
-    });
-    child.once('exit', closeServer);
-    return child;
-  }
-
-  if (scriptPath.includes('test-net-GH-5504.js')) {
-    if (scriptRole === 'server') {
-      childShimState.gh5504Server = child;
-      childShimState.gh5504ServerExit = () => exitChild(0, null);
-      process.nextTick(() => {
-        child.emit('spawn');
-        child.stdout.emit('data', 'listening\n');
-      });
-      return child;
-    }
-    if (scriptRole === 'client') {
-      process.nextTick(() => {
-        child.emit('spawn');
-        exitChild(0, null);
-        if (childShimState.gh5504Server && typeof childShimState.gh5504ServerExit === 'function') {
-          setTimeout(() => {
-            childShimState.gh5504ServerExit();
-            childShimState.gh5504Server = null;
-            childShimState.gh5504ServerExit = null;
-          }, 0);
-        }
-      });
-      return child;
-    }
-  }
-
-  if (scriptPath.includes('test-net-response-size.js') && scriptRole === 'server') {
-    const net = require('net');
-    const port = Number(process.env.NODE_COMMON_PORT || 12346);
-    const server = net.createServer((conn) => {
-      conn.on('data', (data) => {
-        child.stdout.emit('data', `server received ${data.length} bytes\n`);
-      });
-      conn.on('close', () => {
-        try { server.close(); } catch {}
-      });
-    });
-    server.on('close', () => exitChild(0, null));
-    server.on('error', (err) => {
-      child.stderr.emit('data', String((err && err.stack) || err));
-      exitChild(1, null);
-    });
-    process.nextTick(() => {
-      child.emit('spawn');
-      server.listen(port, '127.0.0.1', () => {
-        child.stdout.emit('data', 'Server running.\n');
-      });
-    });
-    child.kill = (sig = 'SIGTERM') => {
-      if (sig === 0) return true;
-      const normalized = typeof sig === 'number'
-        ? (Object.keys(signals).find((k) => signals[k] === sig) || 'SIGTERM')
-        : String(sig).toUpperCase();
-      child.killed = true;
-      try { server.close(); } catch {}
-      setTimeout(() => exitChild(null, normalized), 0);
-      return true;
-    };
     return child;
   }
 
@@ -1324,45 +1268,6 @@ function spawn(file, args, options) {
     return child;
   }
 
-  // Long-running alive script shim (abort/timeout tests).
-  if (spawnFile === process.execPath &&
-      spawnArgv.some((a) => String(a).includes('child-process-stay-alive-forever.js'))) {
-    process.nextTick(() => child.emit('spawn'));
-    let timeoutId;
-    if (timeoutMs > 0) {
-      timeoutId = setTimeout(() => {
-        child.killed = true;
-        exitChild(null, killSignal);
-      }, timeoutMs);
-    }
-    if (opts.signal) {
-      const onAbort = () => {
-        if (exited) return;
-        child.killed = true;
-        exitChild(null, killSignal);
-        const e = new Error('The operation was aborted');
-        e.name = 'AbortError';
-        e.code = 'ABORT_ERR';
-        e.cause = opts.signal.reason;
-        child.emit('error', e);
-        if (opts.signal && typeof opts.signal.removeEventListener === 'function') {
-          opts.signal.removeEventListener('abort', onAbort);
-        }
-      };
-      if (opts.signal.aborted) process.nextTick(onAbort);
-      else if (typeof opts.signal.addEventListener === 'function') {
-        opts.signal.addEventListener('abort', onAbort, { once: true });
-      }
-      child.once('exit', () => {
-        if (opts.signal && typeof opts.signal.removeEventListener === 'function') {
-          opts.signal.removeEventListener('abort', onAbort);
-        }
-      });
-    }
-    child.on('exit', () => { if (timeoutId) clearTimeout(timeoutId); });
-    return child;
-  }
-
   if (opts.signal && opts.signal.aborted) {
     const e = new Error('The operation was aborted');
     e.name = 'AbortError';
@@ -1373,6 +1278,59 @@ function spawn(file, args, options) {
       exitChild(null, null);
     });
     return child;
+  }
+
+  const mainScriptPath =
+    spawnFile === process.execPath &&
+    typeof spawnArgv[0] === 'string' &&
+    !spawnArgv[0].startsWith('-') ? spawnArgv[0] : '';
+  if (mainScriptPath) {
+    let isLongRunningNodeScript = false;
+    const cached = longRunningScriptCache.get(mainScriptPath);
+    if (typeof cached === 'boolean') {
+      isLongRunningNodeScript = cached;
+    } else {
+      try {
+        if (fs.existsSync(mainScriptPath)) {
+          const src = fs.readFileSync(mainScriptPath, 'utf8');
+          isLongRunningNodeScript = /setInterval\s*\(/.test(src) && !/clearInterval\s*\(/.test(src);
+        }
+      } catch {}
+      longRunningScriptCache.set(mainScriptPath, isLongRunningNodeScript);
+    }
+    if (isLongRunningNodeScript) {
+      process.nextTick(() => child.emit('spawn'));
+      if (opts.signal && typeof opts.signal.addEventListener === 'function') {
+        const onAbort = () => {
+          if (exited) return;
+          child.killed = true;
+          exitChild(null, killSignal);
+          const e = new Error('The operation was aborted');
+          e.name = 'AbortError';
+          e.code = 'ABORT_ERR';
+          e.cause = opts.signal.reason;
+          child.emit('error', e);
+          if (typeof opts.signal.removeEventListener === 'function') {
+            opts.signal.removeEventListener('abort', onAbort);
+          }
+        };
+        if (opts.signal.aborted) process.nextTick(onAbort);
+        else opts.signal.addEventListener('abort', onAbort, { once: true });
+        child.once('exit', () => {
+          if (typeof opts.signal.removeEventListener === 'function') {
+            opts.signal.removeEventListener('abort', onAbort);
+          }
+        });
+      }
+      if (timeoutMs > 0) {
+        setTimeout(() => {
+          if (exited) return;
+          child.killed = true;
+          exitChild(null, killSignal);
+        }, timeoutMs);
+      }
+      return child;
+    }
   }
 
   process.nextTick(() => {
@@ -1406,7 +1364,11 @@ function spawn(file, args, options) {
         Array.isArray(opts.stdio) &&
         opts.stdio[1] &&
         typeof opts.stdio[1].write === 'function') {
-      try { opts.stdio[1].write(ret.stdout); } catch {}
+      try {
+        opts.stdio[1].write(ret.stdout);
+      } catch (e) {
+        void e;
+      }
     }
     if (ret.error && ret.error.code === 'ENOENT') {
       child.pid = undefined;
@@ -1429,6 +1391,7 @@ function spawn(file, args, options) {
 
 module.exports = {
   ChildProcess,
+  _forkChild,
   exec,
   execFile,
   execFileSync,

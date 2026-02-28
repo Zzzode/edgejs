@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <uv.h>
+
 #if defined(_WIN32)
 #include <stdlib.h>
 extern char** _environ;
@@ -642,6 +644,10 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
   napi_value exit_code_value = nullptr;
   napi_create_int32(env, exit_code, &exit_code_value);
   napi_set_named_property(env, error_value, "__unodeExitCode", exit_code_value);
+  uv_loop_t* loop = uv_default_loop();
+  if (loop != nullptr) {
+    uv_stop(loop);
+  }
   napi_throw(env, error_value);
   return nullptr;
 }

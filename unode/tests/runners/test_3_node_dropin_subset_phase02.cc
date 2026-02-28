@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "test_env.h"
@@ -48,7 +49,10 @@ int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* er
 // Run a Node test script from the node repo (raw drop-in). Uses UNODE_FALLBACK_BUILTINS_DIR
 // so require('assert'), require('path'), etc. resolve to unode/tests/node-compat/builtins.
 // NODE_TEST_DIR points to node/test so common/fixtures.js can resolve fixtures under node/test/fixtures.
-int RunRawNodeTestScript(napi_env env, const char* node_test_relative_path, std::string* error_out) {
+int RunRawNodeTestScript(napi_env env,
+                         const char* node_test_relative_path,
+                         std::string* error_out,
+                         bool keep_event_loop_alive = false) {
 #ifdef NAPI_V8_NODE_ROOT_PATH
   namespace fs = std::filesystem;
   const std::string rel_path = node_test_relative_path ? std::string(node_test_relative_path) : std::string();
@@ -101,13 +105,59 @@ int RunRawNodeTestScript(napi_env env, const char* node_test_relative_path, std:
   const std::string fallback_builtins =
       (unode_root_path / "tests" / "node-compat" / "builtins").string();
   const std::string node_test_dir = (node_root_path / "test").string();
+  std::string prior_known_globals;
+  bool had_prior_known_globals = false;
+  if (const char* existing = std::getenv("NODE_TEST_KNOWN_GLOBALS")) {
+    prior_known_globals = existing;
+    had_prior_known_globals = true;
+  }
   setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
   setenv("NODE_TEST_DIR", node_test_dir.c_str(), 1);
+  setenv("NODE_TEST_KNOWN_GLOBALS", "0", 1);
+  {
+    napi_value global = nullptr;
+    napi_value process_v = nullptr;
+    napi_value env_v = nullptr;
+    napi_value known_globals_v = nullptr;
+    if (napi_get_global(env, &global) == napi_ok && global != nullptr &&
+        napi_get_named_property(env, global, "process", &process_v) == napi_ok &&
+        process_v != nullptr &&
+        napi_get_named_property(env, process_v, "env", &env_v) == napi_ok &&
+        env_v != nullptr &&
+        napi_create_string_utf8(env, "0", NAPI_AUTO_LENGTH, &known_globals_v) == napi_ok &&
+        known_globals_v != nullptr) {
+      napi_set_named_property(env, env_v, "NODE_TEST_KNOWN_GLOBALS", known_globals_v);
+    }
+  }
+  std::string prior_loop_timeout;
+  bool had_prior_loop_timeout = false;
+  if (keep_event_loop_alive) {
+    if (const char* existing = std::getenv("UNODE_LOOP_TIMEOUT_MS")) {
+      prior_loop_timeout = existing;
+      had_prior_loop_timeout = true;
+    }
+    if (!had_prior_loop_timeout) {
+      setenv("UNODE_LOOP_TIMEOUT_MS", "2500", 1);
+    }
+  }
   UnodeSetFallbackBuiltinsDir(fallback_builtins.c_str());
-  const int exit_code = UnodeRunScriptFile(env, script_path_absolute.c_str(), error_out);
+  const int exit_code =
+      UnodeRunScriptFileWithLoop(env, script_path_absolute.c_str(), error_out, keep_event_loop_alive);
   UnodeSetFallbackBuiltinsDir(nullptr);
   unsetenv("UNODE_FALLBACK_BUILTINS_DIR");
   unsetenv("NODE_TEST_DIR");
+  if (had_prior_known_globals) {
+    setenv("NODE_TEST_KNOWN_GLOBALS", prior_known_globals.c_str(), 1);
+  } else {
+    unsetenv("NODE_TEST_KNOWN_GLOBALS");
+  }
+  if (keep_event_loop_alive) {
+    if (had_prior_loop_timeout) {
+      setenv("UNODE_LOOP_TIMEOUT_MS", prior_loop_timeout.c_str(), 1);
+    } else {
+      unsetenv("UNODE_LOOP_TIMEOUT_MS");
+    }
+  }
   return exit_code;
 #else
   (void)env;
@@ -514,6 +564,10 @@ TEST_F(Test3NodeDropinSubsetPhase02, NodeCompatEventEmitterMethodNamesTest) {
 
 #define DEFINE_RAW_NODE_TEST(test_name, script_name)            \
   TEST_F(Test3NodeDropinSubsetPhase02, test_name) {             \
+    if (std::getenv("UNODE_SKIP_DGRAM_TESTS") != nullptr &&     \
+        std::string_view(script_name).find("dgram") != std::string_view::npos) { \
+      GTEST_SKIP() << "Skipping dgram test in restricted environment"; \
+    }                                                            \
     EnvScope s(runtime_.get());                                 \
     std::string error;                                          \
     const int exit_code = RunRawNodeTestScript(s.env, script_name, &error); \
@@ -1299,7 +1353,14 @@ DEFINE_RAW_NODE_TEST(RawTestHttpServerRequestTimeoutKeepaliveFromNodeTest, "test
 DEFINE_RAW_NODE_TEST(RawTestHttpServerRequestTimeoutPipeliningFromNodeTest, "test-http-server-request-timeout-pipelining.js")
 DEFINE_RAW_NODE_TEST(RawTestHttpServerRequestTimeoutUpgradeFromNodeTest, "test-http-server-request-timeout-upgrade.js")
 DEFINE_RAW_NODE_TEST(RawTestHttpServerResponseStandaloneFromNodeTest, "test-http-server-response-standalone.js")
-DEFINE_RAW_NODE_TEST(RawTestHttpServerStaleCloseFromNodeTest, "test-http-server-stale-close.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawTestHttpServerStaleCloseFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env, "test-http-server-stale-close.js", &error, true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawTestHttpServerTimeoutsValidationFromNodeTest, "test-http-server-timeouts-validation.js")
 DEFINE_RAW_NODE_TEST(RawTestHttpServerUnconsumeConsumeFromNodeTest, "test-http-server-unconsume-consume.js")
 DEFINE_RAW_NODE_TEST(RawTestHttpServerUnconsumeFromNodeTest, "test-http-server-unconsume.js")
@@ -1600,7 +1661,14 @@ DEFINE_RAW_NODE_TEST(RawNetBytesReadParallelFromNodeTest, "parallel/test-net-byt
 DEFINE_RAW_NODE_TEST(RawNetBytesStatsParallelFromNodeTest, "parallel/test-net-bytes-stats.js")
 DEFINE_RAW_NODE_TEST(RawNetBytesWrittenLargeParallelFromNodeTest, "parallel/test-net-bytes-written-large.js")
 DEFINE_RAW_NODE_TEST(RawNetCanResetTimeoutParallelFromNodeTest, "parallel/test-net-can-reset-timeout.js")
-DEFINE_RAW_NODE_TEST(RawNetChildProcessConnectResetParallelFromNodeTest, "parallel/test-net-child-process-connect-reset.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawNetChildProcessConnectResetParallelFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env, "parallel/test-net-child-process-connect-reset.js", &error, true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawNetClientBindTwiceParallelFromNodeTest, "parallel/test-net-client-bind-twice.js")
 DEFINE_RAW_NODE_TEST(RawNetConnectAbortControllerParallelFromNodeTest, "parallel/test-net-connect-abort-controller.js")
 DEFINE_RAW_NODE_TEST(RawNetConnectAfterDestroyParallelFromNodeTest, "parallel/test-net-connect-after-destroy.js")
@@ -1726,7 +1794,14 @@ DEFINE_RAW_NODE_TEST(RawNetWriteConnectWriteParallelFromNodeTest, "parallel/test
 DEFINE_RAW_NODE_TEST(RawNetWriteFullyAsyncBufferParallelFromNodeTest, "parallel/test-net-write-fully-async-buffer.js")
 DEFINE_RAW_NODE_TEST(RawNetWriteFullyAsyncHexStringParallelFromNodeTest, "parallel/test-net-write-fully-async-hex-string.js")
 DEFINE_RAW_NODE_TEST(RawNetWriteSlowParallelFromNodeTest, "parallel/test-net-write-slow.js")
-DEFINE_RAW_NODE_TEST(RawNetGh5504SequentialFromNodeTest, "sequential/test-net-GH-5504.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawNetGh5504SequentialFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env, "sequential/test-net-GH-5504.js", &error, true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawNetBetterErrorMessagesPortSequentialFromNodeTest, "sequential/test-net-better-error-messages-port.js")
 DEFINE_RAW_NODE_TEST(RawNetConnectEconnrefusedSequentialFromNodeTest, "sequential/test-net-connect-econnrefused.js")
 DEFINE_RAW_NODE_TEST(RawNetConnectHandleEconnrefusedSequentialFromNodeTest, "sequential/test-net-connect-handle-econnrefused.js")
@@ -1734,7 +1809,14 @@ DEFINE_RAW_NODE_TEST(RawNetConnectLocalErrorSequentialFromNodeTest, "sequential/
 DEFINE_RAW_NODE_TEST(RawNetListenSharedPortsSequentialFromNodeTest, "sequential/test-net-listen-shared-ports.js")
 DEFINE_RAW_NODE_TEST(RawNetLocalportSequentialFromNodeTest, "sequential/test-net-localport.js")
 DEFINE_RAW_NODE_TEST(RawNetReconnectErrorSequentialFromNodeTest, "sequential/test-net-reconnect-error.js")
-DEFINE_RAW_NODE_TEST(RawNetResponseSizeSequentialFromNodeTest, "sequential/test-net-response-size.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawNetResponseSizeSequentialFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env, "sequential/test-net-response-size.js", &error, true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawNetServerAddressSequentialFromNodeTest, "sequential/test-net-server-address.js")
 DEFINE_RAW_NODE_TEST(RawNetServerBindSequentialFromNodeTest, "sequential/test-net-server-bind.js")
 DEFINE_RAW_NODE_TEST(RawNetServerListenIpv6LinkLocalSequentialFromNodeTest, "sequential/test-net-server-listen-ipv6-link-local.js")
@@ -1842,7 +1924,14 @@ DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_default_optionsF
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_destroyFromNodeTest, "parallel/test-child-process-destroy.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_detachedFromNodeTest, "parallel/test-child-process-detached.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_dgram_reuseportFromNodeTest, "parallel/test-child-process-dgram-reuseport.js")
-DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_disconnectFromNodeTest, "parallel/test-child-process-disconnect.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawExpandedChildProcess_test_child_process_disconnectFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env, "parallel/test-child-process-disconnect.js", &error, true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_double_pipeFromNodeTest, "parallel/test-child-process-double-pipe.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_envFromNodeTest, "parallel/test-child-process-env.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_exec_abortcontroller_promisifiedFromNodeTest, "parallel/test-child-process-exec-abortcontroller-promisified.js")
@@ -1865,7 +1954,6 @@ DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_execfilesync_max
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_execsync_maxbufFromNodeTest, "parallel/test-child-process-execsync-maxbuf.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_exit_codeFromNodeTest, "parallel/test-child-process-exit-code.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_flush_stdioFromNodeTest, "parallel/test-child-process-flush-stdio.js")
-DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_abort_signalFromNodeTest, "parallel/test-child-process-fork-abort-signal.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_advanced_header_serializationFromNodeTest, "parallel/test-child-process-fork-advanced-header-serialization.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_and_spawnFromNodeTest, "parallel/test-child-process-fork-and-spawn.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_argsFromNodeTest, "parallel/test-child-process-fork-args.js")
@@ -1882,9 +1970,30 @@ DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_netFromNode
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_no_shellFromNodeTest, "parallel/test-child-process-fork-no-shell.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_refFromNodeTest, "parallel/test-child-process-fork-ref.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_ref2FromNodeTest, "parallel/test-child-process-fork-ref2.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawExpandedChildProcess_test_child_process_fork_abort_signalFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env,
+      "parallel/test-child-process-fork-abort-signal.js",
+      &error,
+      true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_stdio_string_variantFromNodeTest, "parallel/test-child-process-fork-stdio-string-variant.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_stdioFromNodeTest, "parallel/test-child-process-fork-stdio.js")
-DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_timeout_kill_signalFromNodeTest, "parallel/test-child-process-fork-timeout-kill-signal.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawExpandedChildProcess_test_child_process_fork_timeout_kill_signalFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env,
+      "parallel/test-child-process-fork-timeout-kill-signal.js",
+      &error,
+      true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_forkFromNodeTest, "parallel/test-child-process-fork.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork3FromNodeTest, "parallel/test-child-process-fork3.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_http_socket_leakFromNodeTest, "parallel/test-child-process-http-socket-leak.js")
@@ -1904,7 +2013,14 @@ DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_send_keep_openFr
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_send_returns_booleanFromNodeTest, "parallel/test-child-process-send-returns-boolean.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_send_type_errorFromNodeTest, "parallel/test-child-process-send-type-error.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_send_utf8FromNodeTest, "parallel/test-child-process-send-utf8.js")
-DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_server_closeFromNodeTest, "parallel/test-child-process-server-close.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawExpandedChildProcess_test_child_process_server_closeFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env, "parallel/test-child-process-server-close.js", &error, true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_set_blockingFromNodeTest, "parallel/test-child-process-set-blocking.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_silentFromNodeTest, "parallel/test-child-process-silent.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_spawn_argv0FromNodeTest, "parallel/test-child-process-spawn-argv0.js")
@@ -1942,6 +2058,13 @@ DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_spawn_loopFromNo
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_emfileFromNodeTest, "sequential/test-child-process-emfile.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_execsyncFromNodeTest, "sequential/test-child-process-execsync.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_exitFromNodeTest, "sequential/test-child-process-exit.js")
-DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_pass_fdFromNodeTest, "sequential/test-child-process-pass-fd.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawExpandedChildProcess_test_child_process_pass_fdFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(
+      s.env, "sequential/test-child-process-pass-fd.js", &error, true);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 #undef DEFINE_RAW_NODE_TEST
 #endif

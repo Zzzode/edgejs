@@ -541,11 +541,6 @@ napi_value ParserExecuteCommon(Parser* p, const char* data, size_t len) {
     }
     return nullptr;
   }
-  if (data == nullptr) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(p->env, &undefined);
-    return undefined;
-  }
   if (llhttp_get_upgrade(&p->parser) == 0 && err != HPE_OK) {
     const char* reason = llhttp_get_error_reason(&p->parser);
     const char* code = llhttp_errno_name(err);
@@ -558,6 +553,11 @@ napi_value ParserExecuteCommon(Parser* p, const char* data, size_t len) {
                      static_cast<uint32_t>(nread),
                      data,
                      len);
+  }
+  if (data == nullptr) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(p->env, &undefined);
+    return undefined;
   }
   napi_value nread_v = nullptr;
   napi_create_uint32(p->env, static_cast<uint32_t>(nread), &nread_v);
@@ -870,6 +870,7 @@ void UnodeInstallHttpParserBinding(napi_env env) {
   SetNamedU32(env, parser_ctor, "kOnMessageComplete", kOnMessageComplete);
   SetNamedU32(env, parser_ctor, "kOnExecute", kOnExecute);
   SetNamedU32(env, parser_ctor, "kOnTimeout", kOnTimeout);
+  SetNamedU32(env, parser_ctor, "kHasNativeConsume", 0);
 
   SetNamedU32(env, parser_ctor, "kLenientNone", kLenientNone);
   SetNamedU32(env, parser_ctor, "kLenientHeaders", kLenientHeaders);

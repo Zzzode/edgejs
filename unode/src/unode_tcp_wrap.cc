@@ -226,16 +226,6 @@ void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     }
   }
 
-  // Safety net: if JS-side teardown is skipped on EOF/error, close the handle
-  // to avoid accumulating half-closed sockets under sustained load.
-  if (nread < 0 && !wrap->closed) {
-    uv_handle_t* h = reinterpret_cast<uv_handle_t*>(&wrap->handle);
-    (void)uv_read_stop(stream);
-    if (!uv_is_closing(h)) {
-      uv_close(h, OnClosed);
-    }
-  }
-
   if (buf && buf->base) free(buf->base);
 }
 
@@ -800,6 +790,13 @@ napi_value TcpFchmod(napi_env env, napi_callback_info info) {
   return MakeInt32(env, UV_ENOTSUP);
 }
 
+napi_value TcpUseUserBuffer(napi_env env, napi_callback_info info) {
+  // Compatibility shim for net.Socket({ onread: { buffer, callback } }).
+  napi_value out = nullptr;
+  napi_get_undefined(env, &out);
+  return out;
+}
+
 napi_value TcpBytesReadGetter(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
@@ -874,6 +871,15 @@ void SetNamedU32(napi_env env, napi_value obj, const char* key, uint32_t value) 
 
 }  // namespace
 
+uv_stream_t* UnodeTcpWrapGetStream(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  napi_valuetype t = napi_undefined;
+  if (napi_typeof(env, value, &t) != napi_ok || t != napi_object) return nullptr;
+  TcpWrap* wrap = nullptr;
+  if (napi_unwrap(env, value, reinterpret_cast<void**>(&wrap)) != napi_ok || wrap == nullptr) return nullptr;
+  return reinterpret_cast<uv_stream_t*>(&wrap->handle);
+}
+
 void UnodeInstallTcpWrapBinding(napi_env env) {
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return;
@@ -911,6 +917,7 @@ void UnodeInstallTcpWrapBinding(napi_env env) {
       {"asyncReset", nullptr, TcpAsyncReset, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"reset", nullptr, TcpReset, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"fchmod", nullptr, TcpFchmod, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"useUserBuffer", nullptr, TcpUseUserBuffer, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"bytesRead", nullptr, nullptr, TcpBytesReadGetter, nullptr, nullptr, napi_default, nullptr},
       {"bytesWritten", nullptr, nullptr, TcpBytesWrittenGetter, nullptr, nullptr, napi_default, nullptr},
       {"fd", nullptr, nullptr, TcpFdGetter, nullptr, nullptr, napi_default, nullptr},
