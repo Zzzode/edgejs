@@ -1125,6 +1125,277 @@ extern "C" int snapi_bridge_run_script(uint32_t script_id,
 }
 
 // ============================================================
+// UTF-16 strings
+// ============================================================
+
+extern "C" int snapi_bridge_create_string_utf16(const uint16_t* str,
+                                                uint32_t wasm_length,
+                                                uint32_t* out_id) {
+  size_t length =
+      (wasm_length == 0xFFFFFFFFu) ? NAPI_AUTO_LENGTH : (size_t)wasm_length;
+  napi_value result;
+  napi_status s = napi_create_string_utf16(g_env, (const char16_t*)str, length,
+                                           &result);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(result);
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_get_value_string_utf16(uint32_t id,
+                                                   uint16_t* buf,
+                                                   size_t bufsize,
+                                                   size_t* result) {
+  napi_value val = LoadValue(id);
+  if (!val) return napi_invalid_arg;
+  return napi_get_value_string_utf16(g_env, val, (char16_t*)buf, bufsize,
+                                     result);
+}
+
+// ============================================================
+// BigInt words (arbitrary precision)
+// ============================================================
+
+extern "C" int snapi_bridge_create_bigint_words(int sign_bit,
+                                                uint32_t word_count,
+                                                const uint64_t* words,
+                                                uint32_t* out_id) {
+  napi_value result;
+  napi_status s = napi_create_bigint_words(g_env, sign_bit, (size_t)word_count,
+                                           words, &result);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(result);
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_get_value_bigint_words(uint32_t id,
+                                                   int* sign_bit,
+                                                   size_t* word_count,
+                                                   uint64_t* words) {
+  napi_value val = LoadValue(id);
+  if (!val) return napi_invalid_arg;
+  return napi_get_value_bigint_words(g_env, val, sign_bit, word_count, words);
+}
+
+// ============================================================
+// Instance data
+// ============================================================
+
+extern "C" int snapi_bridge_set_instance_data(uint64_t data_val) {
+  return napi_set_instance_data(g_env, (void*)(uintptr_t)data_val,
+                                nullptr, nullptr);
+}
+
+extern "C" int snapi_bridge_get_instance_data(uint64_t* data_out) {
+  void* data = nullptr;
+  napi_status s = napi_get_instance_data(g_env, &data);
+  if (s != napi_ok) return s;
+  *data_out = (uint64_t)(uintptr_t)data;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_adjust_external_memory(int64_t change,
+                                                   int64_t* adjusted) {
+  return napi_adjust_external_memory(g_env, change, adjusted);
+}
+
+// ============================================================
+// Node Buffers (implemented via Uint8Array + ArrayBuffer since
+// napi-v8 doesn't have node_api.h buffer functions)
+// ============================================================
+
+extern "C" int snapi_bridge_create_buffer(uint32_t length,
+                                          uint64_t* data_out,
+                                          uint32_t* out_id) {
+  // Create an ArrayBuffer, then a Uint8Array view over it
+  napi_value arraybuffer;
+  void* ab_data = nullptr;
+  napi_status s = napi_create_arraybuffer(g_env, (size_t)length, &ab_data,
+                                          &arraybuffer);
+  if (s != napi_ok) return s;
+  napi_value uint8array;
+  s = napi_create_typedarray(g_env, napi_uint8_array, (size_t)length,
+                             arraybuffer, 0, &uint8array);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(uint8array);
+  if (data_out) *data_out = (uint64_t)(uintptr_t)ab_data;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_create_buffer_copy(uint32_t length,
+                                               const void* src_data,
+                                               uint64_t* result_data_out,
+                                               uint32_t* out_id) {
+  // Create an ArrayBuffer, copy data in, wrap with Uint8Array
+  napi_value arraybuffer;
+  void* ab_data = nullptr;
+  napi_status s = napi_create_arraybuffer(g_env, (size_t)length, &ab_data,
+                                          &arraybuffer);
+  if (s != napi_ok) return s;
+  if (ab_data && src_data && length > 0) {
+    memcpy(ab_data, src_data, length);
+  }
+  napi_value uint8array;
+  s = napi_create_typedarray(g_env, napi_uint8_array, (size_t)length,
+                             arraybuffer, 0, &uint8array);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(uint8array);
+  if (result_data_out) *result_data_out = (uint64_t)(uintptr_t)ab_data;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_is_buffer(uint32_t id, int* result) {
+  // A "buffer" in our implementation is a Uint8Array
+  napi_value val = LoadValue(id);
+  if (!val) return napi_invalid_arg;
+  bool is_ta;
+  napi_status s = napi_is_typedarray(g_env, val, &is_ta);
+  if (s != napi_ok) return s;
+  if (!is_ta) {
+    *result = 0;
+    return napi_ok;
+  }
+  // Check if it's specifically a Uint8Array
+  napi_typedarray_type ta_type;
+  s = napi_get_typedarray_info(g_env, val, &ta_type, nullptr, nullptr,
+                               nullptr, nullptr);
+  if (s != napi_ok) return s;
+  *result = (ta_type == napi_uint8_array) ? 1 : 0;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_get_buffer_info(uint32_t id,
+                                            uint64_t* data_out,
+                                            uint32_t* length_out) {
+  napi_value val = LoadValue(id);
+  if (!val) return napi_invalid_arg;
+  // Get typedarray info to find the backing arraybuffer and length
+  napi_typedarray_type ta_type;
+  size_t length;
+  napi_value arraybuffer;
+  size_t byte_offset;
+  napi_status s = napi_get_typedarray_info(g_env, val, &ta_type, &length,
+                                           nullptr, &arraybuffer, &byte_offset);
+  if (s != napi_ok) return s;
+  if (length_out) *length_out = (uint32_t)length;
+  // Get the data pointer from the backing ArrayBuffer (not from the typedarray,
+  // which may return a V8 sandbox-mapped address for external arraybuffers)
+  if (data_out) {
+    void* ab_data = nullptr;
+    size_t ab_len = 0;
+    s = napi_get_arraybuffer_info(g_env, arraybuffer, &ab_data, &ab_len);
+    if (s != napi_ok) return s;
+    // Apply byte_offset to get the actual data start
+    *data_out = (uint64_t)(uintptr_t)((uint8_t*)ab_data + byte_offset);
+  }
+  return napi_ok;
+}
+
+// ============================================================
+// Node version (stub — we're not running in Node, return fake version)
+// ============================================================
+
+extern "C" int snapi_bridge_get_node_version(uint32_t* major,
+                                             uint32_t* minor,
+                                             uint32_t* patch) {
+  // Return a reasonable fake version since we're running on pure V8
+  if (major) *major = 22;
+  if (minor) *minor = 0;
+  if (patch) *patch = 0;
+  return napi_ok;
+}
+
+// ============================================================
+// Object wrapping
+// ============================================================
+
+extern "C" int snapi_bridge_wrap(uint32_t obj_id, uint64_t native_data,
+                                 uint32_t* ref_out) {
+  napi_value obj = LoadValue(obj_id);
+  if (!obj) return napi_invalid_arg;
+  napi_ref ref = nullptr;
+  napi_status s = napi_wrap(g_env, obj, (void*)(uintptr_t)native_data,
+                            nullptr, nullptr, ref_out ? &ref : nullptr);
+  if (s != napi_ok) return s;
+  if (ref_out) *ref_out = StoreRef(ref);
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unwrap(uint32_t obj_id, uint64_t* data_out) {
+  napi_value obj = LoadValue(obj_id);
+  if (!obj) return napi_invalid_arg;
+  void* data = nullptr;
+  napi_status s = napi_unwrap(g_env, obj, &data);
+  if (s != napi_ok) return s;
+  if (data_out) *data_out = (uint64_t)(uintptr_t)data;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_remove_wrap(uint32_t obj_id, uint64_t* data_out) {
+  napi_value obj = LoadValue(obj_id);
+  if (!obj) return napi_invalid_arg;
+  void* data = nullptr;
+  napi_status s = napi_remove_wrap(g_env, obj, &data);
+  if (s != napi_ok) return s;
+  if (data_out) *data_out = (uint64_t)(uintptr_t)data;
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_add_finalizer(uint32_t obj_id, uint64_t data_val,
+                                          uint32_t* ref_out) {
+  napi_value obj = LoadValue(obj_id);
+  if (!obj) return napi_invalid_arg;
+  // No actual WASM callback for finalizer; just register with nullptr callback
+  napi_ref ref = nullptr;
+  napi_status s = napi_add_finalizer(g_env, obj, (void*)(uintptr_t)data_val,
+                                     nullptr, nullptr, ref_out ? &ref : nullptr);
+  if (s != napi_ok) return s;
+  if (ref_out) *ref_out = StoreRef(ref);
+  return napi_ok;
+}
+
+// ============================================================
+// napi_new_instance
+// ============================================================
+
+extern "C" int snapi_bridge_new_instance(uint32_t ctor_id, uint32_t argc,
+                                         const uint32_t* argv_ids,
+                                         uint32_t* out_id) {
+  napi_value ctor = LoadValue(ctor_id);
+  if (!ctor) return napi_invalid_arg;
+  std::vector<napi_value> argv(argc);
+  for (uint32_t i = 0; i < argc; i++) {
+    argv[i] = LoadValue(argv_ids[i]);
+    if (!argv[i]) return napi_invalid_arg;
+  }
+  napi_value result;
+  napi_status s = napi_new_instance(g_env, ctor, argc, argv.data(), &result);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(result);
+  return napi_ok;
+}
+
+// ============================================================
+// napi_define_properties
+// ============================================================
+
+extern "C" int snapi_bridge_define_properties(uint32_t obj_id,
+                                              uint32_t prop_count,
+                                              const char** utf8names,
+                                              const uint32_t* value_ids,
+                                              const int32_t* attributes) {
+  napi_value obj = LoadValue(obj_id);
+  if (!obj) return napi_invalid_arg;
+  std::vector<napi_property_descriptor> descs(prop_count);
+  for (uint32_t i = 0; i < prop_count; i++) {
+    memset(&descs[i], 0, sizeof(napi_property_descriptor));
+    descs[i].utf8name = utf8names[i];
+    descs[i].value = LoadValue(value_ids[i]);
+    descs[i].attributes = (napi_property_attributes)attributes[i];
+  }
+  return napi_define_properties(g_env, obj, prop_count, descs.data());
+}
+
+// ============================================================
 // Cleanup
 // ============================================================
 

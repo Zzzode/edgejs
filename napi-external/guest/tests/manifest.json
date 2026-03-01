@@ -109,6 +109,36 @@
       "name": "test_function_call",
       "description": "Call JS functions via napi_call_function with arguments",
       "expected_stdout": "TEST_FUNCTION_CALL_OK=1\n"
+    },
+    {
+      "name": "test_string_utf16",
+      "description": "UTF-16 string creation and readback",
+      "expected_stdout": "TEST_STRING_UTF16_OK=1\n"
+    },
+    {
+      "name": "test_bigint_words",
+      "description": "BigInt arbitrary-precision words create/readback",
+      "expected_stdout": "TEST_BIGINT_WORDS_OK=1\n"
+    },
+    {
+      "name": "test_instance_data",
+      "description": "Instance data set/get and adjust_external_memory",
+      "expected_stdout": "TEST_INSTANCE_DATA_OK=1\n"
+    },
+    {
+      "name": "test_buffer",
+      "description": "Node Buffer create/copy/is_buffer/get_buffer_info",
+      "expected_stdout": "TEST_BUFFER_OK=1\n"
+    },
+    {
+      "name": "test_node_api_misc",
+      "description": "napi_get_node_version",
+      "expected_stdout": "TEST_NODE_API_MISC_OK=1\n"
+    },
+    {
+      "name": "test_wrap",
+      "description": "Object wrap/unwrap/remove_wrap and add_finalizer",
+      "expected_stdout": "TEST_WRAP_OK=1\n"
     }
   ]
 }

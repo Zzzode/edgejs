@@ -133,6 +133,30 @@ unsafe extern "C" {
     fn snapi_bridge_call_function(recv_id: u32, func_id: u32, argc: u32, argv_ids: *const u32, out_id: *mut u32) -> i32;
     // Script execution
     fn snapi_bridge_run_script(script_id: u32, out_value_id: *mut u32) -> i32;
+    // UTF-16 strings
+    fn snapi_bridge_create_string_utf16(str_ptr: *const u16, wasm_length: u32, out_id: *mut u32) -> i32;
+    fn snapi_bridge_get_value_string_utf16(id: u32, buf: *mut u16, bufsize: usize, result: *mut usize) -> i32;
+    // BigInt words
+    fn snapi_bridge_create_bigint_words(sign_bit: i32, word_count: u32, words: *const u64, out_id: *mut u32) -> i32;
+    fn snapi_bridge_get_value_bigint_words(id: u32, sign_bit: *mut i32, word_count: *mut usize, words: *mut u64) -> i32;
+    // Instance data
+    fn snapi_bridge_set_instance_data(data_val: u64) -> i32;
+    fn snapi_bridge_get_instance_data(data_out: *mut u64) -> i32;
+    fn snapi_bridge_adjust_external_memory(change: i64, adjusted: *mut i64) -> i32;
+    // Node Buffers
+    fn snapi_bridge_create_buffer(length: u32, data_out: *mut u64, out_id: *mut u32) -> i32;
+    fn snapi_bridge_create_buffer_copy(length: u32, src_data: *const u8, result_data_out: *mut u64, out_id: *mut u32) -> i32;
+    fn snapi_bridge_is_buffer(id: u32, result: *mut i32) -> i32;
+    fn snapi_bridge_get_buffer_info(id: u32, data_out: *mut u64, length_out: *mut u32) -> i32;
+    // Node version
+    fn snapi_bridge_get_node_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
+    // Object wrapping
+    fn snapi_bridge_wrap(obj_id: u32, native_data: u64, ref_out: *mut u32) -> i32;
+    fn snapi_bridge_unwrap(obj_id: u32, data_out: *mut u64) -> i32;
+    fn snapi_bridge_remove_wrap(obj_id: u32, data_out: *mut u64) -> i32;
+    fn snapi_bridge_add_finalizer(obj_id: u32, data_val: u64, ref_out: *mut u32) -> i32;
+    // Constructor
+    fn snapi_bridge_new_instance(ctor_id: u32, argc: u32, argv_ids: *const u32, out_id: *mut u32) -> i32;
     // Cleanup
     #[allow(dead_code)]
     fn snapi_bridge_dispose();
@@ -145,6 +169,10 @@ unsafe extern "C" {
 struct RuntimeEnv {
     memory: Option<Memory>,
     malloc_fn: Option<TypedFunction<i32, i32>>,
+    /// Maps value handle IDs to their guest-memory data pointers.
+    /// Used for buffers/arraybuffers backed by guest linear memory,
+    /// since V8 sandbox remaps external ArrayBuffer pointers.
+    guest_data_ptrs: std::collections::HashMap<u32, u32>,
 }
 
 fn make_store() -> Store {
@@ -821,6 +849,8 @@ fn guest_napi_create_arraybuffer(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, b
         let mut out: u32 = 0;
         let s = unsafe { snapi_bridge_create_external_arraybuffer(host_addr, byte_length as u32, &mut out) };
         if s == 0 {
+            // Store mapping from handle ID → guest data pointer (V8 sandbox remaps external pointers)
+            env.data_mut().guest_data_ptrs.insert(out, guest_ptr as u32);
             write_guest_u32(&mut env, rp as u32, out);
             if data_ptr > 0 {
                 write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
@@ -844,17 +874,22 @@ fn guest_napi_get_arraybuffer_info(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32,
 
     if len_ptr > 0 { write_guest_u32(&mut env, len_ptr as u32, bl); }
 
-    if data_ptr > 0 && host_data_addr != 0 {
-        // Convert host pointer back to guest pointer
-        let memory = env.data().memory.clone();
-        if let Some(memory) = memory {
-            let guest_data_ptr: u32 = {
-                let (_, store_ref) = env.data_and_store_mut();
-                let view = memory.view(&store_ref);
-                let host_base = view.data_ptr() as u64;
-                (host_data_addr - host_base) as u32
-            };
+    // Use stored guest data pointer mapping (V8 sandbox remaps external ArrayBuffer pointers)
+    if data_ptr > 0 {
+        if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&(vh as u32)) {
             write_guest_u32(&mut env, data_ptr as u32, guest_data_ptr);
+        } else if host_data_addr != 0 {
+            // Fallback for non-external arraybuffers: convert host pointer
+            let memory = env.data().memory.clone();
+            if let Some(memory) = memory {
+                let guest_data_ptr: u32 = {
+                    let (_, store_ref) = env.data_and_store_mut();
+                    let view = memory.view(&store_ref);
+                    let host_base = view.data_ptr() as u64;
+                    (host_data_addr - host_base) as u32
+                };
+                write_guest_u32(&mut env, data_ptr as u32, guest_data_ptr);
+            }
         }
     }
     0
@@ -1019,6 +1054,359 @@ fn guest_napi_run_script(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, sh: i32, 
     s
 }
 
+// --- UTF-16 strings ---
+
+fn guest_napi_create_string_utf16(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, str_ptr: i32, length: i32, rp: i32) -> i32 {
+    let wl = length as u32;
+    // UTF-16: each char is 2 bytes
+    let char_count: usize = if wl == 0xFFFFFFFFu32 {
+        // Auto-length: scan for null terminator (u16 == 0)
+        let mut scan_len: usize = 0;
+        loop {
+            let Some(bytes) = read_guest_bytes(&mut env, str_ptr + (scan_len as i32 * 2), 2) else { break; };
+            let ch = u16::from_le_bytes([bytes[0], bytes[1]]);
+            if ch == 0 { break; }
+            scan_len += 1;
+            if scan_len > MAX_GUEST_CSTRING_SCAN { break; }
+        }
+        scan_len
+    } else {
+        wl as usize
+    };
+    let byte_len = char_count * 2;
+    let Some(raw_bytes) = read_guest_bytes(&mut env, str_ptr, byte_len) else { return 1; };
+    // Convert bytes to u16 array
+    let u16_data: Vec<u16> = raw_bytes.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let mut out: u32 = 0;
+    // Always pass the actual char count to the 64-bit bridge (not the WASM32 NAPI_AUTO_LENGTH sentinel)
+    let s = unsafe { snapi_bridge_create_string_utf16(u16_data.as_ptr(), char_count as u32, &mut out) };
+    if s == 0 { write_guest_u32(&mut env, rp as u32, out); }
+    s
+}
+
+fn guest_napi_get_value_string_utf16(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, vh: i32, bp: i32, bs: i32, rp: i32) -> i32 {
+    let hbs = if bs <= 0 { 0usize } else { bs as usize };
+    let mut hb = vec![0u16; hbs];
+    let mut rl: usize = 0;
+    let s = unsafe { snapi_bridge_get_value_string_utf16(vh as u32, if hbs > 0 { hb.as_mut_ptr() } else { std::ptr::null_mut() }, hbs, &mut rl) };
+    if s != 0 { return s; }
+    if bp > 0 && hbs > 0 {
+        let n = hbs.min(rl + 1);
+        // Write u16 values as LE bytes to guest memory
+        let bytes: Vec<u8> = hb[..n].iter().flat_map(|&v| v.to_le_bytes()).collect();
+        write_guest_bytes(&mut env, bp as u32, &bytes);
+    }
+    if rp > 0 { write_guest_u32(&mut env, rp as u32, rl as u32); }
+    0
+}
+
+// --- BigInt words ---
+
+fn guest_napi_create_bigint_words(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, sign_bit: i32, word_count: i32, words_ptr: i32, rp: i32) -> i32 {
+    let wc = word_count as u32;
+    // Read u64 words from guest memory (each is 8 bytes)
+    let Some(words_bytes) = read_guest_bytes(&mut env, words_ptr, wc as usize * 8) else { return 1; };
+    let words: Vec<u64> = words_bytes.chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let mut out: u32 = 0;
+    let s = unsafe { snapi_bridge_create_bigint_words(sign_bit, wc, words.as_ptr(), &mut out) };
+    if s == 0 { write_guest_u32(&mut env, rp as u32, out); }
+    s
+}
+
+fn guest_napi_get_value_bigint_words(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, vh: i32, sign_ptr: i32, wc_ptr: i32, words_ptr: i32) -> i32 {
+    // First, read the word_count from guest to know how many to allocate
+    let Some(wc_bytes) = read_guest_bytes(&mut env, wc_ptr, 4) else { return 1; };
+    let mut word_count = u32::from_le_bytes(wc_bytes.try_into().unwrap()) as usize;
+
+    if words_ptr <= 0 {
+        // Query mode: just get the word count
+        let mut sign: i32 = 0;
+        let s = unsafe { snapi_bridge_get_value_bigint_words(vh as u32, &mut sign, &mut word_count, std::ptr::null_mut()) };
+        if s == 0 {
+            write_guest_i32(&mut env, sign_ptr as u32, sign);
+            write_guest_u32(&mut env, wc_ptr as u32, word_count as u32);
+        }
+        return s;
+    }
+
+    let mut sign: i32 = 0;
+    let mut words = vec![0u64; word_count];
+    let s = unsafe { snapi_bridge_get_value_bigint_words(vh as u32, &mut sign, &mut word_count, words.as_mut_ptr()) };
+    if s == 0 {
+        write_guest_i32(&mut env, sign_ptr as u32, sign);
+        write_guest_u32(&mut env, wc_ptr as u32, word_count as u32);
+        // Write u64 words as LE bytes to guest
+        let bytes: Vec<u8> = words[..word_count].iter().flat_map(|&v| v.to_le_bytes()).collect();
+        write_guest_bytes(&mut env, words_ptr as u32, &bytes);
+    }
+    s
+}
+
+// --- Instance data ---
+
+fn guest_napi_set_instance_data(_env: FunctionEnvMut<RuntimeEnv>, _e: i32, data: i32, _finalize_cb: i32, _finalize_hint: i32) -> i32 {
+    unsafe { snapi_bridge_set_instance_data(data as u64) }
+}
+
+fn guest_napi_get_instance_data(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, rp: i32) -> i32 {
+    let mut data: u64 = 0;
+    let s = unsafe { snapi_bridge_get_instance_data(&mut data) };
+    if s == 0 { write_guest_u32(&mut env, rp as u32, data as u32); }
+    s
+}
+
+fn guest_napi_adjust_external_memory(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, change: i64, rp: i32) -> i32 {
+    let mut adjusted: i64 = 0;
+    let s = unsafe { snapi_bridge_adjust_external_memory(change, &mut adjusted) };
+    if s == 0 { write_guest_i64(&mut env, rp as u32, adjusted); }
+    s
+}
+
+// --- Node Buffers ---
+
+fn guest_napi_create_buffer(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, length: i32, data_ptr: i32, rp: i32) -> i32 {
+    // Buffers must be backed by guest linear memory (same pattern as create_arraybuffer)
+    let malloc_fn = env.data().malloc_fn.clone();
+    let memory = env.data().memory.clone();
+
+    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
+        // Allocate memory in the guest's linear memory
+        let guest_ptr: i32 = {
+            let (_, mut store_ref) = env.data_and_store_mut();
+            match malloc_fn.call(&mut store_ref, length) {
+                Ok(ptr) if ptr > 0 => ptr,
+                _ => return 1,
+            }
+        };
+
+        // Get host pointer corresponding to the guest allocation
+        let host_addr: u64 = {
+            let (_, store_ref) = env.data_and_store_mut();
+            let view = memory.view(&store_ref);
+            let host_base = view.data_ptr() as u64;
+            host_base + guest_ptr as u64
+        };
+
+        // Zero-initialize the guest memory region
+        if length > 0 {
+            let zeros = vec![0u8; length as usize];
+            write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
+        }
+
+        // Create external ArrayBuffer backed by guest memory
+        let mut ab_id: u32 = 0;
+        let s = unsafe { snapi_bridge_create_external_arraybuffer(host_addr, length as u32, &mut ab_id) };
+        if s != 0 { return s; }
+
+        // Create Uint8Array on top of the ArrayBuffer (this is our "buffer")
+        // napi_uint8_array = 1 in napi_typedarray_type enum
+        let mut buf_id: u32 = 0;
+        let s = unsafe { snapi_bridge_create_typedarray(1/*napi_uint8_array*/, length as u32, ab_id, 0, &mut buf_id) };
+        if s != 0 { return s; }
+
+        // Store mapping from buffer handle ID → guest data pointer
+        env.data_mut().guest_data_ptrs.insert(buf_id, guest_ptr as u32);
+
+        write_guest_u32(&mut env, rp as u32, buf_id);
+        if data_ptr > 0 {
+            write_guest_u32(&mut env, data_ptr as u32, guest_ptr as u32);
+        }
+        0
+    } else {
+        // Fallback for non-WASIX: use bridge directly
+        let mut host_data: u64 = 0;
+        let mut out: u32 = 0;
+        let s = unsafe { snapi_bridge_create_buffer(length as u32, &mut host_data, &mut out) };
+        if s != 0 { return s; }
+        write_guest_u32(&mut env, rp as u32, out);
+        0
+    }
+}
+
+fn guest_napi_create_buffer_copy(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, length: i32, data_ptr: i32, result_data_ptr: i32, rp: i32) -> i32 {
+    // Read source data from guest memory first
+    let Some(src_data) = read_guest_bytes(&mut env, data_ptr, length as usize) else { return 1; };
+
+    let malloc_fn = env.data().malloc_fn.clone();
+    let memory = env.data().memory.clone();
+
+    if let (Some(malloc_fn), Some(memory)) = (malloc_fn, memory) {
+        // Allocate memory in the guest's linear memory
+        let guest_ptr: i32 = {
+            let (_, mut store_ref) = env.data_and_store_mut();
+            match malloc_fn.call(&mut store_ref, length) {
+                Ok(ptr) if ptr > 0 => ptr,
+                _ => return 1,
+            }
+        };
+
+        // Copy source data to guest memory
+        write_guest_bytes(&mut env, guest_ptr as u32, &src_data);
+
+        // Get host pointer corresponding to the guest allocation
+        let host_addr: u64 = {
+            let (_, store_ref) = env.data_and_store_mut();
+            let view = memory.view(&store_ref);
+            let host_base = view.data_ptr() as u64;
+            host_base + guest_ptr as u64
+        };
+
+        // Create external ArrayBuffer backed by guest memory
+        let mut ab_id: u32 = 0;
+        let s = unsafe { snapi_bridge_create_external_arraybuffer(host_addr, length as u32, &mut ab_id) };
+        if s != 0 { return s; }
+
+        // Create Uint8Array on top of the ArrayBuffer
+        // napi_uint8_array = 1 in napi_typedarray_type enum
+        let mut buf_id: u32 = 0;
+        let s = unsafe { snapi_bridge_create_typedarray(1/*napi_uint8_array*/, length as u32, ab_id, 0, &mut buf_id) };
+        if s != 0 { return s; }
+
+        // Store mapping from buffer handle ID → guest data pointer
+        env.data_mut().guest_data_ptrs.insert(buf_id, guest_ptr as u32);
+
+        write_guest_u32(&mut env, rp as u32, buf_id);
+        if result_data_ptr > 0 {
+            write_guest_u32(&mut env, result_data_ptr as u32, guest_ptr as u32);
+        }
+        0
+    } else {
+        // Fallback for non-WASIX
+        let mut result_host_data: u64 = 0;
+        let mut out: u32 = 0;
+        let s = unsafe { snapi_bridge_create_buffer_copy(length as u32, src_data.as_ptr(), &mut result_host_data, &mut out) };
+        if s == 0 {
+            write_guest_u32(&mut env, rp as u32, out);
+        }
+        s
+    }
+}
+
+guest_is_check!(guest_napi_is_buffer, snapi_bridge_is_buffer);
+
+fn guest_napi_get_buffer_info(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, vh: i32, data_ptr: i32, len_ptr: i32) -> i32 {
+    let mut host_data: u64 = 0;
+    let mut bl: u32 = 0;
+    let s = unsafe { snapi_bridge_get_buffer_info(vh as u32, &mut host_data, &mut bl) };
+    if s != 0 { return s; }
+    if len_ptr > 0 { write_guest_u32(&mut env, len_ptr as u32, bl); }
+    // Use stored guest data pointer mapping (V8 sandbox remaps external ArrayBuffer pointers)
+    if data_ptr > 0 {
+        if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&(vh as u32)) {
+            write_guest_u32(&mut env, data_ptr as u32, guest_data_ptr);
+        }
+    }
+    0
+}
+
+// --- Node version ---
+
+fn guest_napi_get_node_version(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, rp: i32) -> i32 {
+    let mut major: u32 = 0;
+    let mut minor: u32 = 0;
+    let mut patch: u32 = 0;
+    let s = unsafe { snapi_bridge_get_node_version(&mut major, &mut minor, &mut patch) };
+    if s != 0 { return s; }
+    // Write a napi_node_version struct to guest memory:
+    // { uint32_t major, uint32_t minor, uint32_t patch, const char* release }
+    // For WASM: we write the struct (16 bytes) into a static-ish location
+    // But the N-API spec says we return a *pointer* to the version struct.
+    // Actually, the API signature is: napi_get_node_version(env, const napi_node_version** version)
+    // So we need to allocate memory in guest for the struct and write the pointer.
+    // For simplicity, use malloc if available, otherwise just write the pointer to a fixed value.
+    let malloc_fn = env.data().malloc_fn.clone();
+    if let Some(malloc_fn) = malloc_fn {
+        // Allocate 16 bytes for the struct (major, minor, patch, release_ptr)
+        // Then allocate a small buffer for the release string
+        let release_str = b"napi-external\0";
+        let struct_size = 16i32; // 4 * u32 = 16 (release is a pointer)
+        let total = struct_size + release_str.len() as i32;
+        let guest_ptr: i32 = {
+            let (_, mut store_ref) = env.data_and_store_mut();
+            match malloc_fn.call(&mut store_ref, total) {
+                Ok(ptr) if ptr > 0 => ptr,
+                _ => return 1,
+            }
+        };
+        // Write release string
+        let release_offset = guest_ptr + struct_size;
+        write_guest_bytes(&mut env, release_offset as u32, release_str);
+        // Write struct fields
+        write_guest_u32(&mut env, guest_ptr as u32, major);
+        write_guest_u32(&mut env, (guest_ptr + 4) as u32, minor);
+        write_guest_u32(&mut env, (guest_ptr + 8) as u32, patch);
+        write_guest_u32(&mut env, (guest_ptr + 12) as u32, release_offset as u32);
+        // Write pointer to struct
+        write_guest_u32(&mut env, rp as u32, guest_ptr as u32);
+    } else {
+        // Fallback: just write major version as a simple value
+        write_guest_u32(&mut env, rp as u32, major);
+    }
+    0
+}
+
+// --- Object wrapping ---
+
+fn guest_napi_wrap(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, obj: i32, native_data: i32, _finalize_cb: i32, _finalize_hint: i32, ref_ptr: i32) -> i32 {
+    let mut ref_out: u32 = 0;
+    let s = if ref_ptr > 0 {
+        unsafe { snapi_bridge_wrap(obj as u32, native_data as u64, &mut ref_out) }
+    } else {
+        unsafe { snapi_bridge_wrap(obj as u32, native_data as u64, std::ptr::null_mut()) }
+    };
+    if s == 0 && ref_ptr > 0 {
+        write_guest_u32(&mut env, ref_ptr as u32, ref_out);
+    }
+    s
+}
+
+fn guest_napi_unwrap(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, obj: i32, rp: i32) -> i32 {
+    let mut data: u64 = 0;
+    let s = unsafe { snapi_bridge_unwrap(obj as u32, &mut data) };
+    if s == 0 { write_guest_u32(&mut env, rp as u32, data as u32); }
+    s
+}
+
+fn guest_napi_remove_wrap(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, obj: i32, rp: i32) -> i32 {
+    let mut data: u64 = 0;
+    let s = unsafe { snapi_bridge_remove_wrap(obj as u32, &mut data) };
+    if s == 0 { write_guest_u32(&mut env, rp as u32, data as u32); }
+    s
+}
+
+fn guest_napi_add_finalizer(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, obj: i32, data: i32, _finalize_cb: i32, _finalize_hint: i32, ref_ptr: i32) -> i32 {
+    let mut ref_out: u32 = 0;
+    let s = if ref_ptr > 0 {
+        unsafe { snapi_bridge_add_finalizer(obj as u32, data as u64, &mut ref_out) }
+    } else {
+        unsafe { snapi_bridge_add_finalizer(obj as u32, data as u64, std::ptr::null_mut()) }
+    };
+    if s == 0 && ref_ptr > 0 {
+        write_guest_u32(&mut env, ref_ptr as u32, ref_out);
+    }
+    s
+}
+
+// --- Constructor ---
+
+fn guest_napi_new_instance(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, ctor: i32, argc: i32, argv_ptr: i32, rp: i32) -> i32 {
+    let argc_u = argc as u32;
+    let argv_ids = if argc_u > 0 {
+        let Some(ids) = read_guest_u32_array(&mut env, argv_ptr, argc_u as usize) else { return 1; };
+        ids
+    } else {
+        vec![]
+    };
+    let mut out: u32 = 0;
+    let s = unsafe { snapi_bridge_new_instance(ctor as u32, argc_u, argv_ids.as_ptr(), &mut out) };
+    if s == 0 { write_guest_u32(&mut env, rp as u32, out); }
+    s
+}
+
 // --- Misc stubs ---
 
 fn guest_napi_get_last_error_info(_env: FunctionEnvMut<RuntimeEnv>, _e: i32, _rp: i32) -> i32 { 0 }
@@ -1026,6 +1414,22 @@ fn guest_napi_get_last_error_info(_env: FunctionEnvMut<RuntimeEnv>, _e: i32, _rp
 fn guest_napi_get_version(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, rp: i32) -> i32 {
     write_guest_u32(&mut env, rp as u32, 8);
     0
+}
+
+fn guest_napi_fatal_error(mut env: FunctionEnvMut<RuntimeEnv>, loc_ptr: i32, loc_len: i32, msg_ptr: i32, msg_len: i32) -> i32 {
+    // Read location and message from guest memory
+    let loc = if loc_ptr > 0 {
+        let len = if loc_len as u32 == 0xFFFFFFFFu32 { read_guest_c_string(&mut env, loc_ptr).map(|v| v.len()).unwrap_or(0) } else { loc_len as usize };
+        read_guest_bytes(&mut env, loc_ptr, len).map(|b| String::from_utf8_lossy(&b).to_string())
+    } else { None };
+    let msg = if msg_ptr > 0 {
+        let len = if msg_len as u32 == 0xFFFFFFFFu32 { read_guest_c_string(&mut env, msg_ptr).map(|v| v.len()).unwrap_or(0) } else { msg_len as usize };
+        read_guest_bytes(&mut env, msg_ptr, len).map(|b| String::from_utf8_lossy(&b).to_string())
+    } else { None };
+    eprintln!("FATAL ERROR: location={}, message={}",
+              loc.as_deref().unwrap_or("(null)"),
+              msg.as_deref().unwrap_or("(null)"));
+    std::process::abort();
 }
 
 // ============================================================
@@ -1153,6 +1557,32 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
     reg!("napi_call_function", guest_napi_call_function);
     // Script execution
     reg!("napi_run_script", guest_napi_run_script);
+    // UTF-16 strings
+    reg!("napi_create_string_utf16", guest_napi_create_string_utf16);
+    reg!("napi_get_value_string_utf16", guest_napi_get_value_string_utf16);
+    // BigInt words
+    reg!("napi_create_bigint_words", guest_napi_create_bigint_words);
+    reg!("napi_get_value_bigint_words", guest_napi_get_value_bigint_words);
+    // Instance data
+    reg!("napi_set_instance_data", guest_napi_set_instance_data);
+    reg!("napi_get_instance_data", guest_napi_get_instance_data);
+    reg!("napi_adjust_external_memory", guest_napi_adjust_external_memory);
+    // Node Buffers
+    reg!("napi_create_buffer", guest_napi_create_buffer);
+    reg!("napi_create_buffer_copy", guest_napi_create_buffer_copy);
+    reg!("napi_is_buffer", guest_napi_is_buffer);
+    reg!("napi_get_buffer_info", guest_napi_get_buffer_info);
+    // Node version
+    reg!("napi_get_node_version", guest_napi_get_node_version);
+    // Object wrapping
+    reg!("napi_wrap", guest_napi_wrap);
+    reg!("napi_unwrap", guest_napi_unwrap);
+    reg!("napi_remove_wrap", guest_napi_remove_wrap);
+    reg!("napi_add_finalizer", guest_napi_add_finalizer);
+    // Constructor
+    reg!("napi_new_instance", guest_napi_new_instance);
+    // Fatal error
+    reg!("napi_fatal_error", guest_napi_fatal_error);
     // Misc
     reg!("napi_get_last_error_info", guest_napi_get_last_error_info);
     reg!("napi_get_version", guest_napi_get_version);
@@ -1184,6 +1614,7 @@ pub fn run_wasm_main_i32(wasm_path: &Path) -> Result<i32> {
     let func_env = FunctionEnv::new(&mut store, RuntimeEnv {
         memory: Some(memory.clone()),
         malloc_fn: None,
+        guest_data_ptrs: std::collections::HashMap::new(),
     });
 
     let mut import_object = imports! {
@@ -1248,6 +1679,7 @@ pub fn run_wasix_main_capture_stdout(wasm_path: &Path, args: &[&str]) -> Result<
         let func_env = FunctionEnv::new(&mut store, RuntimeEnv {
             memory: Some(memory),
             malloc_fn: None,
+            guest_data_ptrs: std::collections::HashMap::new(),
         });
         register_napi_imports(&mut store, &func_env, &mut import_object);
 
