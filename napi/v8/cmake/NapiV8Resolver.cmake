@@ -61,7 +61,7 @@ function(_napi_v8_local_strategy out_ok out_include out_library out_extra out_de
           set(_extra "${_hb_prefix}/lib/libv8_libplatform.dylib;${_hb_prefix}/lib/libv8_libbase.dylib")
         endif()
         if(_defines STREQUAL "")
-          set(_defines "V8_COMPRESS_POINTERS;V8_31BIT_SMIS_ON_64BIT_ARCH;V8_ENABLE_SANDBOX")
+          set(_defines "")
         endif()
         break()
       endif()
@@ -175,7 +175,7 @@ function(_napi_v8_prebuilt_strategy out_ok out_include out_library out_extra out
   endif()
 
   if(defines_override STREQUAL "")
-    set(_defines "V8_COMPRESS_POINTERS;V8_31BIT_SMIS_ON_64BIT_ARCH;V8_ENABLE_SANDBOX")
+    set(_defines "")
   else()
     set(_defines "${defines_override}")
   endif()
@@ -299,7 +299,7 @@ function(_napi_v8_source_strategy out_ok out_include out_library out_extra out_d
   endif()
 
   if(defines_override STREQUAL "")
-    set(_defines "V8_COMPRESS_POINTERS;V8_31BIT_SMIS_ON_64BIT_ARCH;V8_ENABLE_SANDBOX")
+    set(_defines "")
   else()
     set(_defines "${defines_override}")
   endif()

@@ -19,7 +19,7 @@ if [[ -z "${NAPI_V8_EXTRA_LIBS:-}" ]]; then
   fi
 fi
 
-export NAPI_V8_DEFINES="${NAPI_V8_DEFINES:-${NAPI_V8_V8_DEFINES:-V8_COMPRESS_POINTERS;V8_ENABLE_SANDBOX}}"
+export NAPI_V8_DEFINES="${NAPI_V8_DEFINES:-${NAPI_V8_V8_DEFINES:-}}"
 
 if [[ ! -d "${NAPI_V8_INCLUDE_DIR}" ]]; then
   echo "V8 include directory not found: ${NAPI_V8_INCLUDE_DIR}" >&2

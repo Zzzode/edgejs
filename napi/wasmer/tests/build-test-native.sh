@@ -54,9 +54,6 @@ clang -c -std=c11 -O2 \
 clang++ -std=c++20 -O2 \
   -DNAPI_EXTERN= \
   -DNAPI_VERSION=8 \
-  -DV8_COMPRESS_POINTERS=1 \
-  -DV8_31BIT_SMIS_ON_64BIT_ARCH=1 \
-  -DV8_ENABLE_SANDBOX=1 \
   -I"$NAPI_INCLUDE_DIR" \
   -I"$NAPI_V8_INCLUDE" \
   -I"$NAPI_V8_SRC" \
