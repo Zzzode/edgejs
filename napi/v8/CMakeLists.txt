@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(NAPI_V8_BUILD_TESTS "Build napi-v8 tier1 tests" ON)
 
 set(NAPI_V8_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-include("${NAPI_V8_ROOT}/../cmake/NapiEngine.cmake")
+include("${NAPI_V8_ROOT}/cmake/NapiEngine.cmake")
 include("${NAPI_V8_ROOT}/cmake/NapiV8Resolver.cmake")
 napi_engine_set_layout("${NAPI_V8_ROOT}")
 set(NAPI_V8_NODE_ROOT_DEFAULT "${PROJECT_ROOT}/node")
