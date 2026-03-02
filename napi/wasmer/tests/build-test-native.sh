@@ -28,6 +28,7 @@ NAPI_V8_SRC="$NAPI_V8_DIR/src"
 # V8 paths (auto-detect Homebrew)
 V8_INCLUDE_DIR="${V8_INCLUDE_DIR:-/opt/homebrew/Cellar/v8/14.5.201.9/include}"
 V8_LIB_DIR="${V8_LIB_DIR:-/opt/homebrew/Cellar/v8/14.5.201.9/lib}"
+V8_DEFINES="${V8_DEFINES:-${NAPI_V8_DEFINES:-V8_COMPRESS_POINTERS}}"
 
 if [[ ! -f "$TEST_SRC" ]]; then
   echo "test not found: $TEST_SRC" >&2
@@ -54,6 +55,7 @@ clang -c -std=c11 -O2 \
 clang++ -std=c++20 -O2 \
   -DNAPI_EXTERN= \
   -DNAPI_VERSION=8 \
+  $(echo "$V8_DEFINES" | tr ';,' '\n' | sed '/^[[:space:]]*$/d; s/^[[:space:]]*/-D/; s/[[:space:]]*$//' | tr '\n' ' ') \
   -I"$NAPI_INCLUDE_DIR" \
   -I"$NAPI_V8_INCLUDE" \
   -I"$NAPI_V8_SRC" \

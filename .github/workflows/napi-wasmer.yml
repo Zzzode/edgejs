@@ -61,6 +61,7 @@ jobs:
 
           echo "V8_INCLUDE_DIR=$V8_ROOT/include" >> "$GITHUB_ENV"
           echo "V8_LIB_DIR=$V8_ROOT/lib" >> "$GITHUB_ENV"
+          echo "V8_DEFINES=V8_COMPRESS_POINTERS" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$V8_ROOT/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Test napi-wasmer
@@ -122,6 +123,7 @@ jobs:
 
           echo "V8_INCLUDE_DIR=$V8_ROOT/include" >> "$GITHUB_ENV"
           echo "V8_LIB_DIR=$V8_ROOT/lib" >> "$GITHUB_ENV"
+          echo "V8_DEFINES=V8_COMPRESS_POINTERS" >> "$GITHUB_ENV"
           echo "DYLD_LIBRARY_PATH=$V8_ROOT/lib:${DYLD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Test napi-wasmer

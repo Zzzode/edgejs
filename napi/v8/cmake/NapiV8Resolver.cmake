@@ -175,7 +175,7 @@ function(_napi_v8_prebuilt_strategy out_ok out_include out_library out_extra out
   endif()
 
   if(defines_override STREQUAL "")
-    set(_defines "")
+    set(_defines "V8_COMPRESS_POINTERS")
   else()
     set(_defines "${defines_override}")
   endif()
@@ -245,8 +245,7 @@ function(_napi_v8_source_strategy out_ok out_include out_library out_extra out_d
     "v8_use_external_startup_data=false "
     "v8_enable_i18n_support=false "
     "v8_enable_pointer_compression=true "
-    "v8_enable_31bit_smis_on_64bit_arch=true "
-    "v8_enable_sandbox=true "
+    "v8_enable_sandbox=false "
     "target_os=\"${_target_os}\" "
     "target_cpu=\"${_target_cpu}\" "
     "treat_warnings_as_errors=false")
@@ -299,7 +298,7 @@ function(_napi_v8_source_strategy out_ok out_include out_library out_extra out_d
   endif()
 
   if(defines_override STREQUAL "")
-    set(_defines "")
+    set(_defines "V8_COMPRESS_POINTERS")
   else()
     set(_defines "${defines_override}")
   endif()

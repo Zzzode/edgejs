@@ -16,8 +16,14 @@ fn main() {
     let v8_include = std::env::var("V8_INCLUDE_DIR").unwrap_or(default_v8_include);
     let v8_lib = std::env::var("V8_LIB_DIR").unwrap_or(default_v8_lib);
 
-    // Compile the napi/v8 sources + bridge into a single static library
-    cc::Build::new()
+    let v8_defines = std::env::var("V8_DEFINES")
+        .or_else(|_| std::env::var("NAPI_V8_DEFINES"))
+        .unwrap_or_else(|_| "V8_COMPRESS_POINTERS".to_string());
+
+    // Compile the napi/v8 sources + bridge into a single static library.
+    // Keep V8 feature defines aligned with the selected V8 binary.
+    let mut build = cc::Build::new();
+    build
         .cpp(true)
         .flag_if_supported("-std=c++20")
         .flag_if_supported("-w")
@@ -27,8 +33,21 @@ fn main() {
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
-        .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap())
-        .compile("napi_bridge");
+        .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap());
+
+    for raw in v8_defines.split(&[';', ',', ' '][..]) {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = entry.split_once('=') {
+            build.define(name.trim(), Some(value.trim()));
+        } else {
+            build.define(entry, Some("1"));
+        }
+    }
+
+    build.compile("napi_bridge");
 
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
     println!("cargo:rustc-link-search=native={v8_lib}");
