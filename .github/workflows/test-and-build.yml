@@ -39,13 +39,13 @@ jobs:
       - name: Test napi-v8
         run: ctest --test-dir napi/v8/build --output-on-failure -R '^napi_v8\.'
 
-      - name: Build unode
+      - name: Build ubi
         run: |
-          cmake -S unode -B build-unode -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-unode -j4
+          cmake -S ubi -B build-ubi -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-ubi -j4
 
-      - name: Test unode
-        run: ctest --test-dir build-unode --output-on-failure -j4
+      - name: Test ubi
+        run: ctest --test-dir build-ubi --output-on-failure -j4
 
       - name: Generate dist
         shell: bash
@@ -53,15 +53,15 @@ jobs:
           set -euo pipefail
           rm -rf dist
           mkdir -p dist/bin
-          cp build-unode/unode dist/bin/unode
+          cp build-ubi/ubi dist/bin/ubi
           cp README.md dist/README.md
-          (cd dist && zip -r ../unode-linux.zip bin README.md)
+          (cd dist && zip -r ../ubi-linux.zip bin README.md)
 
-      - name: Upload artifact unode
+      - name: Upload artifact ubi
         uses: actions/upload-artifact@v4
         with:
-          name: unode-linux
-          path: unode-linux.zip
+          name: ubi-linux
+          path: ubi-linux.zip
           if-no-files-found: error
 
       - name: sccache stats
@@ -101,13 +101,13 @@ jobs:
       - name: Test napi-v8
         run: ctest --test-dir napi/v8/build --output-on-failure -R '^napi_v8\.'
 
-      - name: Build unode
+      - name: Build ubi
         run: |
-          cmake -S unode -B build-unode -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-unode -j4
+          cmake -S ubi -B build-ubi -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-ubi -j4
 
-      - name: Test unode
-        run: ctest --test-dir build-unode --output-on-failure -j4
+      - name: Test ubi
+        run: ctest --test-dir build-ubi --output-on-failure -j4
 
       - name: Generate dist
         shell: bash
@@ -115,15 +115,15 @@ jobs:
           set -euo pipefail
           rm -rf dist
           mkdir -p dist/bin
-          cp build-unode/unode dist/bin/unode
+          cp build-ubi/ubi dist/bin/ubi
           cp README.md dist/README.md
-          (cd dist && zip -r ../unode-macos.zip bin README.md)
+          (cd dist && zip -r ../ubi-macos.zip bin README.md)
 
-      - name: Upload artifact unode
+      - name: Upload artifact ubi
         uses: actions/upload-artifact@v4
         with:
-          name: unode-macos
-          path: unode-macos.zip
+          name: ubi-macos
+          path: ubi-macos.zip
           if-no-files-found: error
 
       - name: sccache stats

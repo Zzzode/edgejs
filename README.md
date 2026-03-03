@@ -79,7 +79,7 @@ Exit criteria:
 
 ## V8 Build Modes
 
-`napi/v8` and `unode` support deterministic V8 resolution through:
+`napi/v8` and `ubi` support deterministic V8 resolution through:
 
 - `NAPI_V8_BUILD_METHOD=prebuilt` (default)
 - `NAPI_V8_BUILD_METHOD=source`
