@@ -77,6 +77,22 @@ const _ciphers = () => binding.getCiphers();
 const _curves = () => binding.getCurves();
 
 function getHashes() { return _hashes().slice().sort(); }
+let _hashSetCache;
+function getHashSet() {
+  if (!_hashSetCache) _hashSetCache = new Set(getHashes());
+  return _hashSetCache;
+}
+function resolveSupportedDigestName(algorithm) {
+  const hashes = getHashSet();
+  if (hashes.has(algorithm)) return algorithm;
+  if (typeof algorithm === 'string') {
+    const lower = algorithm.toLowerCase();
+    if (hashes.has(lower)) return lower;
+    const upper = algorithm.toUpperCase();
+    if (hashes.has(upper)) return upper;
+  }
+  return null;
+}
 function getCiphers() { return _ciphers().slice().sort(); }
 function getCurves() { return _curves().slice().sort(); }
 let _cipherInfoByName;
@@ -152,10 +168,16 @@ function hash(algorithm, data, outputEncoding) {
     throw makeTypeError('ERR_INVALID_ARG_TYPE',
                         `The "outputEncoding" argument must be of type string.${formatReceived(outputEncoding)}`);
   }
-  const normalized = algorithm.toLowerCase();
+  const resolvedAlgorithm = resolveSupportedDigestName(algorithm);
+  if (resolvedAlgorithm === null) {
+    const err = new Error('Digest method not supported');
+    err.code = 'ERR_CRYPTO_INVALID_DIGEST';
+    throw err;
+  }
+  const normalized = resolvedAlgorithm.toLowerCase();
   const out = isXofAlgorithm(normalized)
     ? nativeToBuffer(binding.hashOneShotXof(normalized, input, getDefaultXofOutputLength(normalized)))
-    : nativeToBuffer(binding.hashOneShot(algorithm, input));
+    : nativeToBuffer(binding.hashOneShot(resolvedAlgorithm, input));
   if (outputEncoding === 'buffer') return out;
   const enc = outputEncoding === undefined ? 'hex' : outputEncoding;
   if (!Buffer.isEncoding(enc)) {
@@ -405,19 +427,13 @@ function Hash(algorithm, options) {
     throw makeTypeError('ERR_INVALID_ARG_TYPE', `The "algorithm" argument must be of type string. Received ${algorithm}`);
   }
   EventEmitter.call(this);
-  // Match Node behavior: fail fast on unknown digest names.
-  try {
-    if (isXofAlgorithm(algorithm)) {
-      binding.hashOneShotXof(algorithm, Buffer.alloc(0), getDefaultXofOutputLength(algorithm));
-    } else {
-      binding.hashOneShot(algorithm, Buffer.alloc(0));
-    }
-  } catch (e) {
+  const resolvedAlgorithm = resolveSupportedDigestName(algorithm);
+  if (resolvedAlgorithm === null) {
     const err = new Error('Digest method not supported');
-    err.code = e && e.code ? e.code : 'ERR_CRYPTO_INVALID_DIGEST';
+    err.code = 'ERR_CRYPTO_INVALID_DIGEST';
     throw err;
   }
-  this.algorithm = algorithm;
+  this.algorithm = resolvedAlgorithm;
   this.options = options || undefined;
   this._isXof = isXofAlgorithm(this.algorithm);
   this._outputLength = undefined;
@@ -829,12 +845,13 @@ function pbkdf2Sync(password, salt, iterations, keylen, digest) {
     throw makeRangeError('ERR_OUT_OF_RANGE', `The value of "keylen" is out of range. Received ${keylen}`);
   }
   if (typeof digest !== 'string') throw makeTypeError('ERR_INVALID_ARG_TYPE', `The "digest" argument must be of type string. Received ${digest}`);
-  if (!getHashes().includes(digest)) {
+  const resolvedDigest = resolveSupportedDigestName(digest);
+  if (resolvedDigest === null) {
     const err = new TypeError(`Invalid digest: ${digest}`);
     err.code = 'ERR_CRYPTO_INVALID_DIGEST';
     throw err;
   }
-  return nativeToBuffer(binding.pbkdf2Sync(toBuffer(password), toBuffer(salt), iterations, keylen, digest));
+  return nativeToBuffer(binding.pbkdf2Sync(toBuffer(password), toBuffer(salt), iterations, keylen, resolvedDigest));
 }
 
 function pbkdf2(password, salt, iterations, keylen, digest, cb) {
@@ -927,17 +944,19 @@ function hkdfSync(digest, ikm, salt, info, keylen) {
   if (infoBuf.length > 1024) {
     throw makeRangeError('ERR_OUT_OF_RANGE', `The value of "info" is out of range. Received ${infoBuf.length}`);
   }
-  if (!hashLens[digest] && !getHashes().includes(digest)) {
+  const resolvedDigest = resolveSupportedDigestName(digest);
+  if (!hashLens[digest] && resolvedDigest === null) {
     const e = new TypeError(`Invalid digest: ${digest}`);
     e.code = 'ERR_CRYPTO_INVALID_DIGEST';
     throw e;
   }
-  if (hashLens[digest] && keylen > hashLens[digest] * 255) {
+  const lenKey = hashLens[digest] ? digest : (resolvedDigest || digest);
+  if (hashLens[lenKey] && keylen > hashLens[lenKey] * 255) {
     const e = new Error('Invalid key length');
     e.code = 'ERR_CRYPTO_INVALID_KEYLEN';
     throw e;
   }
-  const out = nativeToBuffer(binding.hkdfSync(digest, ikmBuf, saltBuf, infoBuf, keylen));
+  const out = nativeToBuffer(binding.hkdfSync(resolvedDigest || digest, ikmBuf, saltBuf, infoBuf, keylen));
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
 }
 
@@ -952,11 +971,11 @@ function Sign(algorithm) {
   if (typeof algorithm !== 'string') {
     throw makeTypeError('ERR_INVALID_ARG_TYPE', `The "algorithm" argument must be of type string.${formatReceived(algorithm)}`);
   }
-  const normalized = algorithm.toLowerCase();
-  if (!getHashes().includes(normalized) && !getHashes().includes(algorithm)) {
+  const resolvedAlgorithm = resolveSupportedDigestName(algorithm);
+  if (resolvedAlgorithm === null) {
     throw new TypeError('Invalid digest');
   }
-  this.algorithm = algorithm;
+  this.algorithm = resolvedAlgorithm;
   this._chunks = [];
 }
 Sign.prototype.update = function update(data, inputEncoding) {
@@ -1017,11 +1036,11 @@ function Verify(algorithm) {
   if (typeof algorithm !== 'string') {
     throw makeTypeError('ERR_INVALID_ARG_TYPE', `The "algorithm" argument must be of type string.${formatReceived(algorithm)}`);
   }
-  const normalized = algorithm.toLowerCase();
-  if (!getHashes().includes(normalized) && !getHashes().includes(algorithm)) {
+  const resolvedAlgorithm = resolveSupportedDigestName(algorithm);
+  if (resolvedAlgorithm === null) {
     throw new TypeError('Invalid digest');
   }
-  this.algorithm = algorithm;
+  this.algorithm = resolvedAlgorithm;
   this._chunks = [];
 }
 Verify.prototype.update = function update(data, inputEncoding) {

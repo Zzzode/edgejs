@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "ncrypto.h"
@@ -28,9 +29,16 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
 }
 
 bool GetBufferBytes(napi_env env, napi_value value, uint8_t** data, size_t* len) {
+  static uint8_t kEmptyBufferSentinel = 0;
   bool is_buffer = false;
   if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
-    return napi_get_buffer_info(env, value, reinterpret_cast<void**>(data), len) == napi_ok;
+    if (napi_get_buffer_info(env, value, reinterpret_cast<void**>(data), len) != napi_ok) {
+      return false;
+    }
+    if (*len == 0 && *data == nullptr) {
+      *data = &kEmptyBufferSentinel;
+    }
+    return true;
   }
   napi_typedarray_type ta_type = napi_uint8_array;
   size_t element_len = 0;
@@ -41,6 +49,15 @@ bool GetBufferBytes(napi_env env, napi_value value, uint8_t** data, size_t* len)
       ta_type == napi_uint8_array && raw != nullptr) {
     *data = reinterpret_cast<uint8_t*>(raw);
     *len = element_len;
+    if (*len == 0 && *data == nullptr) {
+      *data = &kEmptyBufferSentinel;
+    }
+    return true;
+  }
+  if (napi_get_typedarray_info(env, value, &ta_type, &element_len, &raw, &ab, &byte_offset) == napi_ok &&
+      ta_type == napi_uint8_array && element_len == 0) {
+    *data = &kEmptyBufferSentinel;
+    *len = 0;
     return true;
   }
   return false;
@@ -433,13 +450,35 @@ napi_value CryptoCipherTransform(napi_env env, napi_callback_info info) {
 }
 
 napi_value CryptoGetHashes(napi_env env, napi_callback_info info) {
-  static const char* kHashes[] = {"RSA-SHA1", "sha1", "sha224", "sha256", "sha384", "sha512", "shake128",
-                                  "shake256"};
+  std::unordered_set<std::string> unique_hashes;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  EVP_MD_do_all_provided(
+      nullptr,
+      [](EVP_MD* md, void* arg) {
+        if (md == nullptr || arg == nullptr) return;
+        const char* name = EVP_MD_get0_name(md);
+        if (name == nullptr) return;
+        auto* out = static_cast<std::unordered_set<std::string>*>(arg);
+        out->emplace(name);
+      },
+      &unique_hashes);
+#endif
+  static const char* kFallbackCandidates[] = {
+      "sha1",      "sha224",    "sha256",    "sha384",    "sha512",      "shake128",   "shake256",
+      "md5",       "ripemd160", "sha3-224",  "sha3-256",  "sha3-384",    "sha3-512",   "blake2b512",
+      "blake2s256"};
+  for (const char* candidate : kFallbackCandidates) {
+    if (ResolveDigest(candidate)) unique_hashes.emplace(candidate);
+  }
+  if (ResolveDigest("sha1")) unique_hashes.emplace("RSA-SHA1");
+
+  std::vector<std::string> hashes(unique_hashes.begin(), unique_hashes.end());
+  std::sort(hashes.begin(), hashes.end());
   napi_value arr = nullptr;
-  napi_create_array_with_length(env, sizeof(kHashes) / sizeof(kHashes[0]), &arr);
-  for (uint32_t i = 0; i < sizeof(kHashes) / sizeof(kHashes[0]); i++) {
+  napi_create_array_with_length(env, hashes.size(), &arr);
+  for (uint32_t i = 0; i < hashes.size(); i++) {
     napi_value s = nullptr;
-    napi_create_string_utf8(env, kHashes[i], NAPI_AUTO_LENGTH, &s);
+    napi_create_string_utf8(env, hashes[i].c_str(), NAPI_AUTO_LENGTH, &s);
     napi_set_element(env, arr, i, s);
   }
   return arr;
