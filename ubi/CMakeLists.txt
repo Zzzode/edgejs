@@ -249,6 +249,44 @@ add_library(ubi_runtime STATIC
   src/ubi_runtime_platform_v8.cc
   src/ubi_process.cc
   src/ubi_module_loader.cc
+  src/internal_binding/dispatch.cc
+  src/internal_binding/binding_async_wrap.cc
+  src/internal_binding/binding_buffer.cc
+  src/internal_binding/binding_builtins.cc
+  src/internal_binding/binding_cares_wrap.cc
+  src/internal_binding/binding_config.cc
+  src/internal_binding/binding_constants.cc
+  src/internal_binding/binding_contextify.cc
+  src/internal_binding/binding_credentials.cc
+  src/internal_binding/binding_crypto.cc
+  src/internal_binding/binding_encoding_binding.cc
+  src/internal_binding/binding_errors.cc
+  src/internal_binding/binding_fs.cc
+  src/internal_binding/binding_http_parser.cc
+  src/internal_binding/binding_module_wrap.cc
+  src/internal_binding/binding_modules.cc
+  src/internal_binding/binding_options.cc
+  src/internal_binding/binding_os.cc
+  src/internal_binding/binding_pipe_wrap.cc
+  src/internal_binding/binding_process_methods.cc
+  src/internal_binding/binding_process_wrap.cc
+  src/internal_binding/binding_report.cc
+  src/internal_binding/binding_signal_wrap.cc
+  src/internal_binding/binding_spawn_sync.cc
+  src/internal_binding/binding_stream_wrap.cc
+  src/internal_binding/binding_string_decoder.cc
+  src/internal_binding/binding_symbols.cc
+  src/internal_binding/binding_task_queue.cc
+  src/internal_binding/binding_tcp_wrap.cc
+  src/internal_binding/binding_timers.cc
+  src/internal_binding/binding_trace_events.cc
+  src/internal_binding/binding_tty_wrap.cc
+  src/internal_binding/binding_types.cc
+  src/internal_binding/binding_udp_wrap.cc
+  src/internal_binding/binding_url.cc
+  src/internal_binding/binding_url_pattern.cc
+  src/internal_binding/binding_util.cc
+  src/internal_binding/binding_uv.cc
   src/ubi_errors_binding.cc
   "${PROJECT_ROOT}/deps/llhttp/src/api.c"
   "${PROJECT_ROOT}/deps/llhttp/src/http.c"

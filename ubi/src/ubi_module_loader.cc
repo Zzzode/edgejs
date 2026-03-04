@@ -1,5 +1,6 @@
 #include "ubi_module_loader.h"
 #include "ubi_errors_binding.h"
+#include "internal_binding/dispatch.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1544,6 +1545,248 @@ static napi_value GetOrCreateTraceEventsBinding(napi_env env) {
   return binding;
 }
 
+static napi_value ResolveUvBinding(napi_env env) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+
+  napi_value out = nullptr;
+  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+
+  auto set_int32 = [&](const char* key, int32_t value) {
+    napi_value v = nullptr;
+    if (napi_create_int32(env, value, &v) == napi_ok && v != nullptr) {
+      napi_set_named_property(env, out, key, v);
+    }
+  };
+
+#define UBI_SET_UV_CONSTANT(name, message) \
+  set_int32("UV_" #name, static_cast<int32_t>(UV_##name));
+  UV_ERRNO_MAP(UBI_SET_UV_CONSTANT);
+#undef UBI_SET_UV_CONSTANT
+
+  auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
+    napi_value fn = nullptr;
+    return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
+           fn != nullptr &&
+           napi_set_named_property(env, out, method_name, fn) == napi_ok;
+  };
+
+  if (!define_method("getErrorMap", UvGetErrorMapCallback) ||
+      !define_method("getErrorMessage", UvGetErrorMessageCallback) ||
+      !define_method("errname", UvErrNameCallback)) {
+    return undefined;
+  }
+
+  return out;
+}
+
+static napi_value ResolveContextifyBinding(napi_env env) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) == napi_ok && global != nullptr) {
+    bool has_binding = false;
+    if (napi_has_named_property(env, global, "__ubi_contextify_binding", &has_binding) == napi_ok &&
+        has_binding) {
+      napi_value existing = nullptr;
+      if (napi_get_named_property(env, global, "__ubi_contextify_binding", &existing) == napi_ok &&
+          existing != nullptr) {
+        return existing;
+      }
+    }
+  }
+
+  napi_value out = nullptr;
+  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+  napi_value contains_module_syntax = nullptr;
+  if (napi_create_function(env,
+                           "containsModuleSyntax",
+                           NAPI_AUTO_LENGTH,
+                           ReturnFalseCallback,
+                           nullptr,
+                           &contains_module_syntax) == napi_ok &&
+      contains_module_syntax != nullptr) {
+    napi_set_named_property(env, out, "containsModuleSyntax", contains_module_syntax);
+  }
+
+  napi_value contextify_script_ctor = nullptr;
+  if (napi_create_function(env,
+                           "ContextifyScript",
+                           NAPI_AUTO_LENGTH,
+                           ContextifyScriptConstructorCallback,
+                           nullptr,
+                           &contextify_script_ctor) == napi_ok &&
+      contextify_script_ctor != nullptr) {
+    napi_value proto = nullptr;
+    if (napi_get_named_property(env, contextify_script_ctor, "prototype", &proto) == napi_ok && proto != nullptr) {
+      napi_value run_in_context = nullptr;
+      if (napi_create_function(env,
+                               "runInContext",
+                               NAPI_AUTO_LENGTH,
+                               ContextifyScriptRunInContextCallback,
+                               nullptr,
+                               &run_in_context) == napi_ok &&
+          run_in_context != nullptr) {
+        napi_set_named_property(env, proto, "runInContext", run_in_context);
+      }
+    }
+    napi_set_named_property(env, out, "ContextifyScript", contextify_script_ctor);
+  }
+
+  napi_value compile_function = nullptr;
+  if (napi_create_function(env,
+                           "compileFunction",
+                           NAPI_AUTO_LENGTH,
+                           ContextifyCompileFunctionCallback,
+                           nullptr,
+                           &compile_function) == napi_ok &&
+      compile_function != nullptr) {
+    napi_set_named_property(env, out, "compileFunction", compile_function);
+  }
+
+  napi_value compile_function_for_cjs = nullptr;
+  if (napi_create_function(env,
+                           "compileFunctionForCJSLoader",
+                           NAPI_AUTO_LENGTH,
+                           ContextifyCompileFunctionForCJSLoaderCallback,
+                           nullptr,
+                           &compile_function_for_cjs) == napi_ok &&
+      compile_function_for_cjs != nullptr) {
+    napi_set_named_property(env, out, "compileFunctionForCJSLoader", compile_function_for_cjs);
+  }
+
+  if (global != nullptr) {
+    napi_set_named_property(env, global, "__ubi_contextify_binding", out);
+  }
+  return out;
+}
+
+static napi_value ResolveModulesBinding(napi_env env) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+
+  napi_value out = nullptr;
+  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+
+  auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
+    napi_value fn = nullptr;
+    return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
+           fn != nullptr &&
+           napi_set_named_property(env, out, method_name, fn) == napi_ok;
+  };
+
+  if (!define_method("readPackageJSON", ModulesReadPackageJSONCallback) ||
+      !define_method("getNearestParentPackageJSONType", ModulesGetNearestParentPackageJSONTypeCallback) ||
+      !define_method("getNearestParentPackageJSON", ModulesGetNearestParentPackageJSONCallback) ||
+      !define_method("getPackageScopeConfig", ModulesGetPackageScopeConfigCallback) ||
+      !define_method("getPackageType", ModulesGetPackageTypeCallback) ||
+      !define_method("enableCompileCache", ModulesEnableCompileCacheCallback) ||
+      !define_method("getCompileCacheDir", ModulesGetCompileCacheDirCallback) ||
+      !define_method("flushCompileCache", ModulesFlushCompileCacheCallback) ||
+      !define_method("getCompileCacheEntry", ModulesGetCompileCacheEntryCallback) ||
+      !define_method("saveCompileCacheEntry", ModulesSaveCompileCacheEntryCallback) ||
+      !define_method("setLazyPathHelpers", ModulesSetLazyPathHelpersCallback)) {
+    return undefined;
+  }
+
+  napi_value status = nullptr;
+  if (napi_create_array_with_length(env, 4, &status) != napi_ok || status == nullptr) return undefined;
+  auto set_status = [&](uint32_t idx, const char* value) {
+    napi_value v = nullptr;
+    if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &v) == napi_ok && v != nullptr) {
+      napi_set_element(env, status, idx, v);
+    }
+  };
+  set_status(0, "FAILED");
+  set_status(1, "ENABLED");
+  set_status(2, "ALREADY_ENABLED");
+  set_status(3, "DISABLED");
+  if (napi_set_named_property(env, out, "compileCacheStatus", status) != napi_ok) return undefined;
+
+  napi_value cached_types = nullptr;
+  if (napi_create_object(env, &cached_types) != napi_ok || cached_types == nullptr) return undefined;
+  auto set_int32 = [&](const char* key, int32_t value) {
+    napi_value v = nullptr;
+    if (napi_create_int32(env, value, &v) == napi_ok && v != nullptr) {
+      napi_set_named_property(env, cached_types, key, v);
+    }
+  };
+  set_int32("kCommonJS", 0);
+  set_int32("kESM", 1);
+  set_int32("kStrippedTypeScript", 2);
+  set_int32("kTransformedTypeScript", 3);
+  set_int32("kTransformedTypeScriptWithSourceMaps", 4);
+  if (napi_set_named_property(env, out, "cachedCodeTypes", cached_types) != napi_ok) return undefined;
+
+  return out;
+}
+
+static napi_value ResolveOptionsBinding(napi_env env) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+
+  napi_value out = nullptr;
+  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+
+  napi_value env_settings = nullptr;
+  if (napi_create_object(env, &env_settings) != napi_ok || env_settings == nullptr) return undefined;
+  auto set_int32 = [&](napi_value target, const char* key, int32_t value) {
+    napi_value v = nullptr;
+    if (napi_create_int32(env, value, &v) == napi_ok && v != nullptr) {
+      napi_set_named_property(env, target, key, v);
+    }
+  };
+  set_int32(env_settings, "kAllowedInEnvvar", 0);
+  set_int32(env_settings, "kDisallowedInEnvvar", 1);
+  if (napi_set_named_property(env, out, "envSettings", env_settings) != napi_ok) return undefined;
+
+  napi_value types = nullptr;
+  if (napi_create_object(env, &types) != napi_ok || types == nullptr) return undefined;
+  set_int32(types, "kNoOp", 0);
+  set_int32(types, "kV8Option", 1);
+  set_int32(types, "kBoolean", 2);
+  set_int32(types, "kInteger", 3);
+  set_int32(types, "kUInteger", 4);
+  set_int32(types, "kString", 5);
+  set_int32(types, "kHostPort", 6);
+  set_int32(types, "kStringList", 7);
+  if (napi_set_named_property(env, out, "types", types) != napi_ok) return undefined;
+
+  auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
+    napi_value fn = nullptr;
+    return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
+           fn != nullptr &&
+           napi_set_named_property(env, out, method_name, fn) == napi_ok;
+  };
+  if (!define_method("getCLIOptionsValues", OptionsGetCLIOptionsValuesCallback) ||
+      !define_method("getCLIOptionsInfo", OptionsGetCLIOptionsInfoCallback) ||
+      !define_method("getOptionsAsFlags", OptionsGetOptionsAsFlagsCallback) ||
+      !define_method("getEmbedderOptions", OptionsGetEmbedderOptionsCallback) ||
+      !define_method("getEnvOptionsInputType", OptionsGetEnvOptionsInputTypeCallback) ||
+      !define_method("getNamespaceOptionsInputType", OptionsGetNamespaceOptionsInputTypeCallback)) {
+    return undefined;
+  }
+
+  return out;
+}
+
+static napi_value DispatchGetOrCreateBuiltins(napi_env env, void* state) {
+  return GetOrCreateNativeBuiltinsBinding(env, static_cast<ModuleLoaderState*>(state));
+}
+
+static napi_value DispatchGetOrCreateTaskQueue(napi_env env) {
+  return GetOrCreateTaskQueueBinding(env);
+}
+
+static napi_value DispatchGetOrCreateErrors(napi_env env) {
+  return UbiGetOrCreateErrorsBinding(env);
+}
+
+static napi_value DispatchGetOrCreateTraceEvents(napi_env env) {
+  return GetOrCreateTraceEventsBinding(env);
+}
+
 static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -1551,482 +1794,31 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, &data) != napi_ok || data == nullptr) {
     return nullptr;
   }
-  auto* state = static_cast<ModuleLoaderState*>(data);
-
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
-
   if (argc < 1 || argv[0] == nullptr) {
     return undefined;
   }
+  auto* state = static_cast<ModuleLoaderState*>(data);
   const std::string name = ValueToUtf8(env, argv[0]);
-  auto get_global_named = [&](const char* key) -> napi_value {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) return undefined;
-    bool has_prop = false;
-    if (napi_has_named_property(env, global, key, &has_prop) != napi_ok || !has_prop) return undefined;
-    napi_value out = nullptr;
-    if (napi_get_named_property(env, global, key, &out) != napi_ok || out == nullptr) return undefined;
-    return out;
-  };
-  auto set_int32 = [&](napi_value obj, const char* key, int32_t value) {
-    napi_value v = nullptr;
-    if (napi_create_int32(env, value, &v) == napi_ok && v != nullptr) {
-      napi_set_named_property(env, obj, key, v);
-    }
-  };
-  if (name == "builtins") {
-    napi_value binding = GetOrCreateNativeBuiltinsBinding(env, state);
-    return binding != nullptr ? binding : undefined;
-  }
-  if (name == "timers") {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-      return undefined;
-    }
-    napi_value timers_binding = nullptr;
-    if (napi_get_named_property(env, global, "__ubi_timers_binding_js", &timers_binding) == napi_ok &&
-        timers_binding != nullptr) {
-      return timers_binding;
-    }
-    if (napi_get_named_property(env, global, "__ubi_timers_binding", &timers_binding) == napi_ok &&
-        timers_binding != nullptr) {
-      return timers_binding;
-    }
-    return undefined;
-  }
-  if (name == "encoding_binding") return get_global_named("__ubi_encoding");
-  if (name == "task_queue") {
-    napi_value binding = GetOrCreateTaskQueueBinding(env);
-    return binding != nullptr ? binding : undefined;
-  }
-  if (name == "errors") {
-    napi_value binding = UbiGetOrCreateErrorsBinding(env);
-    return binding != nullptr ? binding : undefined;
-  }
-  if (name == "trace_events") {
-    napi_value binding = GetOrCreateTraceEventsBinding(env);
-    return binding != nullptr ? binding : undefined;
-  }
-  if (name == "credentials") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    napi_value f = nullptr;
-    napi_get_boolean(env, false, &f);
-    napi_set_named_property(env, out, "implementsPosixCredentials", f);
-    return out;
-  }
-  if (name == "async_wrap") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    napi_value setup_hooks = nullptr;
-    if (napi_create_function(env, "setupHooks", NAPI_AUTO_LENGTH, NoopCallback, nullptr, &setup_hooks) == napi_ok &&
-        setup_hooks != nullptr) {
-      napi_set_named_property(env, out, "setupHooks", setup_hooks);
-    }
-    return out;
-  }
-  if (name == "url_pattern") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) == napi_ok && global != nullptr) {
-      napi_value url_pattern_ctor = nullptr;
-      if (napi_get_named_property(env, global, "URLPattern", &url_pattern_ctor) == napi_ok &&
-          url_pattern_ctor != nullptr) {
-        napi_set_named_property(env, out, "URLPattern", url_pattern_ctor);
-      }
-    }
-    return out;
-  }
-  if (name == "constants") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    napi_value os_obj = nullptr;
-    if (napi_create_object(env, &os_obj) == napi_ok && os_obj != nullptr) {
-      napi_value signals = nullptr;
-      if (napi_create_object(env, &signals) == napi_ok && signals != nullptr) {
-        napi_set_named_property(env, os_obj, "signals", signals);
-      }
-      napi_set_named_property(env, out, "os", os_obj);
-    }
-    napi_value fs_obj = nullptr;
-    if (napi_create_object(env, &fs_obj) == napi_ok && fs_obj != nullptr) {
-      set_int32(fs_obj, "F_OK", 0);
-      set_int32(fs_obj, "R_OK", 4);
-      set_int32(fs_obj, "W_OK", 2);
-      set_int32(fs_obj, "X_OK", 1);
-      napi_set_named_property(env, out, "fs", fs_obj);
-    }
-    napi_value os_constants = get_global_named("__ubi_os_constants");
-    if (os_constants != undefined) napi_set_named_property(env, out, "os", os_constants);
-    napi_value fs_binding = get_global_named("__ubi_fs");
-    if (fs_binding != undefined) {
-      napi_value fs_constants_obj = nullptr;
-      if (napi_create_object(env, &fs_constants_obj) == napi_ok && fs_constants_obj != nullptr) {
-        napi_value keys = nullptr;
-        if (napi_get_property_names(env, fs_binding, &keys) == napi_ok && keys != nullptr) {
-          uint32_t key_count = 0;
-          if (napi_get_array_length(env, keys, &key_count) == napi_ok) {
-            for (uint32_t i = 0; i < key_count; i++) {
-              napi_value key = nullptr;
-              if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) continue;
-              napi_value value = nullptr;
-              if (napi_get_property(env, fs_binding, key, &value) != napi_ok || value == nullptr) continue;
-              napi_valuetype t = napi_undefined;
-              if (napi_typeof(env, value, &t) != napi_ok) continue;
-              if (t == napi_number) {
-                napi_set_property(env, fs_constants_obj, key, value);
-              }
-            }
-          }
-        }
-        napi_set_named_property(env, out, "fs", fs_constants_obj);
-      }
-    }
-    return out;
-  }
-  if (name == "uv") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-#define UBI_SET_UV_CONSTANT(name, message) \
-    set_int32(out, "UV_" #name, static_cast<int32_t>(UV_##name));
-    UV_ERRNO_MAP(UBI_SET_UV_CONSTANT);
-#undef UBI_SET_UV_CONSTANT
 
-    auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
-      napi_value fn = nullptr;
-      return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
-             fn != nullptr &&
-             napi_set_named_property(env, out, method_name, fn) == napi_ok;
-    };
-    if (!define_method("getErrorMap", UvGetErrorMapCallback) ||
-        !define_method("getErrorMessage", UvGetErrorMessageCallback) ||
-        !define_method("errname", UvErrNameCallback)) {
-      return undefined;
-    }
-    return out;
-  }
-  if (name == "config") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    napi_value t = nullptr;
-    napi_value f = nullptr;
-    napi_get_boolean(env, true, &t);
-    napi_get_boolean(env, false, &f);
-    napi_set_named_property(env, out, "hasIntl", f);
-    napi_set_named_property(env, out, "hasSmallICU", f);
-    napi_set_named_property(env, out, "hasInspector", f);
-    napi_set_named_property(env, out, "hasTracing", f);
-    napi_set_named_property(env, out, "hasOpenSSL", t);
-    napi_set_named_property(env, out, "openSSLIsBoringSSL", f);
-    napi_set_named_property(env, out, "fipsMode", f);
-    napi_set_named_property(env, out, "hasNodeOptions", t);
-    napi_set_named_property(env, out, "noBrowserGlobals", f);
-    napi_set_named_property(env, out, "isDebugBuild", f);
-    return out;
-  }
-  if (name == "contextify") {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) == napi_ok && global != nullptr) {
-      bool has_binding = false;
-      if (napi_has_named_property(env, global, "__ubi_contextify_binding", &has_binding) == napi_ok &&
-          has_binding) {
-        napi_value existing = nullptr;
-        if (napi_get_named_property(env, global, "__ubi_contextify_binding", &existing) == napi_ok &&
-            existing != nullptr) {
-          return existing;
-        }
-      }
-    }
+  internal_binding::ResolveOptions options;
+  options.state = state;
+  options.callbacks.get_or_create_builtins = DispatchGetOrCreateBuiltins;
+  options.callbacks.get_or_create_task_queue = DispatchGetOrCreateTaskQueue;
+  options.callbacks.get_or_create_errors = DispatchGetOrCreateErrors;
+  options.callbacks.get_or_create_trace_events = DispatchGetOrCreateTraceEvents;
+  options.callbacks.resolve_uv = ResolveUvBinding;
+  options.callbacks.resolve_contextify = ResolveContextifyBinding;
+  options.callbacks.resolve_modules = ResolveModulesBinding;
+  options.callbacks.resolve_options = ResolveOptionsBinding;
 
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    napi_value contains_module_syntax = nullptr;
-    if (napi_create_function(env,
-                             "containsModuleSyntax",
-                             NAPI_AUTO_LENGTH,
-                             ReturnFalseCallback,
-                             nullptr,
-                             &contains_module_syntax) == napi_ok &&
-        contains_module_syntax != nullptr) {
-      napi_set_named_property(env, out, "containsModuleSyntax", contains_module_syntax);
-    }
+  napi_value resolved = internal_binding::Resolve(env, name, options);
+  if (resolved != nullptr) return resolved;
 
-    napi_value contextify_script_ctor = nullptr;
-    if (napi_create_function(env,
-                             "ContextifyScript",
-                             NAPI_AUTO_LENGTH,
-                             ContextifyScriptConstructorCallback,
-                             nullptr,
-                             &contextify_script_ctor) == napi_ok &&
-        contextify_script_ctor != nullptr) {
-      napi_value proto = nullptr;
-      if (napi_get_named_property(env, contextify_script_ctor, "prototype", &proto) == napi_ok && proto != nullptr) {
-        napi_value run_in_context = nullptr;
-        if (napi_create_function(env,
-                                 "runInContext",
-                                 NAPI_AUTO_LENGTH,
-                                 ContextifyScriptRunInContextCallback,
-                                 nullptr,
-                                 &run_in_context) == napi_ok &&
-            run_in_context != nullptr) {
-          napi_set_named_property(env, proto, "runInContext", run_in_context);
-        }
-      }
-      napi_set_named_property(env, out, "ContextifyScript", contextify_script_ctor);
-    }
-
-    napi_value compile_function = nullptr;
-    if (napi_create_function(env,
-                             "compileFunction",
-                             NAPI_AUTO_LENGTH,
-                             ContextifyCompileFunctionCallback,
-                             nullptr,
-                             &compile_function) == napi_ok &&
-        compile_function != nullptr) {
-      napi_set_named_property(env, out, "compileFunction", compile_function);
-    }
-
-    napi_value compile_function_for_cjs = nullptr;
-    if (napi_create_function(env,
-                             "compileFunctionForCJSLoader",
-                             NAPI_AUTO_LENGTH,
-                             ContextifyCompileFunctionForCJSLoaderCallback,
-                             nullptr,
-                             &compile_function_for_cjs) == napi_ok &&
-        compile_function_for_cjs != nullptr) {
-      napi_set_named_property(env, out, "compileFunctionForCJSLoader", compile_function_for_cjs);
-    }
-
-    if (global != nullptr) {
-      napi_set_named_property(env, global, "__ubi_contextify_binding", out);
-    }
-    return out;
-  }
-  if (name == "symbols") {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-      return undefined;
-    }
-    bool has_binding = false;
-    if (napi_has_named_property(env, global, "__ubi_symbols_binding", &has_binding) == napi_ok &&
-        has_binding) {
-      napi_value existing = nullptr;
-      if (napi_get_named_property(env, global, "__ubi_symbols_binding", &existing) == napi_ok &&
-          existing != nullptr) {
-        return existing;
-      }
-    }
-
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    auto set_symbol = [&](const char* key, const char* description) {
-      napi_value desc = nullptr;
-      napi_value sym = nullptr;
-      if (napi_create_string_utf8(env, description, NAPI_AUTO_LENGTH, &desc) == napi_ok &&
-          desc != nullptr &&
-          napi_create_symbol(env, desc, &sym) == napi_ok &&
-          sym != nullptr) {
-        napi_set_named_property(env, out, key, sym);
-      }
-    };
-
-    set_symbol("vm_dynamic_import_default_internal", "vm_dynamic_import_default_internal");
-    set_symbol("vm_dynamic_import_main_context_default", "vm_dynamic_import_main_context_default");
-    set_symbol("vm_dynamic_import_no_callback", "vm_dynamic_import_no_callback");
-    set_symbol("vm_dynamic_import_missing_flag", "vm_dynamic_import_missing_flag");
-    set_symbol("source_text_module_default_hdo", "source_text_module_default_hdo");
-    set_symbol("resource_symbol", "resource_symbol");
-    set_symbol("owner_symbol", "owner_symbol");
-    set_symbol("async_id_symbol", "async_id_symbol");
-    set_symbol("trigger_async_id_symbol", "trigger_async_id_symbol");
-    set_symbol("onpskexchange", "onpskexchange");
-    set_symbol("messaging_transfer_list_symbol", "messaging_transfer_list_symbol");
-    set_symbol("no_message_symbol", "no_message_symbol");
-    set_symbol("imported_cjs_symbol", "imported_cjs_symbol");
-
-    napi_set_named_property(env, global, "__ubi_symbols_binding", out);
-    return out;
-  }
-  if (name == "module_wrap") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    set_int32(out, "kSourcePhase", 0);
-    set_int32(out, "kEvaluationPhase", 1);
-    set_int32(out, "kEvaluated", 2);
-    napi_value create_required_module_facade = nullptr;
-    if (napi_create_function(env,
-                             "createRequiredModuleFacade",
-                             NAPI_AUTO_LENGTH,
-                             ReturnFirstArgCallback,
-                             nullptr,
-                             &create_required_module_facade) == napi_ok &&
-        create_required_module_facade != nullptr) {
-      napi_set_named_property(env, out, "createRequiredModuleFacade", create_required_module_facade);
-    }
-    return out;
-  }
-  if (name == "modules") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-
-    auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
-      napi_value fn = nullptr;
-      return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
-             fn != nullptr &&
-             napi_set_named_property(env, out, method_name, fn) == napi_ok;
-    };
-
-    if (!define_method("readPackageJSON", ModulesReadPackageJSONCallback) ||
-        !define_method("getNearestParentPackageJSONType", ModulesGetNearestParentPackageJSONTypeCallback) ||
-        !define_method("getNearestParentPackageJSON", ModulesGetNearestParentPackageJSONCallback) ||
-        !define_method("getPackageScopeConfig", ModulesGetPackageScopeConfigCallback) ||
-        !define_method("getPackageType", ModulesGetPackageTypeCallback) ||
-        !define_method("enableCompileCache", ModulesEnableCompileCacheCallback) ||
-        !define_method("getCompileCacheDir", ModulesGetCompileCacheDirCallback) ||
-        !define_method("flushCompileCache", ModulesFlushCompileCacheCallback) ||
-        !define_method("getCompileCacheEntry", ModulesGetCompileCacheEntryCallback) ||
-        !define_method("saveCompileCacheEntry", ModulesSaveCompileCacheEntryCallback) ||
-        !define_method("setLazyPathHelpers", ModulesSetLazyPathHelpersCallback)) {
-      return undefined;
-    }
-
-    napi_value status = nullptr;
-    if (napi_create_array_with_length(env, 4, &status) != napi_ok || status == nullptr) return undefined;
-    auto set_status = [&](uint32_t idx, const char* value) {
-      napi_value v = nullptr;
-      if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &v) == napi_ok && v != nullptr) {
-        napi_set_element(env, status, idx, v);
-      }
-    };
-    set_status(0, "FAILED");
-    set_status(1, "ENABLED");
-    set_status(2, "ALREADY_ENABLED");
-    set_status(3, "DISABLED");
-    if (napi_set_named_property(env, out, "compileCacheStatus", status) != napi_ok) return undefined;
-
-    napi_value cached_types = nullptr;
-    if (napi_create_object(env, &cached_types) != napi_ok || cached_types == nullptr) return undefined;
-    set_int32(cached_types, "kCommonJS", 0);
-    set_int32(cached_types, "kESM", 1);
-    set_int32(cached_types, "kStrippedTypeScript", 2);
-    set_int32(cached_types, "kTransformedTypeScript", 3);
-    set_int32(cached_types, "kTransformedTypeScriptWithSourceMaps", 4);
-    if (napi_set_named_property(env, out, "cachedCodeTypes", cached_types) != napi_ok) return undefined;
-
-    return out;
-  }
-  if (name == "options") {
-    napi_value out = nullptr;
-    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-
-    napi_value env_settings = nullptr;
-    if (napi_create_object(env, &env_settings) != napi_ok || env_settings == nullptr) return undefined;
-    set_int32(env_settings, "kAllowedInEnvvar", 0);
-    set_int32(env_settings, "kDisallowedInEnvvar", 1);
-    if (napi_set_named_property(env, out, "envSettings", env_settings) != napi_ok) return undefined;
-
-    napi_value types = nullptr;
-    if (napi_create_object(env, &types) != napi_ok || types == nullptr) return undefined;
-    set_int32(types, "kNoOp", 0);
-    set_int32(types, "kV8Option", 1);
-    set_int32(types, "kBoolean", 2);
-    set_int32(types, "kInteger", 3);
-    set_int32(types, "kUInteger", 4);
-    set_int32(types, "kString", 5);
-    set_int32(types, "kHostPort", 6);
-    set_int32(types, "kStringList", 7);
-    if (napi_set_named_property(env, out, "types", types) != napi_ok) return undefined;
-
-    auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
-      napi_value fn = nullptr;
-      return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
-             fn != nullptr &&
-             napi_set_named_property(env, out, method_name, fn) == napi_ok;
-    };
-    if (!define_method("getCLIOptionsValues", OptionsGetCLIOptionsValuesCallback) ||
-        !define_method("getCLIOptionsInfo", OptionsGetCLIOptionsInfoCallback) ||
-        !define_method("getOptionsAsFlags", OptionsGetOptionsAsFlagsCallback) ||
-        !define_method("getEmbedderOptions", OptionsGetEmbedderOptionsCallback) ||
-        !define_method("getEnvOptionsInputType", OptionsGetEnvOptionsInputTypeCallback) ||
-        !define_method("getNamespaceOptionsInputType", OptionsGetNamespaceOptionsInputTypeCallback)) {
-      return undefined;
-    }
-
-    return out;
-  }
-  if (name == "types") {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-      return undefined;
-    }
-    napi_value types_binding = nullptr;
-    if (napi_get_named_property(env, global, "__ubi_types", &types_binding) != napi_ok ||
-        types_binding == nullptr) {
-      return undefined;
-    }
-    return types_binding;
-  }
-  if (name == "util") {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-      return undefined;
-    }
-    bool has_util = false;
-    if (napi_has_named_property(env, global, "__ubi_util", &has_util) != napi_ok || !has_util) {
-      return undefined;
-    }
-    napi_value util_binding = nullptr;
-    if (napi_get_named_property(env, global, "__ubi_util", &util_binding) != napi_ok ||
-        util_binding == nullptr) {
-      return undefined;
-    }
-    return util_binding;
-  }
-  if (name == "os") return get_global_named("__ubi_os");
-  if (name == "fs") return get_global_named("__ubi_fs");
-  if (name == "buffer") return get_global_named("__ubi_buffer");
-  if (name == "crypto") {
-    napi_value out = get_global_named("__ubi_crypto_binding");
-    if (out != undefined) return out;
-    return get_global_named("__ubi_crypto");
-  }
-  if (name == "http_parser") return get_global_named("__ubi_http_parser");
-  if (name == "stream_wrap") return get_global_named("__ubi_stream_wrap");
-  if (name == "process_wrap") return get_global_named("__ubi_process_wrap");
-  if (name == "tcp_wrap") return get_global_named("__ubi_tcp_wrap");
-  if (name == "tty_wrap") return get_global_named("__ubi_tty_wrap");
-  if (name == "pipe_wrap") return get_global_named("__ubi_pipe_wrap");
-  if (name == "signal_wrap") return get_global_named("__ubi_signal_wrap");
-  if (name == "cares_wrap") return get_global_named("__ubi_cares_wrap");
-  if (name == "udp_wrap") return get_global_named("__ubi_udp_wrap");
-  if (name == "url") return get_global_named("__ubi_url");
-  if (name == "string_decoder") return get_global_named("__ubi_string_decoder");
-  if (name == "spawn_sync") return get_global_named("__ubi_spawn_sync");
-  if (name == "process_methods") {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-      return undefined;
-    }
-    napi_value binding = nullptr;
-    if (napi_get_named_property(env, global, "__ubi_process_methods_binding", &binding) != napi_ok ||
-        binding == nullptr) {
-      return undefined;
-    }
-    return binding;
-  }
-  if (name == "report") {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-      return undefined;
-    }
-    napi_value binding = nullptr;
-    if (napi_get_named_property(env, global, "__ubi_report_binding", &binding) != napi_ok ||
-        binding == nullptr) {
-      return undefined;
-    }
-    return binding;
+  bool has_pending_exception = false;
+  if (napi_is_exception_pending(env, &has_pending_exception) == napi_ok && has_pending_exception) {
+    return nullptr;
   }
   return undefined;
 }
