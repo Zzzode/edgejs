@@ -48,7 +48,7 @@ std::unordered_map<v8::Isolate*, napi_env> g_env_by_isolate;
 std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_callbacks;
 
 void ApplyDefaultV8Flags() {
-  static constexpr char kDefaultFlags[] = "--js-float16array";
+  static constexpr char kDefaultFlags[] = "--js-float16array --expose-gc";
   v8::V8::SetFlagsFromString(kDefaultFlags, static_cast<int>(sizeof(kDefaultFlags) - 1));
 }
 
@@ -638,12 +638,24 @@ napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
   return status;
 }
 
+void DrainMicrotasksForEnv(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return;
+  env->isolate->PerformMicrotaskCheckpoint();
+  v8::Local<v8::Context> context = env->context();
+  if (!context.IsEmpty()) {
+    v8::MicrotaskQueue* queue = context->GetMicrotaskQueue();
+    if (queue != nullptr) {
+      queue->PerformCheckpoint(env->isolate);
+    }
+  }
+}
+
 napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  // Avoid hard dependency on V8's --expose-gc runtime flag while still
-  // requesting aggressive reclamation behavior for tests.
-  env->isolate->LowMemoryNotification();
-  env->isolate->PerformMicrotaskCheckpoint();
+  // Match Node test expectations for global.gc(): force an actual full GC
+  // cycle rather than only hinting memory pressure.
+  env->isolate->RequestGarbageCollectionForTesting(
+      v8::Isolate::GarbageCollectionType::kFullGarbageCollection);
   return napi_ok;
 }
 
@@ -651,7 +663,7 @@ napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
   // Keep this helper engine-agnostic in behavior: flush microtasks only.
   // Foreground task pumping is owned by higher-level runtime loop policy.
-  env->isolate->PerformMicrotaskCheckpoint();
+  DrainMicrotasksForEnv(env);
   return napi_ok;
 }
 

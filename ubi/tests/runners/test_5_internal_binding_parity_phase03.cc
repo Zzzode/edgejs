@@ -626,19 +626,27 @@ assert.strictEqual(stringDecoderBinding.kNumFields, stringDecoderBinding.kSize);
 
 const udpWrap = internalBinding('udp_wrap');
 const udpHandle = new udpWrap.UDP();
-const recvBufferSize = udpHandle.getRecvBufferSize();
-const sendBufferSize = udpHandle.getSendBufferSize();
+const recvBufferContext = {};
+const sendBufferContext = {};
+const recvBufferSize = udpHandle.bufferSize(0, true, recvBufferContext);
+const sendBufferSize = udpHandle.bufferSize(0, false, sendBufferContext);
 assert.ok(recvBufferSize === undefined || typeof recvBufferSize === 'number');
 assert.ok(sendBufferSize === undefined || typeof sendBufferSize === 'number');
-const recvSetResult = udpHandle.setRecvBufferSize(
+const recvSetContext = {};
+const sendSetContext = {};
+const recvSetResult = udpHandle.bufferSize(
   typeof recvBufferSize === 'number' ? recvBufferSize : 0,
+  true,
+  recvSetContext,
 );
-const sendSetResult = udpHandle.setSendBufferSize(
+const sendSetResult = udpHandle.bufferSize(
   typeof sendBufferSize === 'number' ? sendBufferSize : 0,
+  false,
+  sendSetContext,
 );
 assert.ok(recvSetResult === undefined || typeof recvSetResult === 'number');
 assert.ok(sendSetResult === undefined || typeof sendSetResult === 'number');
-assert.strictEqual(typeof udpHandle.setMulticastAll(true), 'number');
+assert.strictEqual(typeof udpHandle.setMulticastLoopback(true), 'number');
 udpHandle.close(() => {});
 
 globalThis.__ubi_internal_binding_parity_ok = 1;

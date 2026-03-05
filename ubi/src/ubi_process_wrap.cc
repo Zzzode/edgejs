@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <csignal>
+#include <chrono>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <iostream>
@@ -103,6 +105,12 @@ bool GetNamedValue(napi_env env, napi_value obj, const char* key, napi_value* ou
 bool DebugProcessWrapEnabled() {
   const char* v = std::getenv("UBI_DEBUG_PROCESS_WRAP");
   return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+bool ProcessExists(int32_t pid) {
+  if (pid <= 0) return false;
+  if (kill(pid, 0) == 0) return true;
+  return errno == EPERM;
 }
 
 int SignalFromName(const std::string& name) {
@@ -680,5 +688,24 @@ void UbiProcessWrapForceKillTrackedChildren() {
     if (rc == 0 || rc == UV_ESRCH) {
       UntrackLiveChildPid(pid);
     }
+  }
+
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    bool any_alive = false;
+    for (int32_t pid : pids) {
+      if (!ProcessExists(pid)) {
+        UntrackLiveChildPid(pid);
+        continue;
+      }
+      any_alive = true;
+      if ((attempt % 8) == 7) {
+        const int rc = uv_kill(pid, SIGKILL);
+        if (DebugProcessWrapEnabled()) {
+          std::cerr << "[ubi-process-wrap] cleanup retry pid=" << pid << " rc=" << rc << "\n";
+        }
+      }
+    }
+    if (!any_alive) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }

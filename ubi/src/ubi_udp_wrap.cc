@@ -16,32 +16,15 @@
 #endif
 
 #include "ubi_runtime.h"
+#include "ubi_udp_listener.h"
 
 namespace {
 
-struct UdpWrap;
+class UdpWrap;
 
-struct UdpSendReqWrap {
-  uv_udp_send_t req{};
+struct UdpSendReqWrap final : public UbiUdpSendWrap {
   napi_env env = nullptr;
   napi_ref req_obj_ref = nullptr;
-  uv_buf_t* bufs = nullptr;
-  uint32_t nbufs = 0;
-  size_t msg_size = 0;
-  bool have_callback = false;
-  UdpWrap* udp = nullptr;
-};
-
-struct UdpWrap {
-  napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
-  napi_ref close_cb_ref = nullptr;
-  uv_udp_t handle{};
-  bool closed = false;
-  bool finalized = false;
-  bool delete_on_close = false;
-  bool has_ref = true;
-  int64_t async_id = 200000;
 };
 
 struct SendWrap {
@@ -129,6 +112,13 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
   }
 }
 
+bool IsFunction(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok) return false;
+  return type == napi_function;
+}
+
 bool ReadUint32Property(napi_env env, napi_value obj, const char* key, uint32_t* out) {
   if (obj == nullptr || out == nullptr) return false;
   napi_value v = nullptr;
@@ -141,6 +131,14 @@ bool ExtractArrayBufferViewBytes(napi_env env, napi_value value, const char** sr
   *src = nullptr;
   *len = 0;
 
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
+    void* data = nullptr;
+    if (napi_get_buffer_info(env, value, &data, len) != napi_ok) return false;
+    *src = static_cast<const char*>(data);
+    return true;
+  }
+
   bool is_typed = false;
   if (napi_is_typedarray(env, value, &is_typed) == napi_ok && is_typed) {
     napi_typedarray_type tt = napi_uint8_array;
@@ -148,7 +146,7 @@ bool ExtractArrayBufferViewBytes(napi_env env, napi_value value, const char** sr
     void* data = nullptr;
     napi_value ab = nullptr;
     size_t off = 0;
-    if (napi_get_typedarray_info(env, value, &tt, &element_len, &data, &ab, &off) != napi_ok || data == nullptr) {
+    if (napi_get_typedarray_info(env, value, &tt, &element_len, &data, &ab, &off) != napi_ok) {
       return false;
     }
     *src = static_cast<const char*>(data);
@@ -166,34 +164,15 @@ bool ExtractArrayBufferViewBytes(napi_env env, napi_value value, const char** sr
     void* data = nullptr;
     napi_value ab = nullptr;
     size_t off = 0;
-    if (napi_get_dataview_info(env, value, len, &data, &ab, &off) != napi_ok || data == nullptr) return false;
+    if (napi_get_dataview_info(env, value, len, &data, &ab, &off) != napi_ok) return false;
     *src = static_cast<const char*>(data);
     return true;
-  }
-
-  napi_value ab = nullptr;
-  if (napi_get_named_property(env, value, "buffer", &ab) == napi_ok && ab != nullptr) {
-    bool is_arraybuffer = false;
-    if (napi_is_arraybuffer(env, ab, &is_arraybuffer) == napi_ok && is_arraybuffer) {
-      void* base = nullptr;
-      size_t ab_len = 0;
-      if (napi_get_arraybuffer_info(env, ab, &base, &ab_len) == napi_ok && base != nullptr) {
-        uint32_t byte_offset = 0;
-        uint32_t byte_len = 0;
-        if (!ReadUint32Property(env, value, "byteOffset", &byte_offset)) byte_offset = 0;
-        if (!ReadUint32Property(env, value, "byteLength", &byte_len)) return false;
-        if (static_cast<size_t>(byte_offset) + static_cast<size_t>(byte_len) > ab_len) return false;
-        *src = static_cast<const char*>(base) + byte_offset;
-        *len = static_cast<size_t>(byte_len);
-        return true;
-      }
-    }
   }
 
   bool is_arraybuffer = false;
   if (napi_is_arraybuffer(env, value, &is_arraybuffer) == napi_ok && is_arraybuffer) {
     void* data = nullptr;
-    if (napi_get_arraybuffer_info(env, value, &data, len) != napi_ok || data == nullptr) return false;
+    if (napi_get_arraybuffer_info(env, value, &data, len) != napi_ok) return false;
     *src = static_cast<const char*>(data);
     return true;
   }
@@ -201,39 +180,387 @@ bool ExtractArrayBufferViewBytes(napi_env env, napi_value value, const char** sr
   return false;
 }
 
-void SetReqError(napi_env env, napi_value req_obj, int status) {
-  if (req_obj == nullptr || status >= 0) return;
-  const char* err = uv_err_name(status);
-  napi_value err_v = nullptr;
-  napi_create_string_utf8(env, err != nullptr ? err : "UV_ERROR", NAPI_AUTO_LENGTH, &err_v);
-  if (err_v != nullptr) napi_set_named_property(env, req_obj, "error", err_v);
-}
-
-void SendWrapFinalize(napi_env env, void* data, void* /*hint*/) {
-  auto* wrap = static_cast<SendWrap*>(data);
+void DestroySendReqWrap(UdpSendReqWrap* wrap) {
   if (wrap == nullptr) return;
-  if (wrap->wrapper_ref) napi_delete_reference(env, wrap->wrapper_ref);
+  if (wrap->req_obj_ref != nullptr) {
+    napi_delete_reference(wrap->env, wrap->req_obj_ref);
+    wrap->req_obj_ref = nullptr;
+  }
+  delete[] wrap->bufs;
+  wrap->bufs = nullptr;
+  wrap->nbufs = 0;
   delete wrap;
 }
 
-void UdpFinalize(napi_env env, void* data, void* /*hint*/) {
+void ExternalBufferFinalize(napi_env env, void* data, void* hint) {
+  (void)env;
+  (void)hint;
+  free(data);
+}
+
+napi_value CreateExternalBuffer(napi_env env, char* data, size_t len) {
+  if (len == 0) {
+    free(data);
+    void* out = nullptr;
+    napi_value buffer = nullptr;
+    if (napi_create_buffer(env, 0, &out, &buffer) != napi_ok) return nullptr;
+    return buffer;
+  }
+
+  napi_value buffer = nullptr;
+  if (napi_create_external_buffer(env, len, data, ExternalBufferFinalize, nullptr, &buffer) != napi_ok ||
+      buffer == nullptr) {
+    free(data);
+    return nullptr;
+  }
+  return buffer;
+}
+
+napi_value CreateErrorValue(napi_env env, const char* message) {
+  napi_value msg = nullptr;
+  napi_value err = nullptr;
+  napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &msg);
+  napi_create_error(env, nullptr, msg, &err);
+  return err;
+}
+
+napi_value BuildRinfoObject(napi_env env, const sockaddr* addr, ssize_t nread) {
+  if (addr == nullptr) return nullptr;
+
+  napi_value out = nullptr;
+  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return nullptr;
+
+  std::string ip;
+  int port = 0;
+  const char* family = nullptr;
+  if (addr->sa_family == AF_INET6) {
+    const auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
+    ip = FormatIPv6AddressWithScope(a6);
+    port = ntohs(a6->sin6_port);
+    family = "IPv6";
+  } else if (addr->sa_family == AF_INET) {
+    char ip4[INET6_ADDRSTRLEN] = {0};
+    const auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
+    uv_ip4_name(a4, ip4, sizeof(ip4));
+    ip = ip4;
+    port = ntohs(a4->sin_port);
+    family = "IPv4";
+  } else {
+    return nullptr;
+  }
+
+  napi_value ip_v = nullptr;
+  napi_value family_v = nullptr;
+  napi_value port_v = nullptr;
+  napi_value size_v = nullptr;
+  napi_create_string_utf8(env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
+  napi_create_string_utf8(env, family, NAPI_AUTO_LENGTH, &family_v);
+  napi_create_int32(env, port, &port_v);
+  napi_create_int32(env, nread >= 0 ? static_cast<int32_t>(nread) : 0, &size_v);
+  if (ip_v != nullptr) napi_set_named_property(env, out, "address", ip_v);
+  if (family_v != nullptr) napi_set_named_property(env, out, "family", family_v);
+  if (port_v != nullptr) napi_set_named_property(env, out, "port", port_v);
+  if (size_v != nullptr) napi_set_named_property(env, out, "size", size_v);
+  return out;
+}
+
+void CallOptionalCallback(napi_env env,
+                          napi_value self,
+                          const char* name,
+                          size_t argc,
+                          napi_value* argv) {
+  if (self == nullptr) return;
+  napi_value callback = nullptr;
+  if (napi_get_named_property(env, self, name, &callback) != napi_ok || !IsFunction(env, callback)) return;
+  napi_value ignored = nullptr;
+  UbiMakeCallback(env, self, callback, argc, argv, &ignored);
+  (void)UbiHandlePendingExceptionNow(env, nullptr);
+}
+
+void CallOnError(napi_env env, napi_value self, ssize_t nread, napi_value error) {
+  napi_value argv[3] = {MakeInt32(env, static_cast<int32_t>(nread)), self, error};
+  CallOptionalCallback(env, self, "onerror", 3, argv);
+}
+
+void ThrowInvalidUdpReceiver(napi_env env) {
+  napi_throw_type_error(env, nullptr, "Invalid UDP receiver");
+}
+
+class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
+ public:
+  explicit UdpWrap(napi_env env_in) : env(env_in), async_id(g_next_async_id++) {
+    uv_udp_init(uv_default_loop(), &handle);
+    handle.data = this;
+    set_listener(this);
+  }
+
+  int RecvStart() override {
+    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) return UV_EBADF;
+    int rc = uv_udp_recv_start(&handle, OnAllocCallback, OnRecvCallback);
+    if (rc == UV_EALREADY) rc = 0;
+    return rc;
+  }
+
+  int RecvStop() override {
+    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) return UV_EBADF;
+    return uv_udp_recv_stop(&handle);
+  }
+
+  ssize_t Send(uv_buf_t* bufs_ptr, size_t count, const sockaddr* addr) override {
+    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) return UV_EBADF;
+
+    size_t msg_size = 0;
+    for (size_t i = 0; i < count; i++) msg_size += bufs_ptr[i].len;
+
+    int err = uv_udp_try_send(&handle, bufs_ptr, count, addr);
+    if (err == UV_ENOSYS || err == UV_EAGAIN) {
+      err = 0;
+    } else if (err >= 0) {
+      size_t sent = static_cast<size_t>(err);
+      while (count > 0 && bufs_ptr->len <= sent) {
+        sent -= bufs_ptr->len;
+        bufs_ptr++;
+        count--;
+      }
+      if (count == 0) {
+        return static_cast<ssize_t>(msg_size + 1);
+      }
+      bufs_ptr->base += sent;
+      bufs_ptr->len -= sent;
+      err = 0;
+    }
+
+    if (err != 0) return err;
+    if (count == 0) return static_cast<ssize_t>(msg_size + 1);
+
+    auto* req_wrap = static_cast<UdpSendReqWrap*>(listener()->CreateSendWrap(msg_size));
+    if (req_wrap == nullptr) return UV_ENOSYS;
+
+    req_wrap->bufs = new uv_buf_t[count];
+    req_wrap->nbufs = count;
+    std::memcpy(req_wrap->bufs, bufs_ptr, sizeof(uv_buf_t) * count);
+    req_wrap->req.data = req_wrap;
+
+    err = uv_udp_send(&req_wrap->req,
+                      &handle,
+                      req_wrap->bufs,
+                      static_cast<unsigned int>(count),
+                      addr,
+                      OnSendDoneCallback);
+    if (err != 0) DestroySendReqWrap(req_wrap);
+    return err;
+  }
+
+  uv_buf_t OnAlloc(size_t suggested_size) override {
+    const size_t alloc_size = suggested_size;
+    char* base = static_cast<char*>(malloc(alloc_size > 0 ? alloc_size : 1));
+    if (base == nullptr) return uv_buf_init(nullptr, 0);
+    return uv_buf_init(base, static_cast<unsigned int>(alloc_size));
+  }
+
+  void OnRecv(ssize_t nread,
+              const uv_buf_t& buf,
+              const sockaddr* addr,
+              unsigned int flags) override {
+    (void)flags;
+    if (nread == 0 && addr == nullptr) {
+      free(buf.base);
+      return;
+    }
+
+    napi_value self = GetRefValue(env, wrapper_ref);
+    if (self == nullptr) {
+      free(buf.base);
+      return;
+    }
+
+    napi_value onmessage = nullptr;
+    if (napi_get_named_property(env, self, "onmessage", &onmessage) != napi_ok ||
+        !IsFunction(env, onmessage)) {
+      free(buf.base);
+      return;
+    }
+
+    napi_value argv[4] = {
+        MakeInt32(env, static_cast<int32_t>(nread)),
+        self,
+        nullptr,
+        nullptr,
+    };
+    napi_get_undefined(env, &argv[2]);
+    napi_get_undefined(env, &argv[3]);
+
+    if (nread < 0) {
+      napi_value ignored = nullptr;
+      UbiMakeCallback(env, self, onmessage, 4, argv, &ignored);
+      (void)UbiHandlePendingExceptionNow(env, nullptr);
+      free(buf.base);
+      return;
+    }
+
+    napi_value rinfo = BuildRinfoObject(env, addr, nread);
+    if (rinfo == nullptr) {
+      napi_value error = CreateErrorValue(env, "Failed to build UDP remote info");
+      CallOnError(env, self, nread, error);
+      free(buf.base);
+      return;
+    }
+    argv[3] = rinfo;
+
+    char* owned = buf.base;
+    if (nread > 0 && static_cast<size_t>(nread) != buf.len) {
+      char* trimmed = static_cast<char*>(malloc(static_cast<size_t>(nread)));
+      if (trimmed == nullptr) {
+        napi_value error = CreateErrorValue(env, "Failed to trim UDP receive buffer");
+        CallOnError(env, self, nread, error);
+        free(owned);
+        return;
+      }
+      std::memcpy(trimmed, owned, static_cast<size_t>(nread));
+      free(owned);
+      owned = trimmed;
+    }
+
+    argv[2] = CreateExternalBuffer(env, owned, nread > 0 ? static_cast<size_t>(nread) : 0);
+    if (argv[2] == nullptr) {
+      napi_value error = CreateErrorValue(env, "Failed to create UDP buffer");
+      CallOnError(env, self, nread, error);
+      return;
+    }
+
+    napi_value ignored = nullptr;
+    UbiMakeCallback(env, self, onmessage, 4, argv, &ignored);
+    (void)UbiHandlePendingExceptionNow(env, nullptr);
+  }
+
+  UbiUdpSendWrap* CreateSendWrap(size_t msg_size) override {
+    if (current_send_req_obj == nullptr) return nullptr;
+
+    auto* req_wrap = new UdpSendReqWrap();
+    req_wrap->env = env;
+    req_wrap->msg_size = msg_size;
+    req_wrap->have_callback = current_send_has_callback;
+    if (napi_create_reference(env, current_send_req_obj, 1, &req_wrap->req_obj_ref) != napi_ok ||
+        req_wrap->req_obj_ref == nullptr) {
+      delete req_wrap;
+      return nullptr;
+    }
+    return req_wrap;
+  }
+
+  void OnSendDone(UbiUdpSendWrap* wrap, int status) override {
+    auto* req_wrap = static_cast<UdpSendReqWrap*>(wrap);
+    napi_value req_obj = GetRefValue(req_wrap->env, req_wrap->req_obj_ref);
+    if (req_wrap->have_callback && req_obj != nullptr) {
+      napi_value argv[2] = {
+          MakeInt32(req_wrap->env, status),
+          MakeInt32(req_wrap->env, static_cast<int32_t>(req_wrap->msg_size)),
+      };
+      CallOptionalCallback(req_wrap->env, req_obj, "oncomplete", 2, argv);
+    }
+    DestroySendReqWrap(req_wrap);
+  }
+
+  static void OnAllocCallback(uv_handle_t* handle,
+                              size_t suggested_size,
+                              uv_buf_t* buf) {
+    auto* wrap = handle != nullptr ? static_cast<UdpWrap*>(reinterpret_cast<uv_udp_t*>(handle)->data) : nullptr;
+    if (wrap == nullptr) {
+      *buf = uv_buf_init(nullptr, 0);
+      return;
+    }
+    *buf = wrap->listener()->OnAlloc(suggested_size);
+  }
+
+  static void OnRecvCallback(uv_udp_t* handle,
+                             ssize_t nread,
+                             const uv_buf_t* buf,
+                             const sockaddr* addr,
+                             unsigned int flags) {
+    auto* wrap = handle != nullptr ? static_cast<UdpWrap*>(handle->data) : nullptr;
+    if (wrap == nullptr) {
+      if (buf != nullptr) free(buf->base);
+      return;
+    }
+    const uv_buf_t recv_buf = buf != nullptr ? *buf : uv_buf_init(nullptr, 0);
+    wrap->listener()->OnRecv(nread, recv_buf, addr, flags);
+  }
+
+  static void OnSendDoneCallback(uv_udp_send_t* req, int status) {
+    auto* req_wrap = static_cast<UdpSendReqWrap*>(req->data);
+    auto* wrap = req->handle != nullptr ? static_cast<UdpWrap*>(req->handle->data) : nullptr;
+    if (wrap == nullptr) {
+      DestroySendReqWrap(req_wrap);
+      return;
+    }
+    wrap->listener()->OnSendDone(req_wrap, status);
+  }
+
+  napi_env env = nullptr;
+  napi_ref wrapper_ref = nullptr;
+  napi_ref close_cb_ref = nullptr;
+  uv_udp_t handle{};
+  bool closed = false;
+  bool finalized = false;
+  bool delete_on_close = false;
+  int64_t async_id = 200000;
+  napi_value current_send_req_obj = nullptr;
+  bool current_send_has_callback = false;
+};
+
+UdpWrap* UnwrapUdpWrap(napi_env env, napi_value value, bool throw_type_error) {
+  if (value == nullptr) {
+    if (throw_type_error) ThrowInvalidUdpReceiver(env);
+    return nullptr;
+  }
+
+  UdpWrap* wrap = nullptr;
+  if (napi_unwrap(env, value, reinterpret_cast<void**>(&wrap)) != napi_ok || wrap == nullptr) {
+    if (throw_type_error) ThrowInvalidUdpReceiver(env);
+    return nullptr;
+  }
+  return wrap;
+}
+
+napi_value GetThis(napi_env env,
+                   napi_callback_info info,
+                   size_t* argc_out,
+                   napi_value* argv,
+                   UdpWrap** wrap_out,
+                   bool throw_type_error = false) {
+  size_t argc = argc_out != nullptr ? *argc_out : 0;
+  napi_value self = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
+  if (argc_out != nullptr) *argc_out = argc;
+  if (wrap_out != nullptr) *wrap_out = UnwrapUdpWrap(env, self, throw_type_error);
+  return self;
+}
+
+void SendWrapFinalize(napi_env env, void* data, void* hint) {
+  (void)hint;
+  auto* wrap = static_cast<SendWrap*>(data);
+  if (wrap == nullptr) return;
+  if (wrap->wrapper_ref != nullptr) napi_delete_reference(env, wrap->wrapper_ref);
+  delete wrap;
+}
+
+void UdpFinalize(napi_env env, void* data, void* hint) {
+  (void)hint;
   auto* wrap = static_cast<UdpWrap*>(data);
   if (wrap == nullptr) return;
   wrap->finalized = true;
-  if (wrap->wrapper_ref) {
+  if (wrap->wrapper_ref != nullptr) {
     napi_delete_reference(env, wrap->wrapper_ref);
     wrap->wrapper_ref = nullptr;
   }
-  if (wrap->close_cb_ref) {
+  if (wrap->close_cb_ref != nullptr) {
     napi_delete_reference(env, wrap->close_cb_ref);
     wrap->close_cb_ref = nullptr;
   }
   uv_handle_t* h = reinterpret_cast<uv_handle_t*>(&wrap->handle);
   if (!wrap->closed) {
     wrap->delete_on_close = true;
-    if (!uv_is_closing(h)) {
-      uv_close(h, OnClosed);
-    }
+    if (!uv_is_closing(h)) uv_close(h, OnClosed);
     return;
   }
   delete wrap;
@@ -252,18 +579,20 @@ napi_value UdpCtor(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
-  auto* wrap = new UdpWrap();
-  wrap->env = env;
-  wrap->async_id = g_next_async_id++;
-  uv_udp_init(uv_default_loop(), &wrap->handle);
-  wrap->handle.data = wrap;
+  auto* wrap = new UdpWrap(env);
   napi_wrap(env, self, wrap, UdpFinalize, nullptr, &wrap->wrapper_ref);
-  // Node's internal/dgram mutates selected handle methods for udp6 aliases.
+
+  // Match Node's dgram handle aliasing for udp6 sockets.
   const char* mutable_methods[] = {"bind", "bind6", "connect", "connect6", "send", "send6"};
   for (const char* key : mutable_methods) {
     napi_value fn = nullptr;
     if (napi_get_named_property(env, self, key, &fn) == napi_ok && fn != nullptr) {
-      napi_property_descriptor desc = {key, nullptr, nullptr, nullptr, nullptr, fn,
+      napi_property_descriptor desc = {key,
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       fn,
                                        static_cast<napi_property_attributes>(napi_writable | napi_configurable),
                                        nullptr};
       napi_define_properties(env, self, 1, &desc);
@@ -272,175 +601,56 @@ napi_value UdpCtor(napi_env env, napi_callback_info info) {
   return self;
 }
 
-void InvokeReqOnComplete(napi_env env, napi_value req_obj, int status, uint32_t sent, bool have_callback) {
-  if (req_obj == nullptr) return;
-  SetReqError(env, req_obj, status);
-  if (!have_callback) return;
-  napi_value oncomplete = nullptr;
-  if (napi_get_named_property(env, req_obj, "oncomplete", &oncomplete) != napi_ok || oncomplete == nullptr) return;
-  napi_valuetype t = napi_undefined;
-  napi_typeof(env, oncomplete, &t);
-  if (t != napi_function) return;
-  napi_value argv[2] = {MakeInt32(env, status), MakeInt32(env, static_cast<int32_t>(sent))};
-  napi_value ignored = nullptr;
-  UbiMakeCallback(env, req_obj, oncomplete, 2, argv, &ignored);
-}
-
-void OnSendDone(uv_udp_send_t* req, int status) {
-  auto* sr = static_cast<UdpSendReqWrap*>(req->data);
-  if (sr == nullptr) return;
-  napi_value req_obj = GetRefValue(sr->env, sr->req_obj_ref);
-  InvokeReqOnComplete(sr->env, req_obj, status, static_cast<uint32_t>(sr->msg_size), sr->have_callback);
-  if (sr->bufs != nullptr) {
-    for (uint32_t i = 0; i < sr->nbufs; i++) free(sr->bufs[i].base);
-    delete[] sr->bufs;
-  }
-  if (sr->req_obj_ref) napi_delete_reference(sr->env, sr->req_obj_ref);
-  delete sr;
-}
-
-void OnAlloc(uv_handle_t* /*h*/, size_t suggested_size, uv_buf_t* buf) {
-  char* base = static_cast<char*>(malloc(suggested_size));
-  *buf = uv_buf_init(base, static_cast<unsigned int>(suggested_size));
-}
-
-napi_value MakeBufferFromBytes(napi_env env, const char* data, size_t len) {
-  void* out = nullptr;
-  napi_value ab = nullptr;
-  if (napi_create_arraybuffer(env, len, &out, &ab) != napi_ok || ab == nullptr) return nullptr;
-  if (len > 0) {
-    if (out == nullptr || data == nullptr) return nullptr;
-    memcpy(out, data, len);
-  }
-  napi_value view = nullptr;
-  if (napi_create_typedarray(env, napi_uint8_array, len, ab, 0, &view) != napi_ok || view == nullptr) return nullptr;
-
-  napi_value global = nullptr;
-  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return view;
-  napi_value buffer_ctor = nullptr;
-  if (napi_get_named_property(env, global, "Buffer", &buffer_ctor) != napi_ok || buffer_ctor == nullptr) return view;
-  napi_value from_fn = nullptr;
-  if (napi_get_named_property(env, buffer_ctor, "from", &from_fn) != napi_ok || from_fn == nullptr) return view;
-  napi_valuetype t = napi_undefined;
-  napi_typeof(env, from_fn, &t);
-  if (t != napi_function) return view;
-  napi_value argv[1] = {view};
-  napi_value buf_obj = nullptr;
-  if (napi_call_function(env, buffer_ctor, from_fn, 1, argv, &buf_obj) != napi_ok || buf_obj == nullptr) return view;
-  return buf_obj;
-}
-
-void OnRecv(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const sockaddr* addr, unsigned /*flags*/) {
-  auto* wrap = static_cast<UdpWrap*>(handle->data);
-  if (wrap == nullptr) {
-    if (buf && buf->base) free(buf->base);
-    return;
-  }
-  // Mirror Node/libuv behavior: ignore empty probe reads that have no address.
-  // Zero-length datagrams still have an address and should be delivered.
-  if (nread == 0 && addr == nullptr) {
-    if (buf && buf->base) free(buf->base);
-    return;
-  }
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-  napi_value onmessage = nullptr;
-  if (self != nullptr &&
-      napi_get_named_property(wrap->env, self, "onmessage", &onmessage) == napi_ok &&
-      onmessage != nullptr) {
-    napi_valuetype t = napi_undefined;
-    napi_typeof(wrap->env, onmessage, &t);
-    if (t == napi_function) {
-      napi_value argv[4] = {MakeInt32(wrap->env, static_cast<int32_t>(nread)), self, nullptr, nullptr};
-      if (nread >= 0 && buf != nullptr && buf->base != nullptr) {
-        argv[2] = MakeBufferFromBytes(wrap->env, buf->base, static_cast<size_t>(nread));
-        if (argv[2] == nullptr) napi_get_undefined(wrap->env, &argv[2]);
-      } else {
-        napi_get_undefined(wrap->env, &argv[2]);
-      }
-      napi_value rinfo = nullptr;
-      napi_create_object(wrap->env, &rinfo);
-      if (addr != nullptr) {
-        std::string ip;
-        int port = 0;
-        const char* fam = "IPv4";
-        if (addr->sa_family == AF_INET6) {
-          auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
-          ip = FormatIPv6AddressWithScope(a6);
-          port = ntohs(a6->sin6_port);
-          fam = "IPv6";
-        } else {
-          char ip4[INET6_ADDRSTRLEN] = {0};
-          auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
-          uv_ip4_name(a4, ip4, sizeof(ip4));
-          ip = ip4;
-          port = ntohs(a4->sin_port);
-        }
-        napi_value ip_v = nullptr;
-        napi_value fam_v = nullptr;
-        napi_value port_v = nullptr;
-        napi_value size_v = nullptr;
-        napi_create_string_utf8(wrap->env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
-        napi_create_string_utf8(wrap->env, fam, NAPI_AUTO_LENGTH, &fam_v);
-        napi_create_int32(wrap->env, port, &port_v);
-        napi_create_int32(wrap->env, nread >= 0 ? static_cast<int32_t>(nread) : 0, &size_v);
-        if (ip_v) napi_set_named_property(wrap->env, rinfo, "address", ip_v);
-        if (fam_v) napi_set_named_property(wrap->env, rinfo, "family", fam_v);
-        if (port_v) napi_set_named_property(wrap->env, rinfo, "port", port_v);
-        if (size_v) napi_set_named_property(wrap->env, rinfo, "size", size_v);
-      }
-      if (rinfo == nullptr) napi_get_undefined(wrap->env, &rinfo);
-      argv[3] = rinfo;
-      napi_value ignored = nullptr;
-      UbiMakeCallback(wrap->env, self, onmessage, 4, argv, &ignored);
-    }
-  }
-  if (buf && buf->base) free(buf->base);
-}
-
 void OnClosed(uv_handle_t* h) {
   auto* wrap = static_cast<UdpWrap*>(h->data);
   if (wrap == nullptr) return;
   wrap->closed = true;
-  if (!wrap->finalized && wrap->close_cb_ref) {
+  if (!wrap->finalized && wrap->close_cb_ref != nullptr) {
     napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-    napi_value cb = GetRefValue(wrap->env, wrap->close_cb_ref);
-    if (cb != nullptr) {
+    napi_value callback = GetRefValue(wrap->env, wrap->close_cb_ref);
+    if (callback != nullptr) {
       napi_value ignored = nullptr;
-      UbiMakeCallback(wrap->env, self, cb, 0, nullptr, &ignored);
+      UbiMakeCallback(wrap->env, self, callback, 0, nullptr, &ignored);
     }
     napi_delete_reference(wrap->env, wrap->close_cb_ref);
     wrap->close_cb_ref = nullptr;
   }
-  if (wrap->delete_on_close || wrap->finalized) {
-    delete wrap;
-  }
+  if (wrap->delete_on_close || wrap->finalized) delete wrap;
 }
 
-napi_value UdpBindImpl(napi_env env, UdpWrap* wrap, napi_value ip_val, int32_t port, bool ipv6, uint32_t flags) {
-  std::string ip = ValueToUtf8(env, ip_val);
+napi_value UdpBindImpl(napi_env env,
+                       UdpWrap* wrap,
+                       napi_value ip_value,
+                       uint32_t port,
+                       bool ipv6,
+                       uint32_t flags) {
+  if (wrap == nullptr) return MakeInt32(env, UV_EBADF);
+  if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) return MakeInt32(env, UV_EBADF);
+
+  std::string ip = ValueToUtf8(env, ip_value);
   int rc = 0;
   if (ipv6) {
     sockaddr_in6 a6{};
-    rc = uv_ip6_addr(ip.c_str(), port, &a6);
+    rc = uv_ip6_addr(ip.c_str(), static_cast<int>(port), &a6);
     if (rc == 0) rc = uv_udp_bind(&wrap->handle, reinterpret_cast<const sockaddr*>(&a6), flags);
   } else {
     sockaddr_in a4{};
-    rc = uv_ip4_addr(ip.c_str(), port, &a4);
+    rc = uv_ip4_addr(ip.c_str(), static_cast<int>(port), &a4);
     if (rc == 0) rc = uv_udp_bind(&wrap->handle, reinterpret_cast<const sockaddr*>(&a4), flags);
   }
+
+  if (rc == 0) wrap->listener()->OnAfterBind();
   return MakeInt32(env, rc);
 }
 
 napi_value UdpBind(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  int32_t port = 0;
-  napi_get_value_int32(env, argv[1], &port);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
+  uint32_t port = 0;
+  napi_get_value_uint32(env, argv[1], &port);
   uint32_t flags = 0;
   if (argc > 2 && argv[2] != nullptr) napi_get_value_uint32(env, argv[2], &flags);
   return UdpBindImpl(env, wrap, argv[0], port, false, flags);
@@ -449,13 +659,11 @@ napi_value UdpBind(napi_env env, napi_callback_info info) {
 napi_value UdpBind6(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  int32_t port = 0;
-  napi_get_value_int32(env, argv[1], &port);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
+  uint32_t port = 0;
+  napi_get_value_uint32(env, argv[1], &port);
   uint32_t flags = 0;
   if (argc > 2 && argv[2] != nullptr) napi_get_value_uint32(env, argv[2], &flags);
   return UdpBindImpl(env, wrap, argv[0], port, true, flags);
@@ -464,265 +672,199 @@ napi_value UdpBind6(napi_env env, napi_callback_info info) {
 napi_value UdpOpen(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
+  if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) return MakeInt32(env, UV_EBADF);
   int32_t fd = -1;
   napi_get_value_int32(env, argv[0], &fd);
-  int rc = uv_udp_open(&wrap->handle, static_cast<uv_os_sock_t>(fd));
-  return MakeInt32(env, rc);
+  return MakeInt32(env, uv_udp_open(&wrap->handle, static_cast<uv_os_sock_t>(fd)));
 }
 
 napi_value UdpRecvStart(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
-  int rc = uv_udp_recv_start(&wrap->handle, OnAlloc, OnRecv);
-  return MakeInt32(env, rc);
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  if (wrap == nullptr) return MakeInt32(env, UV_EBADF);
+  return MakeInt32(env, wrap->RecvStart());
 }
 
 napi_value UdpRecvStop(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
-  int rc = uv_udp_recv_stop(&wrap->handle);
-  return MakeInt32(env, rc);
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  if (wrap == nullptr) return MakeInt32(env, UV_EBADF);
+  return MakeInt32(env, wrap->RecvStop());
 }
 
 napi_value UdpClose(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  GetThis(env, info, &argc, argv, &wrap);
   if (wrap == nullptr) {
-    napi_value u = nullptr;
-    napi_get_undefined(env, &u);
-    return u;
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
   }
+
   if (argc > 0 && argv[0] != nullptr) {
-    napi_valuetype t = napi_undefined;
-    napi_typeof(env, argv[0], &t);
-    if (t == napi_function) {
-      if (wrap->close_cb_ref) napi_delete_reference(env, wrap->close_cb_ref);
+    if (wrap->close_cb_ref != nullptr) {
+      napi_delete_reference(env, wrap->close_cb_ref);
+      wrap->close_cb_ref = nullptr;
+    }
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_function) {
       napi_create_reference(env, argv[0], 1, &wrap->close_cb_ref);
     }
   }
+
   if (!wrap->closed && !uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
     uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnClosed);
   }
-  napi_value u = nullptr;
-  napi_get_undefined(env, &u);
-  return u;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+napi_value UdpSendImpl(napi_env env, napi_callback_info info, bool ipv6) {
+  size_t argc = 6;
+  napi_value argv[6] = {nullptr};
+  UdpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr) return MakeInt32(env, UV_EBADF);
+  if (argc != 4 && argc != 6) return MakeInt32(env, UV_EINVAL);
+
+  napi_value req_obj = argv[0];
+  napi_value chunks = argv[1];
+  uint32_t count = 0;
+  napi_get_value_uint32(env, argv[2], &count);
+
+  std::vector<uv_buf_t> bufs;
+  bufs.reserve(count);
+  for (uint32_t i = 0; i < count; i++) {
+    napi_value chunk = nullptr;
+    if (napi_get_element(env, chunks, i, &chunk) != napi_ok || chunk == nullptr) {
+      return MakeInt32(env, UV_EINVAL);
+    }
+    const char* data = nullptr;
+    size_t len = 0;
+    if (!ExtractArrayBufferViewBytes(env, chunk, &data, &len)) {
+      return MakeInt32(env, UV_EINVAL);
+    }
+    char* base = const_cast<char*>(data);
+    if (base == nullptr && len != 0) return MakeInt32(env, UV_EINVAL);
+    bufs.emplace_back(uv_buf_init(base, static_cast<unsigned int>(len)));
+  }
+
+  const bool send_to = argc == 6;
+  sockaddr_storage addr_storage{};
+  const sockaddr* addr = nullptr;
+  if (send_to) {
+    uint32_t port = 0;
+    napi_get_value_uint32(env, argv[3], &port);
+    std::string ip = ValueToUtf8(env, argv[4]);
+    int rc = 0;
+    if (ipv6) {
+      auto* a6 = reinterpret_cast<sockaddr_in6*>(&addr_storage);
+      rc = uv_ip6_addr(ip.c_str(), static_cast<int>(port), a6);
+    } else {
+      auto* a4 = reinterpret_cast<sockaddr_in*>(&addr_storage);
+      rc = uv_ip4_addr(ip.c_str(), static_cast<int>(port), a4);
+    }
+    if (rc != 0) return MakeInt32(env, rc);
+    addr = reinterpret_cast<const sockaddr*>(&addr_storage);
+  }
+
+  bool have_callback = false;
+  napi_get_value_bool(env, argv[send_to ? 5 : 3], &have_callback);
+  wrap->current_send_req_obj = req_obj;
+  wrap->current_send_has_callback = have_callback;
+  const ssize_t rc =
+      wrap->Send(bufs.empty() ? nullptr : bufs.data(), static_cast<size_t>(count), addr);
+  wrap->current_send_req_obj = nullptr;
+  wrap->current_send_has_callback = false;
+  return MakeInt32(env, static_cast<int32_t>(rc));
 }
 
 napi_value UdpSend(napi_env env, napi_callback_info info) {
-  size_t argc = 6;
-  napi_value argv[6] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
-  UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 3) return MakeInt32(env, UV_EINVAL);
-
-  napi_value req_obj = argv[0];
-  napi_value list = argv[1];
-  uint32_t list_len = 0;
-  napi_get_array_length(env, list, &list_len);
-
-  auto* sr = new UdpSendReqWrap();
-  sr->env = env;
-  sr->udp = wrap;
-  sr->req.data = sr;
-  sr->nbufs = list_len;
-  sr->msg_size = 0;
-  bool have_callback = false;
-  if (argc >= 6 && argv[5] != nullptr) {
-    napi_get_value_bool(env, argv[5], &have_callback);
-  } else if (argc >= 4 && argv[3] != nullptr) {
-    napi_get_value_bool(env, argv[3], &have_callback);
-  }
-  sr->have_callback = have_callback;
-  sr->bufs = new uv_buf_t[list_len > 0 ? list_len : 1];
-  napi_create_reference(env, req_obj, 1, &sr->req_obj_ref);
-
-  for (uint32_t i = 0; i < list_len; i++) {
-    napi_value chunk = nullptr;
-    napi_get_element(env, list, i, &chunk);
-    const char* src = nullptr;
-    size_t len = 0;
-    std::string tmp;
-    if (!ExtractArrayBufferViewBytes(env, chunk, &src, &len)) {
-      tmp = ValueToUtf8(env, chunk);
-      src = tmp.data();
-      len = tmp.size();
-    }
-    // Keep a stable non-null base pointer even for zero-length datagrams.
-    // Some libuv/platform paths may still dereference base regardless of len.
-    char* copy = static_cast<char*>(malloc(len > 0 ? len : 1));
-    if (len > 0 && src != nullptr) memcpy(copy, src, len);
-    sr->bufs[i] = uv_buf_init(copy, static_cast<unsigned int>(len));
-    sr->msg_size += len;
-  }
-
-  sockaddr_storage ss{};
-  const sockaddr* send_addr = nullptr;
-  int rc = 0;
-  if (argc >= 5 && argv[3] != nullptr && argv[4] != nullptr) {
-    int32_t port = 0;
-    napi_get_value_int32(env, argv[3], &port);
-    std::string ip = ValueToUtf8(env, argv[4]);
-    if (ip.find(':') != std::string::npos) {
-      auto* a6 = reinterpret_cast<sockaddr_in6*>(&ss);
-      uv_ip6_addr(ip.c_str(), port, a6);
-      send_addr = reinterpret_cast<const sockaddr*>(a6);
-    } else {
-      auto* a4 = reinterpret_cast<sockaddr_in*>(&ss);
-      uv_ip4_addr(ip.c_str(), port, a4);
-      send_addr = reinterpret_cast<const sockaddr*>(a4);
-    }
-  }
-  uv_buf_t* send_bufs = sr->bufs;
-  uint32_t send_count = sr->nbufs;
-  if (sr->msg_size > 0) {
-    rc = uv_udp_try_send(&wrap->handle, send_bufs, send_count, send_addr);
-    if (rc == UV_ENOSYS || rc == UV_EAGAIN) {
-      rc = 0;
-    } else if (rc >= 0) {
-      size_t sent = static_cast<size_t>(rc);
-      while (send_count > 0 && send_bufs->len <= sent) {
-        sent -= send_bufs->len;
-        send_bufs++;
-        send_count--;
-      }
-      if (send_count == 0) {
-        const int32_t sync_success = static_cast<int32_t>(sr->msg_size + 1);
-        for (uint32_t i = 0; i < sr->nbufs; i++) free(sr->bufs[i].base);
-        delete[] sr->bufs;
-        napi_delete_reference(env, sr->req_obj_ref);
-        delete sr;
-        return MakeInt32(env, sync_success);
-      }
-      if (sent > 0) {
-        send_bufs->base += sent;
-        send_bufs->len -= sent;
-      }
-      rc = 0;
-    }
-  } else {
-    rc = 0;
-  }
-  if (rc == 0) {
-    rc = uv_udp_send(&sr->req, &wrap->handle, send_bufs, send_count, send_addr, OnSendDone);
-  }
-  if (rc != 0) {
-    SetReqError(env, req_obj, rc);
-    for (uint32_t i = 0; i < sr->nbufs; i++) free(sr->bufs[i].base);
-    delete[] sr->bufs;
-    napi_delete_reference(env, sr->req_obj_ref);
-    delete sr;
-  }
-  return MakeInt32(env, rc);
+  return UdpSendImpl(env, info, false);
 }
 
 napi_value UdpSend6(napi_env env, napi_callback_info info) {
-  return UdpSend(env, info);
+  return UdpSendImpl(env, info, true);
+}
+
+void FillSockaddrObject(napi_env env, napi_value out, const sockaddr_storage& storage) {
+  std::string ip;
+  int port = 0;
+  const char* family = nullptr;
+  if (storage.ss_family == AF_INET6) {
+    const auto* a6 = reinterpret_cast<const sockaddr_in6*>(&storage);
+    ip = FormatIPv6AddressWithScope(a6);
+    port = ntohs(a6->sin6_port);
+    family = "IPv6";
+  } else if (storage.ss_family == AF_INET) {
+    char ip4[INET6_ADDRSTRLEN] = {0};
+    const auto* a4 = reinterpret_cast<const sockaddr_in*>(&storage);
+    uv_ip4_name(a4, ip4, sizeof(ip4));
+    ip = ip4;
+    port = ntohs(a4->sin_port);
+    family = "IPv4";
+  } else {
+    return;
+  }
+
+  napi_value ip_v = nullptr;
+  napi_value family_v = nullptr;
+  napi_value port_v = nullptr;
+  napi_create_string_utf8(env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
+  napi_create_string_utf8(env, family, NAPI_AUTO_LENGTH, &family_v);
+  napi_create_int32(env, port, &port_v);
+  if (ip_v != nullptr) napi_set_named_property(env, out, "address", ip_v);
+  if (family_v != nullptr) napi_set_named_property(env, out, "family", family_v);
+  if (port_v != nullptr) napi_set_named_property(env, out, "port", port_v);
 }
 
 napi_value UdpGetSockName(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  sockaddr_storage ss{};
-  int len = sizeof(ss);
-  int rc = uv_udp_getsockname(&wrap->handle, reinterpret_cast<sockaddr*>(&ss), &len);
-  if (rc == 0) {
-    std::string ip;
-    int port = 0;
-    const char* fam = "IPv4";
-    if (ss.ss_family == AF_INET6) {
-      auto* a6 = reinterpret_cast<sockaddr_in6*>(&ss);
-      ip = FormatIPv6AddressWithScope(a6);
-      port = ntohs(a6->sin6_port);
-      fam = "IPv6";
-    } else {
-      char ip4[INET6_ADDRSTRLEN] = {0};
-      auto* a4 = reinterpret_cast<sockaddr_in*>(&ss);
-      uv_ip4_name(a4, ip4, sizeof(ip4));
-      ip = ip4;
-      port = ntohs(a4->sin_port);
-    }
-    napi_value ip_v = nullptr;
-    napi_value fam_v = nullptr;
-    napi_value port_v = nullptr;
-    napi_create_string_utf8(env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
-    napi_create_string_utf8(env, fam, NAPI_AUTO_LENGTH, &fam_v);
-    napi_create_int32(env, port, &port_v);
-    if (ip_v) napi_set_named_property(env, argv[0], "address", ip_v);
-    if (fam_v) napi_set_named_property(env, argv[0], "family", fam_v);
-    if (port_v) napi_set_named_property(env, argv[0], "port", port_v);
-  }
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
+  sockaddr_storage storage{};
+  int len = sizeof(storage);
+  const int rc = uv_udp_getsockname(&wrap->handle, reinterpret_cast<sockaddr*>(&storage), &len);
+  if (rc == 0 && argv[0] != nullptr) FillSockaddrObject(env, argv[0], storage);
   return MakeInt32(env, rc);
 }
 
 napi_value UdpRef(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap != nullptr) {
-    uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
-    wrap->has_ref = true;
-  }
-  napi_value u = nullptr;
-  napi_get_undefined(env, &u);
-  return u;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  if (wrap != nullptr) uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
 }
 
 napi_value UdpUnref(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap != nullptr) {
-    uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
-    wrap->has_ref = false;
-  }
-  napi_value u = nullptr;
-  napi_get_undefined(env, &u);
-  return u;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  if (wrap != nullptr) uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
 }
 
 napi_value UdpHasRef(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  return MakeBool(env, wrap != nullptr ? wrap->has_ref : false);
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return MakeBool(env, wrap != nullptr &&
+                           uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->handle)) != 0);
 }
 
 napi_value UdpGetAsyncId(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  GetThis(env, info, nullptr, nullptr, &wrap);
   napi_value out = nullptr;
   napi_create_int64(env, wrap != nullptr ? wrap->async_id : -1, &out);
   return out;
@@ -732,99 +874,67 @@ napi_value UdpFdGetter(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
-  UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  int32_t fd = -1;
-  if (wrap != nullptr) {
-    uv_os_fd_t raw = -1;
-    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(&wrap->handle), &raw) == 0) {
-      fd = static_cast<int32_t>(raw);
-    }
+  UdpWrap* wrap = UnwrapUdpWrap(env, self, true);
+  if (wrap == nullptr) return nullptr;
+
+  int32_t fd = UV_EBADF;
+#if !defined(_WIN32)
+  uv_os_fd_t raw = -1;
+  if (uv_fileno(reinterpret_cast<const uv_handle_t*>(&wrap->handle), &raw) == 0) {
+    fd = static_cast<int32_t>(raw);
   }
+#endif
   return MakeInt32(env, fd);
 }
 
-napi_value UdpSetMulticastAll(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
+napi_value UdpBufferSize(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  bool on = false;
-  if (napi_get_value_bool(env, argv[0], &on) != napi_ok) return MakeInt32(env, UV_EINVAL);
-
-#if !defined(_WIN32) && defined(IP_MULTICAST_ALL)
-  uv_os_fd_t fd = 0;
-  const int fileno_rc = uv_fileno(reinterpret_cast<const uv_handle_t*>(&wrap->handle), &fd);
-  if (fileno_rc != 0) return MakeInt32(env, fileno_rc);
-  int value = on ? 1 : 0;
-  if (setsockopt(static_cast<int>(fd), IPPROTO_IP, IP_MULTICAST_ALL, &value, sizeof(value)) != 0) {
-    return MakeInt32(env, uv_translate_sys_error(errno));
-  }
-#else
-  (void)on;
-#endif
-  return MakeInt32(env, 0);
-}
-
-napi_value UdpBufferSizeCompat(napi_env env, napi_callback_info info, bool recv, bool set_mode) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
-  UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr) {
-    napi_value undef = nullptr;
-    napi_get_undefined(env, &undef);
-    return undef;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
   }
 
-  int value = 0;
-  if (set_mode) {
-    if (argc < 1 || argv[0] == nullptr || napi_get_value_int32(env, argv[0], &value) != napi_ok) {
-      napi_value undef = nullptr;
-      napi_get_undefined(env, &undef);
-      return undef;
-    }
-  }
+  int32_t size = 0;
+  napi_get_value_int32(env, argv[0], &size);
+  bool recv = false;
+  napi_get_value_bool(env, argv[1], &recv);
 
+  int value = size;
+  const char* syscall = recv ? "uv_recv_buffer_size" : "uv_send_buffer_size";
   const int rc = recv ? uv_recv_buffer_size(reinterpret_cast<uv_handle_t*>(&wrap->handle), &value)
                       : uv_send_buffer_size(reinterpret_cast<uv_handle_t*>(&wrap->handle), &value);
   if (rc != 0) {
-    napi_value undef = nullptr;
-    napi_get_undefined(env, &undef);
-    return undef;
+    if (argc > 2 && argv[2] != nullptr) {
+      napi_value errno_v = nullptr;
+      napi_value code_v = nullptr;
+      napi_value message_v = nullptr;
+      napi_value syscall_v = nullptr;
+      napi_create_int32(env, rc, &errno_v);
+      napi_create_string_utf8(env, uv_err_name(rc), NAPI_AUTO_LENGTH, &code_v);
+      napi_create_string_utf8(env, uv_strerror(rc), NAPI_AUTO_LENGTH, &message_v);
+      napi_create_string_utf8(env, syscall, NAPI_AUTO_LENGTH, &syscall_v);
+      if (errno_v != nullptr) napi_set_named_property(env, argv[2], "errno", errno_v);
+      if (code_v != nullptr) napi_set_named_property(env, argv[2], "code", code_v);
+      if (message_v != nullptr) napi_set_named_property(env, argv[2], "message", message_v);
+      if (syscall_v != nullptr) napi_set_named_property(env, argv[2], "syscall", syscall_v);
+    }
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
   }
   return MakeInt32(env, value);
-}
-
-napi_value UdpSetRecvBufferSize(napi_env env, napi_callback_info info) {
-  return UdpBufferSizeCompat(env, info, true, true);
-}
-
-napi_value UdpSetSendBufferSize(napi_env env, napi_callback_info info) {
-  return UdpBufferSizeCompat(env, info, false, true);
-}
-
-napi_value UdpGetRecvBufferSize(napi_env env, napi_callback_info info) {
-  return UdpBufferSizeCompat(env, info, true, false);
-}
-
-napi_value UdpGetSendBufferSize(napi_env env, napi_callback_info info) {
-  return UdpBufferSizeCompat(env, info, false, false);
 }
 
 napi_value UdpSetBroadcast(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
   bool on = false;
   napi_get_value_bool(env, argv[0], &on);
   return MakeInt32(env, uv_udp_set_broadcast(&wrap->handle, on ? 1 : 0));
@@ -833,11 +943,9 @@ napi_value UdpSetBroadcast(napi_env env, napi_callback_info info) {
 napi_value UdpSetTTL(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
   int32_t ttl = 0;
   napi_get_value_int32(env, argv[0], &ttl);
   return MakeInt32(env, uv_udp_set_ttl(&wrap->handle, ttl));
@@ -846,11 +954,9 @@ napi_value UdpSetTTL(napi_env env, napi_callback_info info) {
 napi_value UdpSetMulticastTTL(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
   int32_t ttl = 0;
   napi_get_value_int32(env, argv[0], &ttl);
   return MakeInt32(env, uv_udp_set_multicast_ttl(&wrap->handle, ttl));
@@ -859,11 +965,9 @@ napi_value UdpSetMulticastTTL(napi_env env, napi_callback_info info) {
 napi_value UdpSetMulticastLoopback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
   bool on = false;
   napi_get_value_bool(env, argv[0], &on);
   return MakeInt32(env, uv_udp_set_multicast_loop(&wrap->handle, on ? 1 : 0));
@@ -872,23 +976,24 @@ napi_value UdpSetMulticastLoopback(napi_env env, napi_callback_info info) {
 napi_value UdpSetMulticastInterface(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
   std::string iface = ValueToUtf8(env, argv[0]);
   return MakeInt32(env, uv_udp_set_multicast_interface(&wrap->handle, iface.c_str()));
 }
 
-napi_value UdpMembershipImpl(napi_env env, napi_callback_info info, uv_membership membership) {
+napi_value UdpMembershipImpl(napi_env env,
+                             napi_callback_info info,
+                             uv_membership membership) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1 || argv[0] == nullptr) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1 || argv[0] == nullptr) {
+    return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
+  }
+
   std::string multicast = ValueToUtf8(env, argv[0]);
   const char* iface = nullptr;
   std::string iface_storage;
@@ -912,13 +1017,12 @@ napi_value UdpSourceMembershipImpl(napi_env env,
                                    uv_membership membership) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  GetThis(env, info, &argc, argv, &wrap);
   if (wrap == nullptr || argc < 2 || argv[0] == nullptr || argv[1] == nullptr) {
-    return MakeInt32(env, UV_EINVAL);
+    return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
   }
+
 #if UV_VERSION_MAJOR > 1 || (UV_VERSION_MAJOR == 1 && UV_VERSION_MINOR >= 32)
   std::string source = ValueToUtf8(env, argv[0]);
   std::string group = ValueToUtf8(env, argv[1]);
@@ -928,9 +1032,9 @@ napi_value UdpSourceMembershipImpl(napi_env env,
     iface_storage = ValueToUtf8(env, argv[2]);
     iface = iface_storage.c_str();
   }
-  return MakeInt32(env,
-                   uv_udp_set_source_membership(
-                       &wrap->handle, group.c_str(), iface, source.c_str(), membership));
+  return MakeInt32(
+      env,
+      uv_udp_set_source_membership(&wrap->handle, group.c_str(), iface, source.c_str(), membership));
 #else
   return MakeInt32(env, UV_ENOTSUP);
 #endif
@@ -947,22 +1051,22 @@ napi_value UdpDropSourceSpecificMembership(napi_env env, napi_callback_info info
 napi_value UdpConnectImpl(napi_env env, napi_callback_info info, bool ipv6) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
+  if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) return MakeInt32(env, UV_EBADF);
+
   std::string host = ValueToUtf8(env, argv[0]);
-  int32_t port = 0;
-  napi_get_value_int32(env, argv[1], &port);
+  uint32_t port = 0;
+  napi_get_value_uint32(env, argv[1], &port);
   if (ipv6) {
     sockaddr_in6 a6{};
-    int rc = uv_ip6_addr(host.c_str(), port, &a6);
+    int rc = uv_ip6_addr(host.c_str(), static_cast<int>(port), &a6);
     if (rc != 0) return MakeInt32(env, rc);
     return MakeInt32(env, uv_udp_connect(&wrap->handle, reinterpret_cast<const sockaddr*>(&a6)));
   }
   sockaddr_in a4{};
-  int rc = uv_ip4_addr(host.c_str(), port, &a4);
+  int rc = uv_ip4_addr(host.c_str(), static_cast<int>(port), &a4);
   if (rc != 0) return MakeInt32(env, rc);
   return MakeInt32(env, uv_udp_connect(&wrap->handle, reinterpret_cast<const sockaddr*>(&a4)));
 }
@@ -976,110 +1080,33 @@ napi_value UdpConnect6(napi_env env, napi_callback_info info) {
 }
 
 napi_value UdpDisconnect(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  if (wrap == nullptr) return MakeInt32(env, UV_EBADF);
   return MakeInt32(env, uv_udp_connect(&wrap->handle, nullptr));
 }
 
 napi_value UdpGetPeerName(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  sockaddr_storage ss{};
-  int len = sizeof(ss);
-  int rc = uv_udp_getpeername(&wrap->handle, reinterpret_cast<sockaddr*>(&ss), &len);
-  if (rc == 0) {
-    std::string ip;
-    int port = 0;
-    const char* fam = "IPv4";
-    if (ss.ss_family == AF_INET6) {
-      auto* a6 = reinterpret_cast<sockaddr_in6*>(&ss);
-      ip = FormatIPv6AddressWithScope(a6);
-      port = ntohs(a6->sin6_port);
-      fam = "IPv6";
-    } else {
-      char ip4[INET6_ADDRSTRLEN] = {0};
-      auto* a4 = reinterpret_cast<sockaddr_in*>(&ss);
-      uv_ip4_name(a4, ip4, sizeof(ip4));
-      ip = ip4;
-      port = ntohs(a4->sin_port);
-    }
-    napi_value ip_v = nullptr;
-    napi_value fam_v = nullptr;
-    napi_value port_v = nullptr;
-    napi_create_string_utf8(env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
-    napi_create_string_utf8(env, fam, NAPI_AUTO_LENGTH, &fam_v);
-    napi_create_int32(env, port, &port_v);
-    if (ip_v) napi_set_named_property(env, argv[0], "address", ip_v);
-    if (fam_v) napi_set_named_property(env, argv[0], "family", fam_v);
-    if (port_v) napi_set_named_property(env, argv[0], "port", port_v);
-  }
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
+  sockaddr_storage storage{};
+  int len = sizeof(storage);
+  const int rc = uv_udp_getpeername(&wrap->handle, reinterpret_cast<sockaddr*>(&storage), &len);
+  if (rc == 0 && argv[0] != nullptr) FillSockaddrObject(env, argv[0], storage);
   return MakeInt32(env, rc);
-}
-
-napi_value UdpBufferSize(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
-  UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (wrap == nullptr || argc < 2) {
-    napi_value undef = nullptr;
-    napi_get_undefined(env, &undef);
-    return undef;
-  }
-  int32_t size = 0;
-  napi_get_value_int32(env, argv[0], &size);
-  bool recv = false;
-  napi_get_value_bool(env, argv[1], &recv);
-  int value = size;
-  const char* syscall = recv ? "uv_recv_buffer_size" : "uv_send_buffer_size";
-  int rc = recv
-      ? uv_recv_buffer_size(reinterpret_cast<uv_handle_t*>(&wrap->handle), &value)
-      : uv_send_buffer_size(reinterpret_cast<uv_handle_t*>(&wrap->handle), &value);
-  if (rc != 0) {
-    if (argc > 2 && argv[2] != nullptr) {
-      napi_value errno_v = nullptr;
-      napi_create_int32(env, rc, &errno_v);
-      if (errno_v) napi_set_named_property(env, argv[2], "errno", errno_v);
-      const char* code = uv_err_name(rc);
-      napi_value code_v = nullptr;
-      napi_create_string_utf8(env, code ? code : "UV_ERROR", NAPI_AUTO_LENGTH, &code_v);
-      if (code_v) napi_set_named_property(env, argv[2], "code", code_v);
-      const char* msg = uv_strerror(rc);
-      napi_value msg_v = nullptr;
-      napi_create_string_utf8(env, msg ? msg : "buffer size error", NAPI_AUTO_LENGTH, &msg_v);
-      if (msg_v) napi_set_named_property(env, argv[2], "message", msg_v);
-      napi_value syscall_v = nullptr;
-      napi_create_string_utf8(env, syscall, NAPI_AUTO_LENGTH, &syscall_v);
-      if (syscall_v) napi_set_named_property(env, argv[2], "syscall", syscall_v);
-    }
-    napi_value undef = nullptr;
-    napi_get_undefined(env, &undef);
-    return undef;
-  }
-  return MakeInt32(env, value);
 }
 
 napi_value UdpGetSendQueueSize(napi_env env, napi_callback_info info) {
 #if UV_VERSION_MAJOR > 1 || (UV_VERSION_MAJOR == 1 && UV_VERSION_MINOR >= 19)
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  uint64_t value = wrap != nullptr ? uv_udp_get_send_queue_size(&wrap->handle) : 0;
+  GetThis(env, info, nullptr, nullptr, &wrap);
   napi_value out = nullptr;
-  napi_create_double(env, static_cast<double>(value), &out);
+  napi_create_double(env,
+                     static_cast<double>(wrap != nullptr ? uv_udp_get_send_queue_size(&wrap->handle) : 0),
+                     &out);
   return out;
 #else
   return MakeInt32(env, 0);
@@ -1088,14 +1115,12 @@ napi_value UdpGetSendQueueSize(napi_env env, napi_callback_info info) {
 
 napi_value UdpGetSendQueueCount(napi_env env, napi_callback_info info) {
 #if UV_VERSION_MAJOR > 1 || (UV_VERSION_MAJOR == 1 && UV_VERSION_MINOR >= 19)
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   UdpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  size_t value = wrap != nullptr ? uv_udp_get_send_queue_count(&wrap->handle) : 0;
+  GetThis(env, info, nullptr, nullptr, &wrap);
   napi_value out = nullptr;
-  napi_create_double(env, static_cast<double>(value), &out);
+  napi_create_double(env,
+                     static_cast<double>(wrap != nullptr ? uv_udp_get_send_queue_count(&wrap->handle) : 0),
+                     &out);
   return out;
 #else
   return MakeInt32(env, 0);
@@ -1128,18 +1153,41 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
       {"setBroadcast", nullptr, UdpSetBroadcast, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"setTTL", nullptr, UdpSetTTL, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"setMulticastTTL", nullptr, UdpSetMulticastTTL, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"setMulticastLoopback", nullptr, UdpSetMulticastLoopback, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"setMulticastInterface", nullptr, UdpSetMulticastInterface, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setMulticastLoopback",
+       nullptr,
+       UdpSetMulticastLoopback,
+       nullptr,
+       nullptr,
+       nullptr,
+       napi_default_method,
+       nullptr},
+      {"setMulticastInterface",
+       nullptr,
+       UdpSetMulticastInterface,
+       nullptr,
+       nullptr,
+       nullptr,
+       napi_default_method,
+       nullptr},
       {"addMembership", nullptr, UdpAddMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"dropMembership", nullptr, UdpDropMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"addSourceSpecificMembership", nullptr, UdpAddSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"dropSourceSpecificMembership", nullptr, UdpDropSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"setMulticastAll", nullptr, UdpSetMulticastAll, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"addSourceSpecificMembership",
+       nullptr,
+       UdpAddSourceSpecificMembership,
+       nullptr,
+       nullptr,
+       nullptr,
+       napi_default_method,
+       nullptr},
+      {"dropSourceSpecificMembership",
+       nullptr,
+       UdpDropSourceSpecificMembership,
+       nullptr,
+       nullptr,
+       nullptr,
+       napi_default_method,
+       nullptr},
       {"bufferSize", nullptr, UdpBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"setRecvBufferSize", nullptr, UdpSetRecvBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"setSendBufferSize", nullptr, UdpSetSendBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"getRecvBufferSize", nullptr, UdpGetRecvBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"getSendBufferSize", nullptr, UdpGetSendBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"connect", nullptr, UdpConnect, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"connect6", nullptr, UdpConnect6, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"disconnect", nullptr, UdpDisconnect, nullptr, nullptr, nullptr, napi_default_method, nullptr},
@@ -1149,8 +1197,16 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
       {"getAsyncId", nullptr, UdpGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"fd", nullptr, nullptr, UdpFdGetter, nullptr, nullptr, napi_default, nullptr},
       {"getSendQueueSize", nullptr, UdpGetSendQueueSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"getSendQueueCount", nullptr, UdpGetSendQueueCount, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getSendQueueCount",
+       nullptr,
+       UdpGetSendQueueCount,
+       nullptr,
+       nullptr,
+       nullptr,
+       napi_default_method,
+       nullptr},
   };
+
   napi_value udp_ctor = nullptr;
   if (napi_define_class(env,
                         "UDP",
@@ -1167,7 +1223,14 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
   napi_create_reference(env, udp_ctor, 1, &g_udp_ctor_ref);
 
   napi_value send_wrap_ctor = nullptr;
-  if (napi_define_class(env, "SendWrap", NAPI_AUTO_LENGTH, SendWrapCtor, nullptr, 0, nullptr, &send_wrap_ctor) != napi_ok ||
+  if (napi_define_class(env,
+                        "SendWrap",
+                        NAPI_AUTO_LENGTH,
+                        SendWrapCtor,
+                        nullptr,
+                        0,
+                        nullptr,
+                        &send_wrap_ctor) != napi_ok ||
       send_wrap_ctor == nullptr) {
     return nullptr;
   }
@@ -1175,6 +1238,7 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
   napi_value constants = nullptr;
   napi_create_object(env, &constants);
   SetNamedU32(env, constants, "UV_UDP_IPV6ONLY", UV_UDP_IPV6ONLY);
+  SetNamedU32(env, constants, "UV_UDP_REUSEADDR", UV_UDP_REUSEADDR);
   SetNamedU32(env, constants, "UV_UDP_REUSEPORT", UV_UDP_REUSEPORT);
 
   napi_set_named_property(env, binding, "UDP", udp_ctor);
@@ -1190,9 +1254,9 @@ napi_value UbiGetUdpWrapConstructor(napi_env env) {
 }
 
 uv_handle_t* UbiUdpWrapGetHandle(napi_env env, napi_value value) {
-  if (env == nullptr || value == nullptr) return nullptr;
-  void* raw = nullptr;
-  if (napi_unwrap(env, value, &raw) != napi_ok || raw == nullptr) return nullptr;
-  auto* wrap = static_cast<UdpWrap*>(raw);
-  return reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  UdpWrap* wrap = UnwrapUdpWrap(env, value, false);
+  if (wrap == nullptr) return nullptr;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  if (handle->data != wrap || handle->type != UV_UDP) return nullptr;
+  return handle;
 }
