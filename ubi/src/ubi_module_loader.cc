@@ -54,6 +54,9 @@ struct ModuleLoaderState {
   napi_ref cache_object_ref = nullptr;
   napi_ref primordials_ref = nullptr;
   napi_ref internal_binding_ref = nullptr;
+  napi_ref private_symbols_ref = nullptr;
+  napi_ref per_isolate_symbols_ref = nullptr;
+  napi_ref require_ref = nullptr;
   napi_ref native_builtins_binding_ref = nullptr;
   napi_ref internal_binding_loader_ref = nullptr;
   napi_ref require_builtin_loader_ref = nullptr;
@@ -740,6 +743,11 @@ static std::string GetBuiltinsDirForBootstrap() {
   return builtin_catalog::NodeLibRoot().string();
 }
 
+static bool IsPerContextBuiltinId(const std::string& id);
+static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state);
+static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state);
+static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state);
+
 static const std::vector<std::string>& CollectRuntimeBuiltinIds() {
   return builtin_catalog::AllBuiltinIds();
 }
@@ -775,9 +783,11 @@ static napi_value ReturnTrueCallback(napi_env env, napi_callback_info /*info*/) 
 static napi_value BuiltinsCompileFunctionCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, &data) != napi_ok || argc < 1 || argv[0] == nullptr) {
     return nullptr;
   }
+  auto* state = static_cast<ModuleLoaderState*>(data);
 
   const std::string id = ValueToUtf8(env, argv[0]);
   if (id.empty()) {
@@ -795,11 +805,22 @@ static napi_value BuiltinsCompileFunctionCallback(napi_env env, napi_callback_in
 
   const std::string source = ReadTextFile(resolved);
   std::string wrapped;
-  wrapped.reserve(source.size() + 160 + id.size());
-  wrapped += "(function(exports, require, module, process, internalBinding, primordials) {\n";
-  wrapped += source;
-  wrapped += "\n})\n//# sourceURL=node:";
-  wrapped += id;
+  const bool is_per_context = IsPerContextBuiltinId(id);
+  if (is_per_context) {
+    wrapped.reserve(source.size() + 280 + id.size());
+    wrapped += "(function(primordials, privateSymbols, perIsolateSymbols) {\n";
+    wrapped += "return function(exports, require, module, process, internalBinding, __ignoredPrimordials) {\n";
+    wrapped += source;
+    wrapped += "\n};\n";
+    wrapped += "})\n//# sourceURL=node:";
+    wrapped += id;
+  } else {
+    wrapped.reserve(source.size() + 160 + id.size());
+    wrapped += "(function(exports, require, module, process, internalBinding, primordials) {\n";
+    wrapped += source;
+    wrapped += "\n})\n//# sourceURL=node:";
+    wrapped += id;
+  }
 
   napi_value wrapped_script = nullptr;
   if (napi_create_string_utf8(env, wrapped.c_str(), wrapped.size(), &wrapped_script) != napi_ok ||
@@ -809,6 +830,24 @@ static napi_value BuiltinsCompileFunctionCallback(napi_env env, napi_callback_in
   napi_value compiled = nullptr;
   if (napi_run_script(env, wrapped_script, &compiled) != napi_ok || compiled == nullptr) {
     return nullptr;
+  }
+  if (is_per_context) {
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+      return nullptr;
+    }
+    napi_value primordials = GetStatePrimordials(env, state);
+    napi_value private_symbols = GetStatePrivateSymbols(env, state);
+    napi_value per_isolate_symbols = GetStatePerIsolateSymbols(env, state);
+    if (primordials == nullptr) napi_get_undefined(env, &primordials);
+    if (private_symbols == nullptr) napi_get_undefined(env, &private_symbols);
+    if (per_isolate_symbols == nullptr) napi_get_undefined(env, &per_isolate_symbols);
+    napi_value outer_args[3] = {primordials, private_symbols, per_isolate_symbols};
+    napi_value inner = nullptr;
+    if (napi_call_function(env, global, compiled, 3, outer_args, &inner) != napi_ok || inner == nullptr) {
+      return nullptr;
+    }
+    compiled = inner;
   }
   return compiled;
 }
@@ -994,6 +1033,44 @@ static napi_value CacheInternalBinding(ModuleLoaderState* state, napi_env env, c
   if (napi_create_reference(env, binding, 1, &ref) != napi_ok || ref == nullptr) return nullptr;
   state->internal_binding_cache[name] = ref;
   return binding;
+}
+
+static napi_value GetRefValue(napi_env env, napi_ref ref) {
+  if (ref == nullptr) return nullptr;
+  napi_value out = nullptr;
+  if (napi_get_reference_value(env, ref, &out) != napi_ok || out == nullptr) return nullptr;
+  return out;
+}
+
+static void ResetStateRef(napi_env env, napi_ref* slot, napi_value value) {
+  if (slot == nullptr) return;
+  if (*slot != nullptr) {
+    napi_delete_reference(env, *slot);
+    *slot = nullptr;
+  }
+  if (value == nullptr || IsUndefinedValue(env, value)) return;
+  if (napi_create_reference(env, value, 1, slot) != napi_ok) {
+    *slot = nullptr;
+  }
+}
+
+static bool IsPerContextBuiltinId(const std::string& id) {
+  return id.rfind("internal/per_context/", 0) == 0;
+}
+
+static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->primordials_ref);
+}
+
+static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->private_symbols_ref);
+}
+
+static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->per_isolate_symbols_ref);
 }
 
 using BindingFactory = napi_value (*)(napi_env env);
@@ -2448,7 +2525,7 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
 
   napi_value compile_fn = nullptr;
   if (napi_create_function(
-          env, "compileFunction", NAPI_AUTO_LENGTH, BuiltinsCompileFunctionCallback, nullptr, &compile_fn) !=
+          env, "compileFunction", NAPI_AUTO_LENGTH, BuiltinsCompileFunctionCallback, state, &compile_fn) !=
           napi_ok ||
       compile_fn == nullptr ||
       napi_set_named_property(env, binding, "compileFunction", compile_fn) != napi_ok) {
@@ -3563,11 +3640,18 @@ bool EvaluateJsModule(napi_env env,
 
   // Node-aligned: compile the wrapper as a function, then call it from C++ with (internalBinding, primordials)
   // as arguments (realm->primordials() in Node). No JS expression like globalThis.primordials at call time.
-  const std::string wrapped_source =
-      "(function(internalBinding, primordials) {"
-      "return function(exports, require, module, __filename, __dirname) {\n" + source +
-      "\n//# sourceURL=" + source_url + "\n};"
-      "})";
+  std::string builtin_id;
+  const bool is_per_context =
+      TryGetBuiltinIdFromResolvedPath(resolved_path, &builtin_id) && IsPerContextBuiltinId(builtin_id);
+  const std::string wrapped_source = is_per_context
+                                         ? "(function(primordials, privateSymbols, perIsolateSymbols) {"
+                                           "return function(exports, require, module, __filename, __dirname) {\n" +
+                                               source + "\n//# sourceURL=" + source_url + "\n};"
+                                               "})"
+                                         : "(function(internalBinding, primordials) {"
+                                           "return function(exports, require, module, __filename, __dirname) {\n" +
+                                               source + "\n//# sourceURL=" + source_url + "\n};"
+                                               "})";
   napi_value script_source = nullptr;
   if (napi_create_string_utf8(env, wrapped_source.c_str(), NAPI_AUTO_LENGTH, &script_source) != napi_ok ||
       script_source == nullptr) {
@@ -3585,29 +3669,40 @@ bool EvaluateJsModule(napi_env env,
   }
 
   napi_value internal_binding_val = nullptr;
-  napi_value primordials_val = nullptr;
-  if (state != nullptr && state->internal_binding_ref != nullptr) {
-    napi_get_reference_value(env, state->internal_binding_ref, &internal_binding_val);
-  }
-  if (internal_binding_val == nullptr) {
-    internal_binding_val = GetGlobalInternalBindingFunction(env, global);
-  }
-  if (state != nullptr && state->primordials_ref != nullptr) {
-    napi_get_reference_value(env, state->primordials_ref, &primordials_val);
-  }
+  napi_value primordials_val = GetStatePrimordials(env, state);
   if (primordials_val == nullptr) {
     napi_get_named_property(env, global, "primordials", &primordials_val);
   }
   if (primordials_val == nullptr) {
     napi_get_undefined(env, &primordials_val);
   }
-
-  napi_value wrapper_args[2] = {internal_binding_val != nullptr ? internal_binding_val : nullptr, primordials_val};
-  if (wrapper_args[0] == nullptr) {
-    napi_get_undefined(env, &wrapper_args[0]);
+  std::vector<napi_value> wrapper_args;
+  if (is_per_context) {
+    napi_value private_symbols = GetStatePrivateSymbols(env, state);
+    napi_value per_isolate_symbols = GetStatePerIsolateSymbols(env, state);
+    if (private_symbols == nullptr) napi_get_undefined(env, &private_symbols);
+    if (per_isolate_symbols == nullptr) napi_get_undefined(env, &per_isolate_symbols);
+    wrapper_args = {primordials_val, private_symbols, per_isolate_symbols};
+  } else {
+    if (state != nullptr && state->internal_binding_ref != nullptr) {
+      napi_get_reference_value(env, state->internal_binding_ref, &internal_binding_val);
+    }
+    if (internal_binding_val == nullptr) {
+      internal_binding_val = GetGlobalInternalBindingFunction(env, global);
+    }
+    if (internal_binding_val == nullptr) {
+      napi_get_undefined(env, &internal_binding_val);
+    }
+    wrapper_args = {internal_binding_val, primordials_val};
   }
   napi_value inner_fn = nullptr;
-  if (napi_call_function(env, global, outer_fn, 2, wrapper_args, &inner_fn) != napi_ok || inner_fn == nullptr) {
+  if (napi_call_function(env,
+                         global,
+                         outer_fn,
+                         wrapper_args.size(),
+                         wrapper_args.data(),
+                         &inner_fn) != napi_ok ||
+      inner_fn == nullptr) {
     return false;  // Preserve JS exception.
   }
 
@@ -3935,28 +4030,35 @@ void UbiSetPrimordials(napi_env env, napi_value primordials) {
   if (env == nullptr || primordials == nullptr) return;
   auto it = g_loader_states.find(env);
   if (it == g_loader_states.end()) return;
-  ModuleLoaderState& state = it->second;
-  if (state.primordials_ref != nullptr) {
-    napi_delete_reference(env, state.primordials_ref);
-    state.primordials_ref = nullptr;
-  }
-  if (napi_create_reference(env, primordials, 1, &state.primordials_ref) != napi_ok) {
-    state.primordials_ref = nullptr;
-  }
+  ResetStateRef(env, &it->second.primordials_ref, primordials);
 }
 
 void UbiSetInternalBinding(napi_env env, napi_value internal_binding) {
   if (env == nullptr || internal_binding == nullptr) return;
   auto it = g_loader_states.find(env);
   if (it == g_loader_states.end()) return;
-  ModuleLoaderState& state = it->second;
-  if (state.internal_binding_ref != nullptr) {
-    napi_delete_reference(env, state.internal_binding_ref);
-    state.internal_binding_ref = nullptr;
-  }
-  if (napi_create_reference(env, internal_binding, 1, &state.internal_binding_ref) != napi_ok) {
-    state.internal_binding_ref = nullptr;
-  }
+  ResetStateRef(env, &it->second.internal_binding_ref, internal_binding);
+}
+
+void UbiSetPrivateSymbols(napi_env env, napi_value private_symbols) {
+  if (env == nullptr || private_symbols == nullptr) return;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return;
+  ResetStateRef(env, &it->second.private_symbols_ref, private_symbols);
+}
+
+void UbiSetPerIsolateSymbols(napi_env env, napi_value per_isolate_symbols) {
+  if (env == nullptr || per_isolate_symbols == nullptr) return;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return;
+  ResetStateRef(env, &it->second.per_isolate_symbols_ref, per_isolate_symbols);
+}
+
+napi_value UbiGetRequireFunction(napi_env env) {
+  if (env == nullptr) return nullptr;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return nullptr;
+  return GetRefValue(env, it->second.require_ref);
 }
 
 napi_value UbiGetInternalBinding(napi_env env) {
@@ -3984,8 +4086,9 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
   }
   EnsureModuleLoaderCleanupHook(env);
 
+  const bool is_eval_entry = entry_script_path == nullptr || entry_script_path[0] == '\0';
   fs::path entry_path;
-  if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
+  if (!is_eval_entry) {
     entry_path = fs::absolute(fs::path(entry_script_path)).lexically_normal();
   } else {
     entry_path = fs::current_path() / "<eval>";
@@ -4028,6 +4131,18 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
     napi_delete_reference(env, state.internal_binding_ref);
     state.internal_binding_ref = nullptr;
   }
+  if (state.private_symbols_ref != nullptr) {
+    napi_delete_reference(env, state.private_symbols_ref);
+    state.private_symbols_ref = nullptr;
+  }
+  if (state.per_isolate_symbols_ref != nullptr) {
+    napi_delete_reference(env, state.per_isolate_symbols_ref);
+    state.per_isolate_symbols_ref = nullptr;
+  }
+  if (state.require_ref != nullptr) {
+    napi_delete_reference(env, state.require_ref);
+    state.require_ref = nullptr;
+  }
   if (state.native_builtins_binding_ref != nullptr) {
     napi_delete_reference(env, state.native_builtins_binding_ref);
     state.native_builtins_binding_ref = nullptr;
@@ -4059,18 +4174,23 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
     return napi_generic_failure;
   }
 
-  napi_value filename_value = nullptr;
-  napi_value dirname_value = nullptr;
-  if (napi_create_string_utf8(env, entry_path.string().c_str(), NAPI_AUTO_LENGTH, &filename_value) != napi_ok ||
-      napi_create_string_utf8(env, state.entry_dir.c_str(), NAPI_AUTO_LENGTH, &dirname_value) != napi_ok) {
+  if (napi_set_named_property(env, require_fn, "cache", cache_obj) != napi_ok) {
     return napi_generic_failure;
   }
+  ResetStateRef(env, &state.require_ref, require_fn);
 
-  if (napi_set_named_property(env, global, "require", require_fn) != napi_ok ||
-      napi_set_named_property(env, require_fn, "cache", cache_obj) != napi_ok ||
-      napi_set_named_property(env, global, "__filename", filename_value) != napi_ok ||
-      napi_set_named_property(env, global, "__dirname", dirname_value) != napi_ok) {
-    return napi_generic_failure;
+  if (is_eval_entry) {
+    napi_value filename_value = nullptr;
+    napi_value dirname_value = nullptr;
+    if (napi_create_string_utf8(env, "[eval]", NAPI_AUTO_LENGTH, &filename_value) != napi_ok ||
+        napi_create_string_utf8(env, ".", NAPI_AUTO_LENGTH, &dirname_value) != napi_ok) {
+      return napi_generic_failure;
+    }
+    if (napi_set_named_property(env, global, "require", require_fn) != napi_ok ||
+        napi_set_named_property(env, global, "__filename", filename_value) != napi_ok ||
+        napi_set_named_property(env, global, "__dirname", dirname_value) != napi_ok) {
+      return napi_generic_failure;
+    }
   }
 
   napi_value native_get_internal_binding_fn = nullptr;

@@ -25,6 +25,7 @@ int UbiRunScriptFileWithLoop(napi_env env,
                                bool keep_event_loop_alive);
 void UbiSetScriptArgv(const std::vector<std::string>& script_argv);
 void UbiSetExecArgv(const std::vector<std::string>& exec_argv);
+bool UbiExecArgvHasFlag(const char* flag);
 
 enum UbiMakeCallbackFlags : int {
   kUbiMakeCallbackNone = 0,

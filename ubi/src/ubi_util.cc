@@ -1,6 +1,7 @@
 #include "ubi_util.h"
 
 #include "unofficial_napi.h"
+#include "ubi_module_loader.h"
 
 #include <uv.h>
 
@@ -312,7 +313,10 @@ napi_value LazyPropertyGetter(napi_env env, napi_callback_info info) {
   }
 
   auto* lazy = static_cast<LazyPropertyData*>(data);
-  napi_value require_fn = GetGlobalNamed(env, "require");
+  napi_value require_fn = UbiGetRequireFunction(env);
+  if (!IsFunction(env, require_fn)) {
+    require_fn = GetGlobalNamed(env, "require");
+  }
   if (!IsFunction(env, require_fn)) return Undefined(env);
 
   napi_value id = nullptr;
@@ -346,6 +350,46 @@ napi_value LazyPropertyGetter(napi_env env, napi_callback_info info) {
   }
 
   return value;
+}
+
+void TrySetLazyGetterName(napi_env env, napi_value target, const std::string& key) {
+  if (!IsObjectLike(env, target) || key.empty()) return;
+  napi_value object_ctor = GetGlobalNamed(env, "Object");
+  napi_value get_own_property_descriptor = GetNamedProperty(env, object_ctor, "getOwnPropertyDescriptor");
+  napi_value define_property = GetNamedProperty(env, object_ctor, "defineProperty");
+  if (!IsFunction(env, get_own_property_descriptor) || !IsFunction(env, define_property)) return;
+
+  napi_value key_value = nullptr;
+  if (napi_create_string_utf8(env, key.c_str(), key.size(), &key_value) != napi_ok || key_value == nullptr) return;
+
+  napi_value get_desc_argv[2] = {target, key_value};
+  napi_value desc = CallFunction(env, object_ctor, get_own_property_descriptor, 2, get_desc_argv);
+  if (!IsObjectLike(env, desc)) return;
+
+  napi_value getter = GetNamedProperty(env, desc, "get");
+  if (!IsFunction(env, getter)) return;
+
+  napi_value name_value = nullptr;
+  if (napi_create_string_utf8(env, ("get " + key).c_str(), NAPI_AUTO_LENGTH, &name_value) != napi_ok ||
+      name_value == nullptr) {
+    return;
+  }
+
+  napi_value name_descriptor = nullptr;
+  if (napi_create_object(env, &name_descriptor) != napi_ok || name_descriptor == nullptr) return;
+  if (napi_set_named_property(env, name_descriptor, "value", name_value) != napi_ok) return;
+
+  napi_value name_key = nullptr;
+  if (napi_create_string_utf8(env, "name", NAPI_AUTO_LENGTH, &name_key) != napi_ok || name_key == nullptr) return;
+
+  napi_value define_argv[3] = {getter, name_key, name_descriptor};
+  if (CallFunction(env, object_ctor, define_property, 3, define_argv) == nullptr) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value ignored = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored);
+    }
+  }
 }
 
 napi_value DefineLazyPropertiesCallback(napi_env env, napi_callback_info info) {
@@ -399,6 +443,7 @@ napi_value DefineLazyPropertiesCallback(napi_env env, napi_callback_info info) {
         .data = raw_data,
     };
     napi_define_properties(env, target, 1, &descriptor);
+    TrySetLazyGetterName(env, target, key);
   }
 
   return Undefined(env);

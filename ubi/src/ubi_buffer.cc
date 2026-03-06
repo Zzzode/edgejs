@@ -6,10 +6,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ubi_encoding_ids.h"
+#include "ubi_runtime.h"
 #include "simdutf.h"
 
 namespace {
@@ -27,6 +30,94 @@ constexpr double kUbiUnsafeArrayBufferAllocCap = 2147483647.0;
 constexpr size_t kUbiStringMaxLength = 0x1fffffe8;
 
 std::string GetUtf8String(napi_env env, napi_value value);
+
+struct BufferBindingState {
+  napi_ref zero_fill_toggle_ref = nullptr;
+  uint32_t* zero_fill_toggle_data = nullptr;
+  napi_ref buffer_prototype_ref = nullptr;
+  bool cleanup_hook_registered = false;
+};
+
+std::unordered_map<napi_env, BufferBindingState> g_buffer_states;
+
+void CleanupBufferBindingState(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  auto it = g_buffer_states.find(env);
+  if (it == g_buffer_states.end()) return;
+  if (it->second.zero_fill_toggle_ref != nullptr) {
+    napi_delete_reference(env, it->second.zero_fill_toggle_ref);
+    it->second.zero_fill_toggle_ref = nullptr;
+  }
+  if (it->second.buffer_prototype_ref != nullptr) {
+    napi_delete_reference(env, it->second.buffer_prototype_ref);
+    it->second.buffer_prototype_ref = nullptr;
+  }
+  g_buffer_states.erase(it);
+}
+
+BufferBindingState& EnsureBufferBindingState(napi_env env) {
+  auto [it, inserted] = g_buffer_states.emplace(env, BufferBindingState{});
+  if ((inserted || !it->second.cleanup_hook_registered) &&
+      napi_add_env_cleanup_hook(env, CleanupBufferBindingState, env) == napi_ok) {
+    it->second.cleanup_hook_registered = true;
+  }
+  return it->second;
+}
+
+bool DefaultZeroFillBuffersEnabled() {
+  return UbiExecArgvHasFlag("--zero-fill-buffers");
+}
+
+napi_value MakeUndefined(napi_env env) {
+  napi_value out = nullptr;
+  napi_get_undefined(env, &out);
+  return out;
+}
+
+napi_value GetZeroFillToggleValue(napi_env env) {
+  auto& state = EnsureBufferBindingState(env);
+  if (state.zero_fill_toggle_ref != nullptr) {
+    napi_value current = nullptr;
+    if (napi_get_reference_value(env, state.zero_fill_toggle_ref, &current) == napi_ok && current != nullptr) {
+      return current;
+    }
+    napi_delete_reference(env, state.zero_fill_toggle_ref);
+    state.zero_fill_toggle_ref = nullptr;
+    state.zero_fill_toggle_data = nullptr;
+  }
+
+  void* data = nullptr;
+  napi_value ab = nullptr;
+  if (napi_create_arraybuffer(env, sizeof(uint32_t), &data, &ab) != napi_ok || ab == nullptr || data == nullptr) {
+    return nullptr;
+  }
+  state.zero_fill_toggle_data = static_cast<uint32_t*>(data);
+  state.zero_fill_toggle_data[0] = DefaultZeroFillBuffersEnabled() ? 1U : 0U;
+
+  napi_value ta = nullptr;
+  if (napi_create_typedarray(env, napi_uint32_array, 1, ab, 0, &ta) != napi_ok || ta == nullptr) {
+    state.zero_fill_toggle_data = nullptr;
+    return nullptr;
+  }
+  if (napi_create_reference(env, ta, 1, &state.zero_fill_toggle_ref) != napi_ok) {
+    state.zero_fill_toggle_ref = nullptr;
+    state.zero_fill_toggle_data = nullptr;
+    return nullptr;
+  }
+  return ta;
+}
+
+bool ShouldZeroFillBuffers(napi_env env) {
+  auto& state = EnsureBufferBindingState(env);
+  if (state.zero_fill_toggle_data == nullptr) {
+    (void)GetZeroFillToggleValue(env);
+  }
+  return state.zero_fill_toggle_data != nullptr ? (state.zero_fill_toggle_data[0] != 0) : DefaultZeroFillBuffersEnabled();
+}
+
+void ExternalArrayBufferFinalize(napi_env /*env*/, void* data, void* /*hint*/) {
+  free(data);
+}
 
 int32_t ParseEncodingArg(napi_env env, napi_value value, int32_t fallback) {
   if (value == nullptr) return fallback;
@@ -93,74 +184,115 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, uint8_t** data, size_
   }
 
   bool is_typed = false;
-  if (napi_is_typedarray(env, value, &is_typed) != napi_ok || !is_typed) return false;
-  napi_typedarray_type type = napi_uint8_array;
-  size_t element_len = 0;
-  void* ptr = nullptr;
-  napi_value arraybuffer = nullptr;
-  size_t byte_offset = 0;
-  if (napi_get_typedarray_info(
-          env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok) {
-    return false;
-  }
+  if (napi_is_typedarray(env, value, &is_typed) == napi_ok && is_typed) {
+    napi_typedarray_type type = napi_uint8_array;
+    size_t element_len = 0;
+    void* ptr = nullptr;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_typedarray_info(
+            env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok) {
+      return false;
+    }
 
-  size_t bytes_per_element = 1;
-  switch (type) {
-    case napi_int16_array:
-    case napi_uint16_array:
-    case napi_float16_array:
-      bytes_per_element = 2;
-      break;
-    case napi_int32_array:
-    case napi_uint32_array:
-    case napi_float32_array:
-      bytes_per_element = 4;
-      break;
-    case napi_float64_array:
-    case napi_bigint64_array:
-    case napi_biguint64_array:
-      bytes_per_element = 8;
-      break;
-    default:
-      bytes_per_element = 1;
-      break;
-  }
-  *len = element_len * bytes_per_element;
-  if (*len == 0) {
-    *data = ZeroLengthDataSentinel();
+    size_t bytes_per_element = 1;
+    switch (type) {
+      case napi_int16_array:
+      case napi_uint16_array:
+      case napi_float16_array:
+        bytes_per_element = 2;
+        break;
+      case napi_int32_array:
+      case napi_uint32_array:
+      case napi_float32_array:
+        bytes_per_element = 4;
+        break;
+      case napi_float64_array:
+      case napi_bigint64_array:
+      case napi_biguint64_array:
+        bytes_per_element = 8;
+        break;
+      default:
+        bytes_per_element = 1;
+        break;
+    }
+    *len = element_len * bytes_per_element;
+    if (*len == 0) {
+      *data = ZeroLengthDataSentinel();
+      return true;
+    }
+
+    void* ab_data = nullptr;
+    size_t ab_len = 0;
+    if (arraybuffer != nullptr &&
+        napi_get_arraybuffer_info(env, arraybuffer, &ab_data, &ab_len) == napi_ok &&
+        ab_data != nullptr &&
+        byte_offset <= ab_len) {
+      *data = static_cast<uint8_t*>(ab_data) + byte_offset;
+    } else if (ptr != nullptr) {
+      *data = static_cast<uint8_t*>(ptr);
+    } else {
+      return false;
+    }
     return true;
   }
 
-  void* ab_data = nullptr;
-  size_t ab_len = 0;
-  if (arraybuffer != nullptr &&
-      napi_get_arraybuffer_info(env, arraybuffer, &ab_data, &ab_len) == napi_ok &&
-      ab_data != nullptr &&
-      byte_offset <= ab_len) {
-    *data = static_cast<uint8_t*>(ab_data) + byte_offset;
-  } else if (ptr != nullptr) {
-    *data = static_cast<uint8_t*>(ptr);
-  } else {
-    return false;
+  bool is_dataview = false;
+  if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) {
+    void* ptr = nullptr;
+    size_t byte_len = 0;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_dataview_info(env, value, &byte_len, &ptr, &arraybuffer, &byte_offset) != napi_ok) {
+      return false;
+    }
+    if (byte_len == 0) {
+      *data = ZeroLengthDataSentinel();
+      *len = 0;
+      return true;
+    }
+    if (ptr != nullptr) {
+      *data = static_cast<uint8_t*>(ptr);
+      *len = byte_len;
+      return true;
+    }
+    void* ab_data = nullptr;
+    size_t ab_len = 0;
+    if (arraybuffer != nullptr &&
+        napi_get_arraybuffer_info(env, arraybuffer, &ab_data, &ab_len) == napi_ok &&
+        ab_data != nullptr &&
+        byte_offset <= ab_len) {
+      *data = static_cast<uint8_t*>(ab_data) + byte_offset;
+      *len = byte_len;
+      return true;
+    }
   }
-  return true;
+
+  return false;
 }
 
 bool ExtractArrayBufferParts(napi_env env, napi_value value, uint8_t** data, size_t* len) {
   if (value == nullptr || data == nullptr || len == nullptr) return false;
 
   bool is_ab = false;
+  bool is_typed = false;
+  bool is_dataview = false;
+  bool is_buffer = false;
   if (napi_is_arraybuffer(env, value, &is_ab) == napi_ok && is_ab) {
-    void* ptr = nullptr;
-    size_t byte_len = 0;
-    if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) != napi_ok) return false;
-    if (ptr == nullptr && byte_len != 0) return false;
-    *data = (ptr != nullptr) ? static_cast<uint8_t*>(ptr) : ZeroLengthDataSentinel();
-    *len = byte_len;
-    return true;
+    // continue below
+  } else {
+    if (napi_is_typedarray(env, value, &is_typed) == napi_ok && is_typed) return false;
+    if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) return false;
+    if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) return false;
   }
 
-  return false;
+  void* ptr = nullptr;
+  size_t byte_len = 0;
+  if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) != napi_ok) return false;
+  if (ptr == nullptr && byte_len != 0) return false;
+  *data = (ptr != nullptr) ? static_cast<uint8_t*>(ptr) : ZeroLengthDataSentinel();
+  *len = byte_len;
+  return true;
 }
 
 bool IsValueTrackedDetachedArrayBuffer(napi_env env, napi_value value) {
@@ -245,16 +377,7 @@ bool ExtractValidationBytesOrThrow(napi_env env, napi_value value, uint8_t** dat
       napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
       return false;
     }
-    void* ptr = nullptr;
-    size_t byte_len = 0;
-    if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) != napi_ok) return false;
-    if (ptr == nullptr && byte_len != 0) {
-      napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
-      return false;
-    }
-    *data = static_cast<uint8_t*>(ptr);
-    *len = byte_len;
-    return true;
+    return ExtractArrayBufferParts(env, value, data, len);
   }
 
   bool is_typed = false;
@@ -270,9 +393,32 @@ bool ExtractValidationBytesOrThrow(napi_env env, napi_value value, uint8_t** dat
       napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
       return false;
     }
+    return ExtractBytesFromValue(env, value, data, len);
   }
 
-  return ExtractBytesFromValue(env, value, data, len);
+  bool is_dataview = false;
+  if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) {
+    void* ptr = nullptr;
+    size_t byte_len = 0;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_dataview_info(env, value, &byte_len, &ptr, &arraybuffer, &byte_offset) == napi_ok &&
+        arraybuffer != nullptr &&
+        IsArrayBufferDetached(env, arraybuffer)) {
+      napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
+      return false;
+    }
+    return ExtractBytesFromValue(env, value, data, len);
+  }
+
+  if (ExtractArrayBufferParts(env, value, data, len)) {
+    return true;
+  }
+
+  napi_throw_type_error(env,
+                        "ERR_INVALID_ARG_TYPE",
+                        "The \"input\" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.");
+  return false;
 }
 
 std::string GetUtf8String(napi_env env, napi_value value) {
@@ -295,6 +441,17 @@ napi_value MakeInt32(napi_env env, int32_t value) {
 napi_value MakeStringUtf8(napi_env env, const std::string& s) {
   napi_value out = nullptr;
   napi_create_string_utf8(env, s.c_str(), s.size(), &out);
+  return out;
+}
+
+napi_value MakeLatin1String(napi_env env, const uint8_t* data, size_t len) {
+  if (len == 0) return MakeStringUtf8(env, "");
+  std::vector<char16_t> utf16(len);
+  for (size_t i = 0; i < len; ++i) {
+    utf16[i] = static_cast<char16_t>(data[i]);
+  }
+  napi_value out = nullptr;
+  napi_create_string_utf16(env, utf16.data(), utf16.size(), &out);
   return out;
 }
 
@@ -532,31 +689,28 @@ napi_value BindingFill(napi_env env, napi_callback_info info) {
   int32_t end = 0;
   GetInt32(env, argv[2], &start);
   GetInt32(env, argv[3], &end);
-  if (start < 0 || end < 0 || start > end || end > static_cast<int32_t>(dst_len)) {
-    napi_throw_error(env, "ERR_OUT_OF_RANGE", "The value is out of range");
-    return nullptr;
-  }
+  if (start < 0 || end < 0 || start > end || end > static_cast<int32_t>(dst_len)) return MakeInt32(env, -2);
   const size_t fill_len = static_cast<size_t>(end - start);
-  if (fill_len == 0) return MakeInt32(env, 0);
+  if (fill_len == 0) return MakeUndefined(env);
 
   napi_valuetype value_type = napi_undefined;
   napi_typeof(env, argv[1], &value_type);
   if (value_type == napi_null || value_type == napi_undefined) {
     std::memset(dst + start, 0, fill_len);
-    return MakeInt32(env, static_cast<int32_t>(fill_len));
+    return MakeUndefined(env);
   }
   if (value_type == napi_number) {
     int32_t n = 0;
     napi_get_value_int32(env, argv[1], &n);
     std::memset(dst + start, static_cast<uint8_t>(n & 0xff), fill_len);
-    return MakeInt32(env, static_cast<int32_t>(fill_len));
+    return MakeUndefined(env);
   }
 
   std::vector<uint8_t> bytes;
   bool from_buffer_source = false;
   if (value_type == napi_string) {
     const std::string raw = GetUtf8String(env, argv[1]);
-    if (raw.empty()) return MakeInt32(env, 0);
+    if (raw.empty()) return MakeUndefined(env);
     int32_t enc = kEncUtf8;
     if (argc >= 5) enc = ParseEncodingArg(env, argv[4], kEncUtf8);
     if (!EncodeStringToBytes(env, argv[1], enc, &bytes)) return MakeInt32(env, -1);
@@ -572,7 +726,7 @@ napi_value BindingFill(napi_env env, napi_callback_info info) {
         int32_t n = 0;
         if (std::isfinite(d)) n = static_cast<int32_t>(d);
         std::memset(dst + start, static_cast<uint8_t>(n & 0xff), fill_len);
-        return MakeInt32(env, static_cast<int32_t>(fill_len));
+        return MakeUndefined(env);
       }
       return MakeInt32(env, -1);
     }
@@ -582,12 +736,12 @@ napi_value BindingFill(napi_env env, napi_callback_info info) {
   if (bytes.empty()) {
     if (value_type == napi_string) return MakeInt32(env, -1);
     if (from_buffer_source) return MakeInt32(env, -1);
-    return MakeInt32(env, 0);
+    return MakeUndefined(env);
   }
   for (size_t i = 0; i < fill_len; i++) {
     dst[start + i] = bytes[i % bytes.size()];
   }
-  return MakeInt32(env, static_cast<int32_t>(fill_len));
+  return MakeUndefined(env);
 }
 
 napi_value BindingIsAscii(napi_env env, napi_callback_info info) {
@@ -956,7 +1110,7 @@ napi_value BindingCreateUnsafeArrayBuffer(napi_env env, napi_callback_info info)
   if (napi_get_value_double(env, argv[0], &size_double) != napi_ok ||
       !std::isfinite(size_double) ||
       size_double < 0 ||
-      size_double > 9007199254740991.0) {
+      size_double > std::min(kUbiBufferMaxLength, static_cast<double>(std::numeric_limits<size_t>::max()))) {
     napi_throw_range_error(env, "ERR_OUT_OF_RANGE", "The value is out of range");
     return nullptr;
   }
@@ -966,9 +1120,25 @@ napi_value BindingCreateUnsafeArrayBuffer(napi_env env, napi_callback_info info)
   }
 
   const size_t size = static_cast<size_t>(std::trunc(size_double));
+  if (size == 0) {
+    napi_value ab = nullptr;
+    void* data = nullptr;
+    if (napi_create_arraybuffer(env, 0, &data, &ab) != napi_ok || ab == nullptr) {
+      napi_throw_error(env, "ERR_MEMORY_ALLOCATION_FAILED", "Array buffer allocation failed");
+      return nullptr;
+    }
+    return ab;
+  }
+
+  void* data = ShouldZeroFillBuffers(env) ? std::calloc(size, 1) : std::malloc(size);
+  if (data == nullptr) {
+    napi_throw_error(env, "ERR_MEMORY_ALLOCATION_FAILED", "Array buffer allocation failed");
+    return nullptr;
+  }
   napi_value ab = nullptr;
-  void* data = nullptr;
-  if (napi_create_arraybuffer(env, size, &data, &ab) != napi_ok || ab == nullptr) {
+  if (napi_create_external_arraybuffer(env, data, size, ExternalArrayBufferFinalize, nullptr, &ab) != napi_ok ||
+      ab == nullptr) {
+    std::free(data);
     napi_throw_error(env, "ERR_MEMORY_ALLOCATION_FAILED", "Array buffer allocation failed");
     return nullptr;
   }
@@ -984,9 +1154,15 @@ napi_value BindingSetBufferPrototype(napi_env env, napi_callback_info info) {
     napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "The \"prototype\" argument must be an object");
     return nullptr;
   }
-  napi_value undef = nullptr;
-  napi_get_undefined(env, &undef);
-  return undef;
+  auto& state = EnsureBufferBindingState(env);
+  if (state.buffer_prototype_ref != nullptr) {
+    napi_delete_reference(env, state.buffer_prototype_ref);
+    state.buffer_prototype_ref = nullptr;
+  }
+  if (napi_create_reference(env, argv[0], 1, &state.buffer_prototype_ref) != napi_ok) {
+    return nullptr;
+  }
+  return MakeUndefined(env);
 }
 
 napi_value BindingCopyArrayBuffer(napi_env env, napi_callback_info info) {
@@ -1032,23 +1208,61 @@ napi_value BindingAtob(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
-  std::vector<uint8_t> out;
-  DecodeBase64(GetUtf8String(env, argv[0]), false, &out);
-  std::string s(out.size(), '\0');
-  for (size_t i = 0; i < out.size(); i++) s[i] = static_cast<char>(out[i]);
-  return MakeStringUtf8(env, s);
+  napi_value input = nullptr;
+  if (napi_coerce_to_string(env, argv[0], &input) != napi_ok || input == nullptr) return nullptr;
+  size_t utf16_len = 0;
+  if (napi_get_value_string_utf16(env, input, nullptr, 0, &utf16_len) != napi_ok) return nullptr;
+  std::vector<char16_t> utf16(utf16_len + 1, 0);
+  size_t copied = 0;
+  if (napi_get_value_string_utf16(env, input, utf16.data(), utf16.size(), &copied) != napi_ok) return nullptr;
+
+  const size_t max_len =
+      simdutf::maximal_binary_length_from_base64(reinterpret_cast<const char16_t*>(utf16.data()), copied);
+  std::vector<char> out(max_len);
+  simdutf::result result =
+      simdutf::base64_to_binary(reinterpret_cast<const char16_t*>(utf16.data()), copied, out.data());
+  if (result.error == simdutf::error_code::SUCCESS) {
+    return MakeLatin1String(env, reinterpret_cast<const uint8_t*>(out.data()), result.count);
+  }
+
+  int32_t error_code = -3;
+  if (result.error == simdutf::error_code::INVALID_BASE64_CHARACTER) {
+    error_code = -2;
+  } else if (result.error == simdutf::error_code::BASE64_INPUT_REMAINDER) {
+    error_code = -1;
+  }
+  return MakeInt32(env, error_code);
 }
 
 napi_value BindingBtoa(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
-  std::string input = GetUtf8String(env, argv[0]);
-  const size_t out_len = simdutf::base64_length_from_binary(input.size());
+  napi_value input_value = nullptr;
+  if (napi_coerce_to_string(env, argv[0], &input_value) != napi_ok || input_value == nullptr) return nullptr;
+  size_t utf16_len = 0;
+  if (napi_get_value_string_utf16(env, input_value, nullptr, 0, &utf16_len) != napi_ok) return nullptr;
+  std::vector<char16_t> utf16(utf16_len + 1, 0);
+  size_t copied = 0;
+  if (napi_get_value_string_utf16(env, input_value, utf16.data(), utf16.size(), &copied) != napi_ok) return nullptr;
+  std::string latin1;
+  latin1.reserve(copied);
+  for (size_t i = 0; i < copied; ++i) {
+    if (utf16[i] > 0xff) {
+      return MakeInt32(env, -1);
+    }
+    latin1.push_back(static_cast<char>(utf16[i] & 0xff));
+  }
+  const size_t out_len = simdutf::base64_length_from_binary(latin1.size());
   std::string out(out_len, '\0');
-  const size_t written = simdutf::binary_to_base64(input.data(), input.size(), out.data());
+  const size_t written = simdutf::binary_to_base64(latin1.data(), latin1.size(), out.data());
   out.resize(written);
   return MakeStringUtf8(env, out);
+}
+
+napi_value BindingGetZeroFillToggle(napi_env env, napi_callback_info /*info*/) {
+  napi_value toggle = GetZeroFillToggleValue(env);
+  return toggle != nullptr ? toggle : MakeUndefined(env);
 }
 
 void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
@@ -1094,6 +1308,7 @@ napi_value UbiInstallBufferBinding(napi_env env) {
   SetMethod(env, binding, "atob", BindingAtob);
   SetMethod(env, binding, "btoa", BindingBtoa);
   SetMethod(env, binding, "setBufferPrototype", BindingSetBufferPrototype);
+  SetMethod(env, binding, "getZeroFillToggle", BindingGetZeroFillToggle);
 
   SetMethod(env, binding, "asciiSlice", BindingAsciiSlice);
   SetMethod(env, binding, "base64Slice", BindingBase64Slice);

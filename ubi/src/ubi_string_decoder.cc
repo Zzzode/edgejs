@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ubi_encoding_ids.h"
+#include "ubi_module_loader.h"
 
 namespace {
 
@@ -232,10 +233,11 @@ napi_value MakeStringFromBytes(napi_env env, const uint8_t* data, size_t len, ui
   // Buffer#toString() behavior that Node's tests compare against.
   if (enc != kEncUtf8) {
     napi_value global = nullptr;
-    napi_value require_fn = nullptr;
+    napi_value require_fn = UbiGetRequireFunction(env);
     napi_valuetype require_type = napi_undefined;
     if (napi_get_global(env, &global) == napi_ok &&
-        napi_get_named_property(env, global, "require", &require_fn) == napi_ok &&
+        (require_fn != nullptr ||
+         napi_get_named_property(env, global, "require", &require_fn) == napi_ok) &&
         napi_typeof(env, require_fn, &require_type) == napi_ok &&
         require_type == napi_function) {
       napi_value buffer_mod_name = nullptr;

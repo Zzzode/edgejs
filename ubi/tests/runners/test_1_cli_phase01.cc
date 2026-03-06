@@ -522,6 +522,68 @@ TEST_F(Test1CliPhase01, PrintFlagEvaluatesExpression) {
   EXPECT_NE(stdout_output.find("42"), std::string::npos);
 }
 
+TEST_F(Test1CliPhase01, ScriptFileDoesNotLeakEvalGlobals) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "script-file global-shape check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_script_globals",
+      "const assert = require('assert');\n"
+      "for (const key of ['require', '__filename', '__dirname', '__napi_dynamic_import']) {\n"
+      "  assert.strictEqual(Object.prototype.hasOwnProperty.call(globalThis, key), false, key);\n"
+      "  assert.strictEqual(typeof globalThis[key], 'undefined', key);\n"
+      "}\n"
+      "const leaked = [];\n"
+      "for (const key in globalThis) {\n"
+      "  if (key === 'require' || key === '__filename' || key === '__dirname' || key === '__napi_dynamic_import') leaked.push(key);\n"
+      "}\n"
+      "assert.deepStrictEqual(leaked, []);\n"
+      "console.log('script-globals:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_script_globals_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("script-globals:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, EvalModeExposesNodeStyleEvalGlobals) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "eval global-shape check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"-e",
+       "const assert = require('assert');"
+       "assert.strictEqual(Object.prototype.hasOwnProperty.call(globalThis,'require'), true);"
+       "assert.strictEqual(Object.prototype.propertyIsEnumerable.call(globalThis,'require'), true);"
+       "assert.strictEqual(typeof globalThis.require, 'function');"
+       "assert.strictEqual(globalThis.__filename, '[eval]');"
+       "assert.strictEqual(globalThis.__dirname, '.');"
+       "assert.strictEqual(typeof globalThis.__napi_dynamic_import, 'undefined');"
+       "console.log('eval-globals:ok');"},
+      "ubi_phase01_cli_eval_globals_run");
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("eval-globals:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
 TEST_F(Test1CliPhase01, FsPromisesReadFileInsideListenCallbackDoesNotHang) {
 #if defined(_WIN32)
   GTEST_SKIP() << "listen/readFile subprocess parity check is POSIX-only";
@@ -1105,5 +1167,136 @@ TEST_F(Test1CliPhase01, ProcessExitCallsMonkeyPatchedReallyExit) {
   EXPECT_NE(result.stdout_output.find("really exited:0"), std::string::npos) << result.stdout_output;
 
   RemoveTempScript(script_path);
+#endif
+}
+
+TEST_F(Test1CliPhase01, BufferAtobBtoaMatchNodeDomSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "buffer atob/btoa CLI parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_buffer_atob_btoa",
+      "const assert = require('assert');\n"
+      "const buffer = require('buffer');\n"
+      "const domDesc = Object.getOwnPropertyDescriptor(globalThis, 'DOMException');\n"
+      "const atobDesc = Object.getOwnPropertyDescriptor(globalThis, 'atob');\n"
+      "const btoaDesc = Object.getOwnPropertyDescriptor(globalThis, 'btoa');\n"
+      "assert.ok(domDesc);\n"
+      "assert.ok(atobDesc && typeof atobDesc.get === 'function');\n"
+      "assert.ok(btoaDesc && typeof btoaDesc.get === 'function');\n"
+      "assert.strictEqual(atobDesc.get.name, 'get atob');\n"
+      "assert.strictEqual(btoaDesc.get.name, 'get btoa');\n"
+      "assert.strictEqual(domDesc.enumerable, false);\n"
+      "assert.strictEqual(domDesc.configurable, true);\n"
+      "assert.strictEqual(domDesc.writable, true);\n"
+      "assert.strictEqual(typeof domDesc.value, 'function');\n"
+      "assert.strictEqual(DOMException.INVALID_CHARACTER_ERR, 5);\n"
+      "assert.strictEqual(new DOMException('x', 'InvalidCharacterError').code, 5);\n"
+      "assert.strictEqual(buffer.atob('  Y\\fW\\tJ\\njZ A=\\r= '), 'abcd');\n"
+      "assert.strictEqual(buffer.atob(null), '\\x9E\\xE9e');\n"
+      "assert.strictEqual(buffer.btoa('abcd'), 'YWJjZA==');\n"
+      "assert.throws(() => buffer.atob('a'), "
+      "{ constructor: DOMException, name: 'InvalidCharacterError', code: 5 });\n"
+      "assert.throws(() => buffer.btoa('我要抛错！'), { name: 'InvalidCharacterError' });\n"
+      "console.log('buffer-atob-btoa:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_buffer_atob_btoa_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("buffer-atob-btoa:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, InternalBufferValidationAcceptsDataViewAndSharedArrayBuffer) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "buffer validation CLI parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_internal_buffer_validation_inputs",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const { isUtf8, isAscii } = internalBinding('buffer');\n"
+      "const sab = new SharedArrayBuffer(5);\n"
+      "new Uint8Array(sab).set([0x68, 0x65, 0x6c, 0x6c, 0x6f]);\n"
+      "const sabView = new DataView(sab, 0, 5);\n"
+      "assert.strictEqual(isUtf8(sab), true);\n"
+      "assert.strictEqual(isUtf8(sabView), true);\n"
+      "assert.strictEqual(isAscii(sabView), true);\n"
+      "const invalid = new Uint8Array([0xc0, 0x80]);\n"
+      "assert.strictEqual(isUtf8(new DataView(invalid.buffer)), false);\n"
+      "assert.throws(() => isAscii('hello'), { code: 'ERR_INVALID_ARG_TYPE' });\n"
+      "console.log('internal-buffer-validation:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {"--expose-internals", script_path},
+          "ubi_phase01_cli_internal_buffer_validation_inputs_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("internal-buffer-validation:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, InternalBufferBindingSentinelsAndSharedArrayBufferCopyMatchNode) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "buffer internal binding CLI parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_internal_buffer_binding",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const binding = internalBinding('buffer');\n"
+      "const dst = new SharedArrayBuffer(4);\n"
+      "const src = new SharedArrayBuffer(4);\n"
+      "new Uint8Array(src).set([1, 2, 3, 4]);\n"
+      "binding.copyArrayBuffer(dst, 1, src, 0, 3);\n"
+      "assert.deepStrictEqual(Array.from(new Uint8Array(dst)), [0, 1, 2, 3]);\n"
+      "assert.strictEqual(binding.fill(Buffer.alloc(4), 1, 0, 4), undefined);\n"
+      "assert.strictEqual(binding.fill(Buffer.alloc(4), 'zz', 0, 4, 'hex'), -1);\n"
+      "assert.strictEqual(binding.fill(Buffer.alloc(4), 1, 3, 2), -2);\n"
+      "const toggle = binding.getZeroFillToggle();\n"
+      "assert.ok(toggle instanceof Uint32Array);\n"
+      "assert.strictEqual(toggle.length, 1);\n"
+      "toggle[0] = 1;\n"
+      "assert.ok(Array.from(new Uint8Array(binding.createUnsafeArrayBuffer(16))).every((v) => v === 0));\n"
+      "console.log('internal-buffer-binding:ok');\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--expose-internals", script_path},
+      "ubi_phase01_cli_internal_buffer_binding_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("internal-buffer-binding:ok"), std::string::npos) << result.stdout_output;
 #endif
 }

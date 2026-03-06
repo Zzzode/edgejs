@@ -92,7 +92,10 @@ napi_value GetCachedWorker(napi_env env) {
 
 napi_value RequireModule(napi_env env, const char* name) {
   napi_value global = GetGlobal(env);
-  napi_value require_fn = GetNamed(env, global, "require");
+  napi_value require_fn = UbiGetRequireFunction(env);
+  if (!IsFunction(env, require_fn)) {
+    require_fn = GetNamed(env, global, "require");
+  }
   if (!IsFunction(env, require_fn)) return nullptr;
   napi_value name_v = nullptr;
   if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &name_v) != napi_ok || name_v == nullptr) return nullptr;

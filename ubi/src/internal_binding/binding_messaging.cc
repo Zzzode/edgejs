@@ -30,6 +30,8 @@ struct MessagingState {
 
 std::unordered_map<napi_env, MessagingState> g_messaging_states;
 
+napi_value ResolveDOMExceptionValue(napi_env env);
+
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
   if (obj == nullptr || napi_get_named_property(env, obj, key, &out) != napi_ok || out == nullptr) {
@@ -111,7 +113,10 @@ void SetRefToValue(napi_env env, napi_ref* slot, napi_value value) {
 napi_value TryRequireModule(napi_env env, const char* module_name) {
   napi_value global = GetGlobal(env);
   if (global == nullptr) return nullptr;
-  napi_value require_fn = GetNamed(env, global, "require");
+  napi_value require_fn = UbiGetRequireFunction(env);
+  if (!IsFunction(env, require_fn)) {
+    require_fn = GetNamed(env, global, "require");
+  }
   if (!IsFunction(env, require_fn)) return nullptr;
 
   napi_value module_name_v = nullptr;
@@ -522,8 +527,16 @@ napi_value ExposeLazyDOMExceptionPropertyCallback(napi_env env, napi_callback_in
 
   napi_value global = GetGlobal(env);
   napi_value dom_exception = GetNamed(env, global, "DOMException");
+  if (dom_exception == nullptr || IsUndefined(env, dom_exception)) {
+    dom_exception = ResolveDOMExceptionValue(env);
+  }
   if (dom_exception == nullptr || IsUndefined(env, dom_exception)) return Undefined(env);
-  napi_set_named_property(env, argv[0], "DOMException", dom_exception);
+
+  napi_property_descriptor desc = {};
+  desc.utf8name = "DOMException";
+  desc.value = dom_exception;
+  desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+  napi_define_properties(env, argv[0], 1, &desc);
   return Undefined(env);
 }
 

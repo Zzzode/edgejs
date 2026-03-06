@@ -276,8 +276,9 @@ napi_value CreateRequireForUrl(napi_env env, napi_value url_value) {
   napi_value global = GetGlobal(env);
   if (global == nullptr) return nullptr;
 
-  napi_value require_fn = nullptr;
-  if (napi_get_named_property(env, global, "require", &require_fn) != napi_ok || !IsFunctionValue(env, require_fn)) {
+  napi_value require_fn = UbiGetRequireFunction(env);
+  if (!IsFunctionValue(env, require_fn) &&
+      (napi_get_named_property(env, global, "require", &require_fn) != napi_ok || !IsFunctionValue(env, require_fn))) {
     return nullptr;
   }
 
@@ -545,8 +546,9 @@ napi_value CreateCjsNamespaceFromRequire(napi_env env, const std::string& specif
   napi_value global = GetGlobal(env);
   if (global == nullptr) return nullptr;
 
-  napi_value require_fn = nullptr;
-  if (napi_get_named_property(env, global, "require", &require_fn) != napi_ok || !IsFunctionValue(env, require_fn)) {
+  napi_value require_fn = UbiGetRequireFunction(env);
+  if (!IsFunctionValue(env, require_fn) &&
+      (napi_get_named_property(env, global, "require", &require_fn) != napi_ok || !IsFunctionValue(env, require_fn))) {
     return nullptr;
   }
 

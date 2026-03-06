@@ -93,7 +93,17 @@ v8::MaybeLocal<v8::Promise> NapiHostImportModuleDynamically(
   v8::Local<v8::String> helper_name =
       v8::String::NewFromUtf8Literal(isolate, "__napi_dynamic_import");
   v8::Local<v8::Value> helper_value;
-  if (!global->Get(context, helper_name).ToLocal(&helper_value) || !helper_value->IsFunction()) {
+  v8::Local<v8::String> process_name =
+      v8::String::NewFromUtf8Literal(isolate, "process");
+  v8::Local<v8::Value> process_value;
+  if (global->Get(context, process_name).ToLocal(&process_value) && process_value->IsObject()) {
+    auto process_obj = process_value.As<v8::Object>();
+    if (!process_obj->Get(context, helper_name).ToLocal(&helper_value)) {
+      helper_value = v8::Undefined(isolate);
+    }
+  }
+  if ((!helper_value->IsFunction()) &&
+      (!global->Get(context, helper_name).ToLocal(&helper_value) || !helper_value->IsFunction())) {
     v8::Local<v8::String> message = v8::String::NewFromUtf8Literal(isolate, "Not supported");
     resolver->Reject(context, v8::Exception::Error(message)).FromMaybe(false);
     return handle_scope.Escape(promise);

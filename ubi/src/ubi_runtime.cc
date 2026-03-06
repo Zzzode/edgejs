@@ -1296,8 +1296,11 @@ bool RequireModule(napi_env env, const char* id, napi_value* out) {
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
 
-  napi_value require_fn = nullptr;
-  if (!GetNamedProperty(env, global, "require", &require_fn) || !IsFunction(env, require_fn)) return false;
+  napi_value require_fn = UbiGetRequireFunction(env);
+  if (!IsFunction(env, require_fn) &&
+      (!GetNamedProperty(env, global, "require", &require_fn) || !IsFunction(env, require_fn))) {
+    return false;
+  }
 
   napi_value id_value = nullptr;
   if (napi_create_string_utf8(env, id, NAPI_AUTO_LENGTH, &id_value) != napi_ok || id_value == nullptr) {
@@ -1569,6 +1572,31 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
+  {
+    napi_value util_name = nullptr;
+    napi_value symbols_name = nullptr;
+    napi_value util_binding = nullptr;
+    napi_value symbols_binding = nullptr;
+    if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) == napi_ok &&
+        util_name != nullptr &&
+        napi_call_function(env, global, native_internal_binding, 1, &util_name, &util_binding) == napi_ok &&
+        util_binding != nullptr &&
+        !IsUndefinedValue(env, util_binding)) {
+      napi_value private_symbols = nullptr;
+      if (GetNamedProperty(env, util_binding, "privateSymbols", &private_symbols) &&
+          private_symbols != nullptr &&
+          !IsUndefinedValue(env, private_symbols)) {
+        UbiSetPrivateSymbols(env, private_symbols);
+      }
+    }
+    if (napi_create_string_utf8(env, "symbols", NAPI_AUTO_LENGTH, &symbols_name) == napi_ok &&
+        symbols_name != nullptr &&
+        napi_call_function(env, global, native_internal_binding, 1, &symbols_name, &symbols_binding) == napi_ok &&
+        symbols_binding != nullptr &&
+        !IsUndefinedValue(env, symbols_binding)) {
+      UbiSetPerIsolateSymbols(env, symbols_binding);
+    }
+  }
   napi_value get_linked_binding = nullptr;
   if (napi_create_function(env,
                            "getLinkedBinding",
@@ -1580,6 +1608,10 @@ int RunScriptWithGlobals(napi_env env,
     define_hidden_global("getLinkedBinding", get_linked_binding);
   }
   if (!require_bootstrap_module("internal/per_context/primordials")) {
+    return 1;
+  }
+  if (!require_bootstrap_module("internal/per_context/domexception") ||
+      !require_bootstrap_module("internal/per_context/messageport")) {
     return 1;
   }
 
@@ -1898,7 +1930,18 @@ int RunScriptWithGlobals(napi_env env,
       return 1;
     }
 
-    if (napi_set_named_property(env, global, "__napi_dynamic_import", import_dynamically) != napi_ok) {
+    napi_value process_obj = nullptr;
+    if (!GetNamedProperty(env, global, "process", &process_obj) || process_obj == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to resolve process object for __napi_dynamic_import bridge";
+      }
+      return 1;
+    }
+    napi_property_descriptor desc = {};
+    desc.utf8name = "__napi_dynamic_import";
+    desc.value = import_dynamically;
+    desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+    if (napi_define_properties(env, process_obj, 1, &desc) != napi_ok) {
       if (error_out != nullptr) {
         *error_out = "Failed to install __napi_dynamic_import bridge";
       }
@@ -1941,11 +1984,12 @@ int RunScriptWithGlobals(napi_env env,
 
   std::string entry_source;
   const char* source_to_run = source_text;
+  bool source_is_wrapper_factory = false;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
     const std::string entry_path = std::filesystem::path(entry_script_path).lexically_normal().string();
     const std::string escaped_entry = EscapeForSingleQuotedJs(entry_path);
     entry_source =
-        "(function(){ try {"
+        "(function(require, getInternalBinding, internalBinding){ try {"
         "var __entry = require('path').resolve('" +
         escaped_entry +
         "');"
@@ -1967,8 +2011,9 @@ int RunScriptWithGlobals(napi_env env,
         "  if (handled) return;"
         "}"
         "throw err;"
-        "} })();";
+        "} })";
     source_to_run = entry_source.c_str();
+    source_is_wrapper_factory = true;
   }
 
   napi_value script = nullptr;
@@ -1981,7 +2026,31 @@ int RunScriptWithGlobals(napi_env env,
   }
 
   napi_value result = nullptr;
-  status = napi_run_script(env, script, &result);
+  if (source_is_wrapper_factory) {
+    napi_value wrapper = nullptr;
+    status = napi_run_script(env, script, &wrapper);
+    if (status == napi_ok && wrapper != nullptr) {
+      napi_value global = nullptr;
+      napi_get_global(env, &global);
+      napi_value require_fn = UbiGetRequireFunction(env);
+      napi_value get_internal_binding = nullptr;
+      napi_value internal_binding = nullptr;
+      if (global != nullptr) {
+        (void)GetNamedProperty(env, global, "getInternalBinding", &get_internal_binding);
+        (void)GetNamedProperty(env, global, "internalBinding", &internal_binding);
+      }
+      if (!IsFunction(env, require_fn)) {
+        status = napi_invalid_arg;
+      } else {
+        napi_value argv[3] = {require_fn, get_internal_binding, internal_binding};
+        if (argv[1] == nullptr) napi_get_undefined(env, &argv[1]);
+        if (argv[2] == nullptr) napi_get_undefined(env, &argv[2]);
+        status = napi_call_function(env, global, wrapper, 3, argv, &result);
+      }
+    }
+  } else {
+    status = napi_run_script(env, script, &result);
+  }
   if (status == napi_ok) {
     napi_value wait_target = result;
     if (DebugExceptionsEnabled()) {
@@ -2038,6 +2107,10 @@ int RunScriptWithGlobals(napi_env env,
 }
 
 }  // namespace
+
+bool UbiExecArgvHasFlag(const char* flag) {
+  return ExecArgvHasFlag(flag);
+}
 
 napi_status UbiMakeCallbackWithFlags(napi_env env,
                                      napi_value recv,

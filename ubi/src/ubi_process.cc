@@ -1,4 +1,5 @@
 #include "ubi_process.h"
+#include "ubi_module_loader.h"
 
 #include <chrono>
 #include <cerrno>
@@ -682,17 +683,21 @@ bool ValueToBool(napi_env env, napi_value value, bool* out) {
 
 napi_value RequireBuiltin(napi_env env, const char* id) {
   napi_value global = nullptr;
-  napi_value require_fn = nullptr;
+  napi_value require_fn = UbiGetRequireFunction(env);
   napi_value id_value = nullptr;
+  napi_valuetype require_type = napi_undefined;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
-      napi_get_named_property(env, global, "require", &require_fn) != napi_ok ||
+      ((require_fn == nullptr ||
+        napi_typeof(env, require_fn, &require_type) != napi_ok ||
+        require_type != napi_function) &&
+       napi_get_named_property(env, global, "require", &require_fn) != napi_ok) ||
       require_fn == nullptr ||
+      napi_typeof(env, require_fn, &require_type) != napi_ok ||
+      require_type != napi_function ||
       napi_create_string_utf8(env, id, NAPI_AUTO_LENGTH, &id_value) != napi_ok ||
       id_value == nullptr) {
     return nullptr;
   }
-  napi_valuetype t = napi_undefined;
-  if (napi_typeof(env, require_fn, &t) != napi_ok || t != napi_function) return nullptr;
   napi_value argv[1] = {id_value};
   napi_value out = nullptr;
   if (napi_call_function(env, global, require_fn, 1, argv, &out) != napi_ok) return nullptr;

@@ -10,6 +10,7 @@
 #include <uv.h>
 
 #include "internal_binding/helpers.h"
+#include "../ubi_module_loader.h"
 #include "ubi_runtime.h"
 
 namespace internal_binding {
@@ -298,10 +299,11 @@ napi_value BufferFromValue(napi_env env, napi_value value, const char* encoding)
       !IsUndefined(env, buffer_ctor)) {
     // Use global Buffer.
   } else {
-    napi_value require_fn = nullptr;
+    napi_value require_fn = UbiGetRequireFunction(env);
     napi_valuetype require_type = napi_undefined;
-    if (global == nullptr ||
-        napi_get_named_property(env, global, "require", &require_fn) != napi_ok ||
+    if ((global == nullptr && require_fn == nullptr) ||
+        ((require_fn == nullptr || IsUndefined(env, require_fn)) &&
+         napi_get_named_property(env, global, "require", &require_fn) != napi_ok) ||
         require_fn == nullptr ||
         napi_typeof(env, require_fn, &require_type) != napi_ok ||
         require_type != napi_function) {
