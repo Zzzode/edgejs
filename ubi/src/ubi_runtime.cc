@@ -2060,7 +2060,34 @@ napi_status UbiMakeCallbackWithFlags(napi_env env,
       !skip_task_queues &&
       napi_is_exception_pending(env, &has_pending) == napi_ok &&
       !has_pending) {
-    status = DrainProcessTickCallback(env);
+    bool has_tick_scheduled = false;
+    bool has_rejection_to_warn = false;
+    const bool have_task_queue_flags =
+        UbiGetTaskQueueFlags(env, &has_tick_scheduled, &has_rejection_to_warn);
+
+    // Match Node's InternalCallbackScope: when no nextTick or promise-rejection
+    // work is pending, run a microtask checkpoint first and return early if no
+    // task-queue work appeared as a result.
+    if (have_task_queue_flags && !has_tick_scheduled && !has_rejection_to_warn) {
+      status = unofficial_napi_process_microtasks(env);
+      if (status == napi_ok &&
+          napi_is_exception_pending(env, &has_pending) == napi_ok &&
+          has_pending) {
+        callback_scope_depth--;
+        return napi_pending_exception;
+      }
+      if (status == napi_ok &&
+          UbiGetTaskQueueFlags(env, &has_tick_scheduled, &has_rejection_to_warn) &&
+          !has_tick_scheduled &&
+          !has_rejection_to_warn) {
+        callback_scope_depth--;
+        return napi_ok;
+      }
+    }
+
+    if (status == napi_ok) {
+      status = DrainProcessTickCallback(env);
+    }
   }
 
   callback_scope_depth--;

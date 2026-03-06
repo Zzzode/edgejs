@@ -17,4 +17,8 @@ bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out);
 // When no callback is registered, `called` is set to false and napi_ok is returned.
 napi_status UbiRunTaskQueueTickCallback(napi_env env, bool* called);
 
+// Read the task_queue tickInfo flags populated by internal/process/task_queues.
+// Returns false when the binding has not been initialized yet.
+bool UbiGetTaskQueueFlags(napi_env env, bool* has_tick_scheduled, bool* has_rejection_to_warn);
+
 #endif  // UBI_MODULE_LOADER_H_

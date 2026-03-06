@@ -1,5 +1,6 @@
 #include "node_api.h"
 #include "node_api_types.h"
+#include "ubi_runtime.h"
 
 #include <atomic>
 #include <new>
@@ -355,7 +356,8 @@ napi_status NAPI_CDECL napi_make_callback(napi_env env,
                                          const napi_value* argv,
                                          napi_value* result) {
   (void)async_context;
-  return napi_call_function(env, recv, func, argc, argv, result);
+  return UbiMakeCallback(
+      env, recv, func, argc, const_cast<napi_value*>(argv), result);
 }
 
 napi_status NAPI_CDECL napi_open_callback_scope(napi_env env,

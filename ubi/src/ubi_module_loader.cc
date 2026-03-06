@@ -68,6 +68,7 @@ struct TaskQueueBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref tick_callback_ref = nullptr;
   napi_ref promise_reject_callback_ref = nullptr;
+  int32_t* tick_info_fields = nullptr;
 };
 struct TraceEventsBindingState {
   napi_ref binding_ref = nullptr;
@@ -2585,6 +2586,7 @@ static napi_value GetOrCreateTaskQueueBinding(napi_env env) {
   auto* fields = static_cast<int32_t*>(tick_data);
   fields[0] = 0;  // hasTickScheduled
   fields[1] = 0;  // hasRejectionToWarn
+  st.tick_info_fields = fields;
   napi_value tick_info = nullptr;
   if (napi_create_typedarray(env, napi_int32_array, 2, tick_ab, 0, &tick_info) != napi_ok || tick_info == nullptr) {
     return nullptr;
@@ -4116,4 +4118,29 @@ napi_status UbiRunTaskQueueTickCallback(napi_env env, bool* called) {
     *called = true;
   }
   return status;
+}
+
+bool UbiGetTaskQueueFlags(napi_env env, bool* has_tick_scheduled, bool* has_rejection_to_warn) {
+  if (has_tick_scheduled != nullptr) {
+    *has_tick_scheduled = false;
+  }
+  if (has_rejection_to_warn != nullptr) {
+    *has_rejection_to_warn = false;
+  }
+  if (env == nullptr) {
+    return false;
+  }
+
+  auto it = g_task_queue_states.find(env);
+  if (it == g_task_queue_states.end() || it->second.tick_info_fields == nullptr) {
+    return false;
+  }
+
+  if (has_tick_scheduled != nullptr) {
+    *has_tick_scheduled = it->second.tick_info_fields[0] != 0;
+  }
+  if (has_rejection_to_warn != nullptr) {
+    *has_rejection_to_warn = it->second.tick_info_fields[1] != 0;
+  }
+  return true;
 }
