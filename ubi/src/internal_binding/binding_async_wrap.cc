@@ -516,6 +516,7 @@ napi_value CreateProviders(napi_env env) {
   SetNamedUint32(env, out, "PIPECONNECTWRAP", 23);
   SetNamedUint32(env, out, "PIPESERVERWRAP", 24);
   SetNamedUint32(env, out, "PIPEWRAP", 25);
+  SetNamedUint32(env, out, "PROCESSWRAP", 26);
   SetNamedUint32(env, out, "SHUTDOWNWRAP", 35);
   SetNamedUint32(env, out, "TCPCONNECTWRAP", 39);
   SetNamedUint32(env, out, "TCPSERVERWRAP", 40);

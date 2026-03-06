@@ -235,14 +235,14 @@ int64_t UbiAsyncWrapNextId(napi_env env) {
 
 int64_t UbiAsyncWrapExecutionAsyncId(napi_env env) {
   double* fields = GetAsyncIdFields(env);
-  if (fields == nullptr) return 0;
+  if (fields == nullptr) return 1;
 
   constexpr size_t kExecutionAsyncId = 0;
   constexpr size_t kDefaultTriggerAsyncId = 3;
   const int64_t execution_async_id = static_cast<int64_t>(fields[kExecutionAsyncId]);
   if (execution_async_id > 0) return execution_async_id;
   const int64_t default_trigger_async_id = static_cast<int64_t>(fields[kDefaultTriggerAsyncId]);
-  return default_trigger_async_id > 0 ? default_trigger_async_id : 0;
+  return default_trigger_async_id > 0 ? default_trigger_async_id : 1;
 }
 
 const char* UbiAsyncWrapProviderName(int32_t provider_type) {
@@ -257,6 +257,8 @@ const char* UbiAsyncWrapProviderName(int32_t provider_type) {
       return "PIPESERVERWRAP";
     case kUbiProviderPipeWrap:
       return "PIPEWRAP";
+    case kUbiProviderProcessWrap:
+      return "PROCESSWRAP";
     case kUbiProviderShutdownWrap:
       return "SHUTDOWNWRAP";
     case kUbiProviderTcpConnectWrap:

@@ -14,8 +14,16 @@ namespace {
 
 enum class StdioMode {
   kPipe,
-  kInherit,
+  kInheritFd,
   kIgnore,
+};
+
+struct StdioSpec {
+  StdioMode mode = StdioMode::kIgnore;
+  bool readable = false;
+  bool writable = false;
+  int inherit_fd = -1;
+  std::vector<uint8_t> input;
 };
 
 struct SpawnOptions {
@@ -26,8 +34,24 @@ struct SpawnOptions {
   int64_t max_buffer = 1024 * 1024;
   int32_t kill_signal = SIGTERM;
   std::vector<std::string> env_pairs;
-  std::vector<uint8_t> stdin_input;
-  StdioMode stdio_mode[3] = {StdioMode::kPipe, StdioMode::kPipe, StdioMode::kPipe};
+  std::vector<StdioSpec> stdio;
+};
+
+struct SpawnSyncRunner;
+
+struct SyncPipe {
+  SpawnSyncRunner* runner = nullptr;
+  uint32_t child_fd = 0;
+  uv_pipe_t pipe{};
+  bool initialized = false;
+  bool readable = false;
+  bool writable = false;
+  bool shutdown_pending = false;
+  uv_write_t write_req{};
+  uv_shutdown_t shutdown_req{};
+  std::vector<uint8_t> input_storage;
+  uv_buf_t input_buf{};
+  std::vector<uint8_t> output;
 };
 
 struct SpawnSyncRunner {
@@ -40,34 +64,17 @@ struct SpawnSyncRunner {
   int64_t exit_status = -1;
   int term_signal = 0;
 
-  uv_pipe_t stdin_pipe{};
-  uv_pipe_t stdout_pipe{};
-  uv_pipe_t stderr_pipe{};
-  bool stdin_initialized = false;
-  bool stdout_initialized = false;
-  bool stderr_initialized = false;
-
   uv_timer_t timer{};
   bool timer_initialized = false;
 
-  uv_write_t stdin_write{};
-  uv_shutdown_t stdin_shutdown{};
-  bool stdin_shutdown_pending = false;
-
-  uv_stdio_container_t stdio[3]{};
-
-  std::vector<uint8_t> stdin_storage;
-  uv_buf_t stdin_buf{};
-
-  std::vector<uint8_t> out_stdout;
-  std::vector<uint8_t> out_stderr;
+  std::vector<SyncPipe> pipes;
+  std::vector<uv_stdio_container_t> stdio;
 
   int kill_signal = SIGTERM;
   int64_t max_buffer = 1024 * 1024;
   int64_t buffered_output_size = 0;
 
   bool timed_out = false;
-  bool max_buffer_exceeded = false;
   bool kill_attempted = false;
 
   int error = 0;
@@ -80,6 +87,13 @@ bool GetNamedProperty(napi_env env, napi_value obj, const char* name, napi_value
   bool has = false;
   if (napi_has_named_property(env, obj, name, &has) != napi_ok || !has) return false;
   return napi_get_named_property(env, obj, name, out) == napi_ok && *out != nullptr;
+}
+
+bool IsNullOrUndefined(napi_env env, napi_value value) {
+  if (value == nullptr) return true;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok) return true;
+  return type == napi_undefined || type == napi_null;
 }
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
@@ -100,18 +114,50 @@ bool CoerceValueToUtf8(napi_env env, napi_value value, std::string* out) {
   return true;
 }
 
-bool ParseStdioModeString(const std::string& mode, StdioMode* out) {
+bool GetInt32Maybe(napi_env env, napi_value obj, const char* name, int32_t* out) {
   if (out == nullptr) return false;
-  if (mode == "pipe") {
-    *out = StdioMode::kPipe;
+  napi_value value = nullptr;
+  if (!GetNamedProperty(env, obj, name, &value) || value == nullptr) return false;
+  return napi_get_value_int32(env, value, out) == napi_ok;
+}
+
+bool GetBoolMaybe(napi_env env, napi_value obj, const char* name, bool* out) {
+  if (out == nullptr) return false;
+  napi_value value = nullptr;
+  if (!GetNamedProperty(env, obj, name, &value) || value == nullptr) return false;
+  return napi_get_value_bool(env, value, out) == napi_ok;
+}
+
+void SetDefaultStdioSpec(uint32_t child_fd, StdioSpec* spec) {
+  if (spec == nullptr) return;
+  spec->mode = child_fd < 3 ? StdioMode::kPipe : StdioMode::kIgnore;
+  spec->readable = child_fd == 0;
+  spec->writable = child_fd != 0;
+  spec->inherit_fd = child_fd < 3 ? static_cast<int>(child_fd) : -1;
+  spec->input.clear();
+}
+
+bool ParseStdioModeString(uint32_t child_fd, const std::string& mode, StdioSpec* out) {
+  if (out == nullptr) return false;
+  if (mode == "pipe" || mode == "overlapped") {
+    out->mode = StdioMode::kPipe;
+    out->readable = child_fd == 0;
+    out->writable = child_fd != 0;
+    out->inherit_fd = -1;
     return true;
   }
   if (mode == "inherit") {
-    *out = StdioMode::kInherit;
+    out->mode = StdioMode::kInheritFd;
+    out->readable = false;
+    out->writable = false;
+    out->inherit_fd = static_cast<int>(child_fd);
     return true;
   }
   if (mode == "ignore") {
-    *out = StdioMode::kIgnore;
+    out->mode = StdioMode::kIgnore;
+    out->readable = false;
+    out->writable = false;
+    out->inherit_fd = -1;
     return true;
   }
   return false;
@@ -146,15 +192,22 @@ bool ReadInputBytes(napi_env env, napi_value input_val, std::vector<uint8_t>* ou
     size_t bytes = element_len;
     switch (ta_type) {
       case napi_uint16_array:
-      case napi_int16_array: bytes *= 2; break;
-      case napi_float16_array: bytes *= 2; break;
+      case napi_int16_array:
+      case napi_float16_array:
+        bytes *= 2;
+        break;
       case napi_uint32_array:
       case napi_int32_array:
-      case napi_float32_array: bytes *= 4; break;
+      case napi_float32_array:
+        bytes *= 4;
+        break;
       case napi_float64_array:
       case napi_bigint64_array:
-      case napi_biguint64_array: bytes *= 8; break;
-      default: break;
+      case napi_biguint64_array:
+        bytes *= 8;
+        break;
+      default:
+        break;
     }
     const uint8_t* data = static_cast<const uint8_t*>(raw);
     out->assign(data, data + bytes);
@@ -199,6 +252,111 @@ bool ReadInputBytes(napi_env env, napi_value input_val, std::vector<uint8_t>* ou
   if (napi_typeof(env, input_val, &value_type) == napi_ok && value_type == napi_string) {
     std::string text = ValueToUtf8(env, input_val);
     out->assign(text.begin(), text.end());
+    return true;
+  }
+
+  return false;
+}
+
+bool ExtractFdFromWrapObject(napi_env env, napi_value value, int32_t* fd) {
+  if (fd == nullptr || value == nullptr) return false;
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return false;
+
+  int32_t direct_fd = -1;
+  if (GetInt32Maybe(env, value, "fd", &direct_fd)) {
+    *fd = direct_fd;
+    return true;
+  }
+
+  napi_value nested = nullptr;
+  if (GetNamedProperty(env, value, "handle", &nested) && nested != nullptr) {
+    int32_t nested_fd = -1;
+    if (GetInt32Maybe(env, nested, "fd", &nested_fd)) {
+      *fd = nested_fd;
+      return true;
+    }
+  }
+
+  nested = nullptr;
+  if (GetNamedProperty(env, value, "_handle", &nested) && nested != nullptr) {
+    int32_t nested_fd = -1;
+    if (GetInt32Maybe(env, nested, "fd", &nested_fd)) {
+      *fd = nested_fd;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool ParseStdioObject(napi_env env, uint32_t child_fd, napi_value stdio_desc, StdioSpec* out) {
+  if (out == nullptr || stdio_desc == nullptr) return false;
+
+  int32_t explicit_fd = -1;
+  bool has_explicit_fd = GetInt32Maybe(env, stdio_desc, "fd", &explicit_fd);
+
+  napi_value type_val = nullptr;
+  std::string type_name;
+  if (GetNamedProperty(env, stdio_desc, "type", &type_val) && type_val != nullptr) {
+    if (!CoerceValueToUtf8(env, type_val, &type_name)) return false;
+  }
+
+  if (type_name.empty() && has_explicit_fd) {
+    out->mode = StdioMode::kInheritFd;
+    out->readable = false;
+    out->writable = false;
+    out->inherit_fd = explicit_fd;
+    return true;
+  }
+
+  if (type_name == "ignore") {
+    out->mode = StdioMode::kIgnore;
+    out->readable = false;
+    out->writable = false;
+    out->inherit_fd = -1;
+    return true;
+  }
+
+  if (type_name == "inherit" || type_name == "fd") {
+    out->mode = StdioMode::kInheritFd;
+    out->readable = false;
+    out->writable = false;
+    out->inherit_fd = has_explicit_fd ? explicit_fd : static_cast<int>(child_fd);
+    return true;
+  }
+
+  if (type_name == "wrap") {
+    int32_t wrap_fd = -1;
+    if (!ExtractFdFromWrapObject(env, stdio_desc, &wrap_fd)) return false;
+    out->mode = StdioMode::kInheritFd;
+    out->readable = false;
+    out->writable = false;
+    out->inherit_fd = wrap_fd;
+    return true;
+  }
+
+  if (type_name == "pipe" || type_name == "overlapped") {
+    out->mode = StdioMode::kPipe;
+    out->readable = child_fd == 0;
+    out->writable = child_fd != 0;
+    out->inherit_fd = -1;
+
+    bool readable = false;
+    if (GetBoolMaybe(env, stdio_desc, "readable", &readable)) {
+      out->readable = readable;
+    }
+
+    bool writable = false;
+    if (GetBoolMaybe(env, stdio_desc, "writable", &writable)) {
+      out->writable = writable;
+    }
+
+    napi_value input_val = nullptr;
+    if (GetNamedProperty(env, stdio_desc, "input", &input_val) && !IsNullOrUndefined(env, input_val)) {
+      if (!ReadInputBytes(env, input_val, &out->input)) return false;
+    }
     return true;
   }
 
@@ -296,10 +454,9 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
     }
   }
 
-  napi_value input_val = nullptr;
-  if (GetNamedProperty(env, value, "input", &input_val)) {
-    if (!ReadInputBytes(env, input_val, &out->stdin_input)) return false;
-    out->stdio_mode[0] = StdioMode::kPipe;
+  out->stdio.resize(3);
+  for (uint32_t i = 0; i < 3; ++i) {
+    SetDefaultStdioSpec(i, &out->stdio[i]);
   }
 
   napi_value stdio_val = nullptr;
@@ -307,11 +464,8 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   napi_valuetype stdio_type = napi_undefined;
   if (has_stdio && napi_typeof(env, stdio_val, &stdio_type) == napi_ok && stdio_type == napi_string) {
     std::string mode = ValueToUtf8(env, stdio_val);
-    StdioMode parsed = StdioMode::kPipe;
-    if (ParseStdioModeString(mode, &parsed)) {
-      out->stdio_mode[0] = parsed;
-      out->stdio_mode[1] = parsed;
-      out->stdio_mode[2] = parsed;
+    for (uint32_t i = 0; i < 3; ++i) {
+      if (!ParseStdioModeString(i, mode, &out->stdio[i])) return false;
     }
   }
 
@@ -319,40 +473,53 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   if (has_stdio && napi_is_array(env, stdio_val, &stdio_is_array) == napi_ok && stdio_is_array) {
     uint32_t stdio_len = 0;
     if (napi_get_array_length(env, stdio_val, &stdio_len) == napi_ok) {
-      const uint32_t limit = stdio_len < 3 ? stdio_len : 3;
-      for (uint32_t i = 0; i < limit; ++i) {
+      const uint32_t target_len = stdio_len < 3 ? 3 : stdio_len;
+      out->stdio.resize(target_len);
+      for (uint32_t i = 0; i < target_len; ++i) {
+        SetDefaultStdioSpec(i, &out->stdio[i]);
+      }
+      for (uint32_t i = 0; i < stdio_len; ++i) {
         napi_value stdio_desc = nullptr;
-        if (napi_get_element(env, stdio_val, i, &stdio_desc) != napi_ok || stdio_desc == nullptr) continue;
-        napi_valuetype entry_type = napi_undefined;
-        if (napi_typeof(env, stdio_desc, &entry_type) != napi_ok) continue;
-        if (entry_type == napi_string) {
-          std::string mode = ValueToUtf8(env, stdio_desc);
-          StdioMode parsed = StdioMode::kPipe;
-          if (ParseStdioModeString(mode, &parsed)) out->stdio_mode[i] = parsed;
+        if (napi_get_element(env, stdio_val, i, &stdio_desc) != napi_ok || stdio_desc == nullptr ||
+            IsNullOrUndefined(env, stdio_desc)) {
           continue;
         }
-        if (entry_type == napi_object) {
-          napi_value type_val = nullptr;
-          if (GetNamedProperty(env, stdio_desc, "type", &type_val)) {
-            std::string type_name = ValueToUtf8(env, type_val);
-            if (type_name == "inherit" || type_name == "fd") {
-              out->stdio_mode[i] = StdioMode::kInherit;
-            } else if (type_name == "ignore") {
-              out->stdio_mode[i] = StdioMode::kIgnore;
-            } else if (type_name == "pipe" || type_name == "overlapped" || type_name == "wrap") {
-              out->stdio_mode[i] = StdioMode::kPipe;
-            }
-          }
-          if (i == 0) {
-            napi_value stdio_input_val = nullptr;
-            if (GetNamedProperty(env, stdio_desc, "input", &stdio_input_val)) {
-              if (!ReadInputBytes(env, stdio_input_val, &out->stdin_input)) return false;
-              out->stdio_mode[0] = StdioMode::kPipe;
-            }
-          }
+
+        napi_valuetype entry_type = napi_undefined;
+        if (napi_typeof(env, stdio_desc, &entry_type) != napi_ok) return false;
+
+        if (entry_type == napi_string) {
+          std::string mode = ValueToUtf8(env, stdio_desc);
+          if (!ParseStdioModeString(i, mode, &out->stdio[i])) return false;
+          continue;
         }
+
+        if (entry_type == napi_number) {
+          int32_t fd = -1;
+          if (napi_get_value_int32(env, stdio_desc, &fd) != napi_ok) return false;
+          if (fd < 0) {
+            out->stdio[i].mode = StdioMode::kPipe;
+            out->stdio[i].readable = i == 0;
+            out->stdio[i].writable = i != 0;
+            out->stdio[i].inherit_fd = -1;
+          } else {
+            out->stdio[i].mode = StdioMode::kInheritFd;
+            out->stdio[i].readable = false;
+            out->stdio[i].writable = false;
+            out->stdio[i].inherit_fd = fd;
+          }
+          continue;
+        }
+
+        if (entry_type != napi_object) return false;
+        if (!ParseStdioObject(env, i, stdio_desc, &out->stdio[i])) return false;
       }
     }
+  }
+
+  napi_value input_val = nullptr;
+  if (GetNamedProperty(env, value, "input", &input_val) && !IsNullOrUndefined(env, input_val)) {
+    if (!ReadInputBytes(env, input_val, &out->stdio[0].input)) return false;
   }
 
   return true;
@@ -396,21 +563,18 @@ void CloseHandleIfNeeded(uv_handle_t* handle) {
 
 void WalkAndCloseHandle(uv_handle_t* handle, void* /*arg*/) {
   if (handle == nullptr) return;
-  if (!uv_is_closing(handle)) {
-    uv_close(handle, UvCloseNoop);
-  }
+  if (!uv_is_closing(handle)) uv_close(handle, UvCloseNoop);
 }
 
-void CloseStdioHandles(SpawnSyncRunner* runner) {
+void ClosePipeIfNeeded(SyncPipe* pipe) {
+  if (pipe == nullptr || !pipe->initialized) return;
+  CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&pipe->pipe));
+}
+
+void CloseAllPipes(SpawnSyncRunner* runner) {
   if (runner == nullptr) return;
-  if (runner->stdin_initialized) {
-    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stdin_pipe));
-  }
-  if (runner->stdout_initialized) {
-    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stdout_pipe));
-  }
-  if (runner->stderr_initialized) {
-    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stderr_pipe));
+  for (auto& pipe : runner->pipes) {
+    ClosePipeIfNeeded(&pipe);
   }
 }
 
@@ -431,55 +595,53 @@ void KillAndClose(SpawnSyncRunner* runner) {
       }
     }
   }
-  CloseStdioHandles(runner);
+  CloseAllPipes(runner);
   CloseTimerIfNeeded(runner);
 }
 
-void StartStdinShutdown(SpawnSyncRunner* runner);
+void StartPipeShutdown(SyncPipe* pipe);
 
-void StdinShutdownCallback(uv_shutdown_t* req, int status) {
+void PipeShutdownCallback(uv_shutdown_t* req, int status) {
   if (req == nullptr) return;
-  auto* runner = static_cast<SpawnSyncRunner*>(req->data);
-  if (runner == nullptr) return;
-  runner->stdin_shutdown_pending = false;
+  auto* pipe = static_cast<SyncPipe*>(req->data);
+  if (pipe == nullptr || pipe->runner == nullptr) return;
+  pipe->shutdown_pending = false;
   if (status < 0 && status != UV_ENOTCONN) {
-    SetPipeErrorIfUnset(runner, status);
+    SetPipeErrorIfUnset(pipe->runner, status);
   }
-  if (runner->stdin_initialized) {
-    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stdin_pipe));
+  if (!pipe->writable) {
+    ClosePipeIfNeeded(pipe);
   }
 }
 
-void StartStdinShutdown(SpawnSyncRunner* runner) {
-  if (runner == nullptr || !runner->stdin_initialized) return;
-  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&runner->stdin_pipe);
-  if (uv_is_closing(handle) || runner->stdin_shutdown_pending) return;
+void StartPipeShutdown(SyncPipe* pipe) {
+  if (pipe == nullptr || !pipe->initialized) return;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&pipe->pipe);
+  if (uv_is_closing(handle) || pipe->shutdown_pending) return;
 
-  runner->stdin_shutdown.data = runner;
-  runner->stdin_shutdown_pending = true;
-  int rc = uv_shutdown(&runner->stdin_shutdown,
-                       reinterpret_cast<uv_stream_t*>(&runner->stdin_pipe),
-                       StdinShutdownCallback);
+  pipe->shutdown_req.data = pipe;
+  pipe->shutdown_pending = true;
+  int rc = uv_shutdown(&pipe->shutdown_req,
+                       reinterpret_cast<uv_stream_t*>(&pipe->pipe),
+                       PipeShutdownCallback);
   if (rc == UV_ENOTCONN) {
-    runner->stdin_shutdown_pending = false;
-    CloseHandleIfNeeded(handle);
+    pipe->shutdown_pending = false;
+    if (!pipe->writable) ClosePipeIfNeeded(pipe);
     return;
   }
   if (rc < 0) {
-    runner->stdin_shutdown_pending = false;
-    SetPipeErrorIfUnset(runner, rc);
-    CloseHandleIfNeeded(handle);
+    pipe->shutdown_pending = false;
+    SetPipeErrorIfUnset(pipe->runner, rc);
+    if (!pipe->writable) ClosePipeIfNeeded(pipe);
   }
 }
 
-void StdinWriteCallback(uv_write_t* req, int status) {
+void PipeWriteCallback(uv_write_t* req, int status) {
   if (req == nullptr) return;
-  auto* runner = static_cast<SpawnSyncRunner*>(req->data);
-  if (runner == nullptr) return;
-  if (status < 0) {
-    SetPipeErrorIfUnset(runner, status);
-  }
-  StartStdinShutdown(runner);
+  auto* pipe = static_cast<SyncPipe*>(req->data);
+  if (pipe == nullptr || pipe->runner == nullptr) return;
+  if (status < 0) SetPipeErrorIfUnset(pipe->runner, status);
+  StartPipeShutdown(pipe);
 }
 
 void AllocReadBuffer(uv_handle_t* /*handle*/, size_t suggested_size, uv_buf_t* buf) {
@@ -516,40 +678,26 @@ void OnKillTimer(uv_timer_t* timer) {
 }
 
 void OnPipeRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-  auto* runner = stream == nullptr ? nullptr : static_cast<SpawnSyncRunner*>(stream->data);
+  auto* pipe = stream == nullptr ? nullptr : static_cast<SyncPipe*>(stream->data);
+  auto* runner = pipe != nullptr ? pipe->runner : nullptr;
 
-  if (nread > 0 && runner != nullptr && buf != nullptr && buf->base != nullptr) {
+  if (nread > 0 && pipe != nullptr && runner != nullptr && buf != nullptr && buf->base != nullptr) {
     const uint8_t* begin = reinterpret_cast<const uint8_t*>(buf->base);
     const uint8_t* end = begin + static_cast<size_t>(nread);
-
-    if (stream == reinterpret_cast<uv_stream_t*>(&runner->stdout_pipe)) {
-      runner->out_stdout.insert(runner->out_stdout.end(), begin, end);
-    } else if (stream == reinterpret_cast<uv_stream_t*>(&runner->stderr_pipe)) {
-      runner->out_stderr.insert(runner->out_stderr.end(), begin, end);
-    }
-
+    pipe->output.insert(pipe->output.end(), begin, end);
     runner->buffered_output_size += nread;
     if (runner->max_buffer > 0 && runner->buffered_output_size > runner->max_buffer) {
-      runner->max_buffer_exceeded = true;
       SetErrorIfUnset(runner, UV_ENOBUFS);
       KillAndClose(runner);
     }
   } else if (nread == UV_EOF) {
-    if (stream != nullptr) {
-      CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
-    }
+    if (stream != nullptr) CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
   } else if (nread < 0) {
-    if (runner != nullptr) {
-      SetPipeErrorIfUnset(runner, static_cast<int>(nread));
-    }
-    if (stream != nullptr) {
-      CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
-    }
+    if (runner != nullptr) SetPipeErrorIfUnset(runner, static_cast<int>(nread));
+    if (stream != nullptr) CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
   }
 
-  if (buf != nullptr && buf->base != nullptr) {
-    std::free(buf->base);
-  }
+  if (buf != nullptr && buf->base != nullptr) std::free(buf->base);
 }
 
 int GetFinalError(const SpawnSyncRunner& runner) {
@@ -563,11 +711,9 @@ void CleanupRunner(SpawnSyncRunner* runner) {
   if (runner->process_spawned) {
     CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->process));
   }
-  CloseStdioHandles(runner);
+  CloseAllPipes(runner);
   CloseTimerIfNeeded(runner);
 
-  // Drain close callbacks and force-close anything still registered on the loop
-  // so file descriptors are always released before returning.
   int close_rc = uv_loop_close(&runner->loop);
   while (close_rc == UV_EBUSY) {
     uv_walk(&runner->loop, WalkAndCloseHandle, nullptr);
@@ -577,6 +723,53 @@ void CleanupRunner(SpawnSyncRunner* runner) {
   runner->loop_initialized = false;
 }
 
+napi_value MakeNull(napi_env env) {
+  napi_value value = nullptr;
+  napi_get_null(env, &value);
+  return value;
+}
+
+napi_value MakeErrorResult(napi_env env, int error) {
+  napi_value result = nullptr;
+  napi_create_object(env, &result);
+  napi_value error_value = nullptr;
+  napi_create_int32(env, error, &error_value);
+  napi_set_named_property(env, result, "error", error_value);
+  napi_value status = nullptr;
+  napi_get_null(env, &status);
+  napi_set_named_property(env, result, "status", status);
+  napi_set_named_property(env, result, "signal", status);
+  napi_set_named_property(env, result, "output", status);
+  napi_value pid = nullptr;
+  napi_create_int32(env, 0, &pid);
+  napi_set_named_property(env, result, "pid", pid);
+  return result;
+}
+
+napi_value BuildOutputArray(napi_env env, const SpawnSyncRunner& runner) {
+  napi_value output = nullptr;
+  napi_create_array_with_length(env, runner.pipes.size(), &output);
+  napi_value null_value = MakeNull(env);
+
+  for (uint32_t i = 0; i < runner.pipes.size(); ++i) {
+    const SyncPipe& pipe = runner.pipes[i];
+    if (!pipe.initialized || !pipe.writable) {
+      napi_set_element(env, output, i, null_value);
+      continue;
+    }
+
+    napi_value buffer = nullptr;
+    napi_create_buffer_copy(env,
+                            pipe.output.size(),
+                            pipe.output.empty() ? nullptr : pipe.output.data(),
+                            nullptr,
+                            &buffer);
+    napi_set_element(env, output, i, buffer);
+  }
+
+  return output;
+}
+
 napi_value SpawnSync(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -584,61 +777,56 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
 
   SpawnOptions options;
   if (argc < 1 || argv[0] == nullptr || !ParseSpawnOptions(env, argv[0], &options)) {
-    napi_value out = nullptr;
-    napi_create_object(env, &out);
-    napi_value err = nullptr;
-    napi_create_int32(env, -EINVAL, &err);
-    napi_set_named_property(env, out, "error", err);
-    return out;
+    return MakeErrorResult(env, -EINVAL);
   }
 
   SpawnSyncRunner runner;
   runner.kill_signal = options.kill_signal;
   runner.max_buffer = options.max_buffer;
+  runner.pipes.resize(options.stdio.size());
+  runner.stdio.resize(options.stdio.size());
 
   int rc = uv_loop_init(&runner.loop);
   if (rc < 0) {
-    napi_value out = nullptr;
-    napi_create_object(env, &out);
-    napi_value err = nullptr;
-    napi_create_int32(env, rc, &err);
-    napi_set_named_property(env, out, "error", err);
-    return out;
+    return MakeErrorResult(env, rc);
   }
   runner.loop_initialized = true;
 
-  const bool use_stdin_pipe = options.stdio_mode[0] == StdioMode::kPipe;
-  const bool use_stdout_pipe = options.stdio_mode[1] == StdioMode::kPipe;
-  const bool use_stderr_pipe = options.stdio_mode[2] == StdioMode::kPipe;
+  for (uint32_t i = 0; i < options.stdio.size(); ++i) {
+    const StdioSpec& spec = options.stdio[i];
+    auto& pipe = runner.pipes[i];
+    pipe.runner = &runner;
+    pipe.child_fd = i;
 
-  rc = 0;
-  if (use_stdin_pipe) {
-    rc = uv_pipe_init(&runner.loop, &runner.stdin_pipe, 0);
-    if (rc >= 0) {
-      runner.stdin_initialized = true;
-      runner.stdin_pipe.data = &runner;
-    } else {
-      SetErrorIfUnset(&runner, rc);
-    }
-  }
-
-  if (rc >= 0 && use_stdout_pipe) {
-    rc = uv_pipe_init(&runner.loop, &runner.stdout_pipe, 0);
-    if (rc >= 0) {
-      runner.stdout_initialized = true;
-      runner.stdout_pipe.data = &runner;
-    } else {
-      SetErrorIfUnset(&runner, rc);
-    }
-  }
-
-  if (rc >= 0 && use_stderr_pipe) {
-    rc = uv_pipe_init(&runner.loop, &runner.stderr_pipe, 0);
-    if (rc >= 0) {
-      runner.stderr_initialized = true;
-      runner.stderr_pipe.data = &runner;
-    } else {
-      SetErrorIfUnset(&runner, rc);
+    switch (spec.mode) {
+      case StdioMode::kIgnore:
+        runner.stdio[i].flags = UV_IGNORE;
+        break;
+      case StdioMode::kInheritFd:
+        runner.stdio[i].flags = UV_INHERIT_FD;
+        runner.stdio[i].data.fd = spec.inherit_fd;
+        break;
+      case StdioMode::kPipe: {
+        if (!spec.readable && !spec.writable) {
+          SetErrorIfUnset(&runner, UV_EINVAL);
+          break;
+        }
+        rc = uv_pipe_init(&runner.loop, &pipe.pipe, 0);
+        if (rc < 0) {
+          SetErrorIfUnset(&runner, rc);
+          break;
+        }
+        pipe.initialized = true;
+        pipe.readable = spec.readable;
+        pipe.writable = spec.writable;
+        pipe.pipe.data = &pipe;
+        pipe.input_storage = spec.input;
+        runner.stdio[i].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE |
+                                                             (pipe.readable ? UV_READABLE_PIPE : 0) |
+                                                             (pipe.writable ? UV_WRITABLE_PIPE : 0));
+        runner.stdio[i].data.stream = reinterpret_cast<uv_stream_t*>(&pipe.pipe);
+        break;
+      }
     }
   }
 
@@ -665,51 +853,8 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
     uv_options.exit_cb = OnProcessExit;
     if (!options.cwd.empty()) uv_options.cwd = options.cwd.c_str();
     if (!exec_env.empty()) uv_options.env = exec_env.data();
-
-    switch (options.stdio_mode[0]) {
-      case StdioMode::kPipe:
-        runner.stdio[0].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_READABLE_PIPE);
-        runner.stdio[0].data.stream = reinterpret_cast<uv_stream_t*>(&runner.stdin_pipe);
-        break;
-      case StdioMode::kInherit:
-        runner.stdio[0].flags = UV_INHERIT_FD;
-        runner.stdio[0].data.fd = 0;
-        break;
-      case StdioMode::kIgnore:
-        runner.stdio[0].flags = UV_IGNORE;
-        break;
-    }
-
-    switch (options.stdio_mode[1]) {
-      case StdioMode::kPipe:
-        runner.stdio[1].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_WRITABLE_PIPE);
-        runner.stdio[1].data.stream = reinterpret_cast<uv_stream_t*>(&runner.stdout_pipe);
-        break;
-      case StdioMode::kInherit:
-        runner.stdio[1].flags = UV_INHERIT_FD;
-        runner.stdio[1].data.fd = 1;
-        break;
-      case StdioMode::kIgnore:
-        runner.stdio[1].flags = UV_IGNORE;
-        break;
-    }
-
-    switch (options.stdio_mode[2]) {
-      case StdioMode::kPipe:
-        runner.stdio[2].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_WRITABLE_PIPE);
-        runner.stdio[2].data.stream = reinterpret_cast<uv_stream_t*>(&runner.stderr_pipe);
-        break;
-      case StdioMode::kInherit:
-        runner.stdio[2].flags = UV_INHERIT_FD;
-        runner.stdio[2].data.fd = 2;
-        break;
-      case StdioMode::kIgnore:
-        runner.stdio[2].flags = UV_IGNORE;
-        break;
-    }
-
-    uv_options.stdio_count = 3;
-    uv_options.stdio = runner.stdio;
+    uv_options.stdio_count = static_cast<int>(runner.stdio.size());
+    uv_options.stdio = runner.stdio.data();
 
     rc = uv_spawn(&runner.loop, &runner.process, &uv_options);
     if (rc < 0) {
@@ -721,39 +866,36 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
   }
 
   if (runner.process_spawned) {
-    if (runner.stdout_initialized) {
-      rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&runner.stdout_pipe), AllocReadBuffer, OnPipeRead);
-      if (rc < 0) {
-        SetPipeErrorIfUnset(&runner, rc);
-        KillAndClose(&runner);
-      }
-    }
+    for (auto& pipe : runner.pipes) {
+      if (!pipe.initialized) continue;
 
-    if (runner.stderr_initialized) {
-      rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&runner.stderr_pipe), AllocReadBuffer, OnPipeRead);
-      if (rc < 0) {
-        SetPipeErrorIfUnset(&runner, rc);
-        KillAndClose(&runner);
+      if (pipe.writable) {
+        rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&pipe.pipe), AllocReadBuffer, OnPipeRead);
+        if (rc < 0) {
+          SetPipeErrorIfUnset(&runner, rc);
+          KillAndClose(&runner);
+          break;
+        }
       }
-    }
 
-    if (runner.stdin_initialized && !options.stdin_input.empty()) {
-      runner.stdin_storage = options.stdin_input;
-      runner.stdin_buf = uv_buf_init(
-          reinterpret_cast<char*>(runner.stdin_storage.data()),
-          static_cast<unsigned int>(runner.stdin_storage.size()));
-      runner.stdin_write.data = &runner;
-      rc = uv_write(&runner.stdin_write,
-                    reinterpret_cast<uv_stream_t*>(&runner.stdin_pipe),
-                    &runner.stdin_buf,
-                    1,
-                    StdinWriteCallback);
-      if (rc < 0) {
-        SetPipeErrorIfUnset(&runner, rc);
-        StartStdinShutdown(&runner);
+      if (pipe.readable) {
+        if (!pipe.input_storage.empty()) {
+          pipe.input_buf = uv_buf_init(reinterpret_cast<char*>(pipe.input_storage.data()),
+                                       static_cast<unsigned int>(pipe.input_storage.size()));
+          pipe.write_req.data = &pipe;
+          rc = uv_write(&pipe.write_req,
+                        reinterpret_cast<uv_stream_t*>(&pipe.pipe),
+                        &pipe.input_buf,
+                        1,
+                        PipeWriteCallback);
+          if (rc < 0) {
+            SetPipeErrorIfUnset(&runner, rc);
+            StartPipeShutdown(&pipe);
+          }
+        } else {
+          StartPipeShutdown(&pipe);
+        }
       }
-    } else if (runner.stdin_initialized) {
-      StartStdinShutdown(&runner);
     }
 
     if (options.timeout_ms > 0) {
@@ -763,10 +905,7 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
       } else {
         runner.timer_initialized = true;
         runner.timer.data = &runner;
-        rc = uv_timer_start(&runner.timer,
-                            OnKillTimer,
-                            static_cast<uint64_t>(options.timeout_ms),
-                            0);
+        rc = uv_timer_start(&runner.timer, OnKillTimer, static_cast<uint64_t>(options.timeout_ms), 0);
         if (rc < 0) {
           SetErrorIfUnset(&runner, rc);
           CloseTimerIfNeeded(&runner);
@@ -784,62 +923,45 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
   napi_value result = nullptr;
   napi_create_object(env, &result);
 
-  napi_value pid_value = nullptr;
-  int32_t pid = runner.process_spawned ? static_cast<int32_t>(runner.process.pid) : 0;
-  napi_create_int32(env, pid, &pid_value);
-  napi_set_named_property(env, result, "pid", pid_value);
-
-  napi_value output = nullptr;
-  napi_create_array_with_length(env, 3, &output);
-  napi_value null_value = nullptr;
-  napi_get_null(env, &null_value);
-  napi_set_element(env, output, 0, null_value);
-
-  napi_value stdout_val = nullptr;
-  napi_create_buffer_copy(env,
-                          runner.out_stdout.size(),
-                          runner.out_stdout.empty() ? nullptr : runner.out_stdout.data(),
-                          nullptr,
-                          &stdout_val);
-  napi_set_element(env, output, 1, stdout_val);
-
-  napi_value stderr_val = nullptr;
-  napi_create_buffer_copy(env,
-                          runner.out_stderr.size(),
-                          runner.out_stderr.empty() ? nullptr : runner.out_stderr.data(),
-                          nullptr,
-                          &stderr_val);
-  napi_set_element(env, output, 2, stderr_val);
-  napi_set_named_property(env, result, "output", output);
-
-  if (runner.process_exited) {
-    if (runner.term_signal > 0) {
-      napi_set_named_property(env, result, "status", null_value);
-      const char* sig_name = SignalName(runner.term_signal);
-      if (sig_name != nullptr) {
-        napi_value signal_value = nullptr;
-        napi_create_string_utf8(env, sig_name, NAPI_AUTO_LENGTH, &signal_value);
-        napi_set_named_property(env, result, "signal", signal_value);
-      } else {
-        napi_set_named_property(env, result, "signal", null_value);
-      }
-    } else {
-      napi_value status_value = nullptr;
-      napi_create_int32(env, static_cast<int32_t>(runner.exit_status), &status_value);
-      napi_set_named_property(env, result, "status", status_value);
-      napi_set_named_property(env, result, "signal", null_value);
-    }
-  } else {
-    napi_set_named_property(env, result, "status", null_value);
-    napi_set_named_property(env, result, "signal", null_value);
-  }
-
   const int final_error = GetFinalError(runner);
   if (final_error != 0) {
     napi_value error_value = nullptr;
     napi_create_int32(env, final_error, &error_value);
     napi_set_named_property(env, result, "error", error_value);
   }
+
+  napi_value null_value = MakeNull(env);
+  if (!runner.process_spawned || !runner.process_exited) {
+    napi_set_named_property(env, result, "status", null_value);
+    napi_set_named_property(env, result, "signal", null_value);
+  } else if (runner.term_signal > 0) {
+    napi_set_named_property(env, result, "status", null_value);
+    const char* sig_name = SignalName(runner.term_signal);
+    if (sig_name != nullptr) {
+      napi_value signal_value = nullptr;
+      napi_create_string_utf8(env, sig_name, NAPI_AUTO_LENGTH, &signal_value);
+      napi_set_named_property(env, result, "signal", signal_value);
+    } else {
+      napi_set_named_property(env, result, "signal", null_value);
+    }
+  } else {
+    napi_value status_value = nullptr;
+    napi_create_int32(env, static_cast<int32_t>(runner.exit_status), &status_value);
+    napi_set_named_property(env, result, "status", status_value);
+    napi_set_named_property(env, result, "signal", null_value);
+  }
+
+  if (runner.process_spawned) {
+    napi_value output = BuildOutputArray(env, runner);
+    napi_set_named_property(env, result, "output", output);
+  } else {
+    napi_set_named_property(env, result, "output", null_value);
+  }
+
+  napi_value pid_value = nullptr;
+  int32_t pid = runner.process_spawned ? static_cast<int32_t>(runner.process.pid) : 0;
+  napi_create_int32(env, pid, &pid_value);
+  napi_set_named_property(env, result, "pid", pid_value);
 
   CleanupRunner(&runner);
   return result;

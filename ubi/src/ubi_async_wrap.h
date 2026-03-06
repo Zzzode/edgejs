@@ -12,6 +12,7 @@ enum UbiAsyncProviderType : int32_t {
   kUbiProviderPipeConnectWrap = 23,
   kUbiProviderPipeServerWrap = 24,
   kUbiProviderPipeWrap = 25,
+  kUbiProviderProcessWrap = 26,
   kUbiProviderShutdownWrap = 35,
   kUbiProviderTcpConnectWrap = 39,
   kUbiProviderTcpServerWrap = 40,

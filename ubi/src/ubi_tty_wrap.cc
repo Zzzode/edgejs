@@ -421,6 +421,18 @@ napi_value TtyWriteQueueSizeGetter(napi_env env, napi_callback_info info) {
 
 }  // namespace
 
+uv_stream_t* UbiTtyWrapGetStream(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return nullptr;
+  TtyWrap* wrap = nullptr;
+  if (napi_unwrap(env, value, reinterpret_cast<void**>(&wrap)) != napi_ok || wrap == nullptr) return nullptr;
+  if (!wrap->initialized) return nullptr;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  if (handle->data != wrap || handle->type != UV_TTY) return nullptr;
+  return reinterpret_cast<uv_stream_t*>(&wrap->handle);
+}
+
 napi_value UbiInstallTtyWrapBinding(napi_env env) {
   TtyBindingState& state = EnsureBindingState(env);
   napi_value cached = nullptr;
