@@ -1,4 +1,5 @@
 #include "ubi_process.h"
+#include "ubi_active_resource.h"
 #include "ubi_module_loader.h"
 
 #include <chrono>
@@ -2377,82 +2378,22 @@ napi_value ProcessMethodsNoopUndefinedCallback(napi_env env, napi_callback_info 
   return undefined;
 }
 
-napi_value RunScriptOrEmptyArray(napi_env env, const char* source) {
-  napi_value script = nullptr;
-  if (napi_create_string_utf8(env, source, NAPI_AUTO_LENGTH, &script) != napi_ok || script == nullptr) {
-    napi_value out = nullptr;
-    napi_create_array(env, &out);
-    return out;
-  }
-  napi_value result = nullptr;
-  if (napi_run_script(env, script, &result) != napi_ok || result == nullptr) {
-    bool has_pending = false;
-    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
-      napi_value ignored = nullptr;
-      napi_get_and_clear_last_exception(env, &ignored);
-    }
-    napi_value out = nullptr;
-    napi_create_array(env, &out);
-    return out;
-  }
-  return result;
-}
-
 napi_value ProcessMethodsGetActiveRequestsCallback(napi_env env, napi_callback_info info) {
-  static constexpr const char* kScript =
-      "(function(){"
-      "  try {"
-      "    const reqs = globalThis[Symbol.for('node.activeRequests')];"
-      "    return Array.isArray(reqs) ? reqs.slice() : [];"
-      "  } catch {"
-      "    return [];"
-      "  }"
-      "})()";
-  return RunScriptOrEmptyArray(env, kScript);
+  napi_value out = UbiGetActiveRequestsArray(env);
+  if (out != nullptr) return out;
+  napi_create_array(env, &out);
+  return out;
 }
 
 napi_value ProcessMethodsGetActiveHandlesCallback(napi_env env, napi_callback_info info) {
-  static constexpr const char* kScript =
-      "(function(){"
-      "  try {"
-      "    const handles = globalThis[Symbol.for('node.activeHandles')];"
-      "    return Array.isArray(handles) ? handles.slice() : [];"
-      "  } catch {"
-      "    return [];"
-      "  }"
-      "})()";
-  return RunScriptOrEmptyArray(env, kScript);
+  napi_value out = UbiGetActiveHandlesArray(env);
+  if (out != nullptr) return out;
+  napi_create_array(env, &out);
+  return out;
 }
 
 napi_value ProcessMethodsGetActiveResourcesInfoCallback(napi_env env, napi_callback_info info) {
-  static constexpr const char* kScript =
-      "(function(){"
-      "  const out = [];"
-      "  try {"
-      "    const resources = globalThis[Symbol.for('node.activeResources')];"
-      "    if (resources && typeof resources.values === 'function') {"
-      "      for (const type of resources.values()) {"
-      "        out.push(String(type));"
-      "      }"
-      "    }"
-      "    const reqs = globalThis[Symbol.for('node.activeRequests')];"
-      "    if (Array.isArray(reqs)) {"
-      "      for (let i = 0; i < reqs.length; i++) {"
-      "        const req = reqs[i];"
-      "        if (req && typeof req.type === 'string') {"
-      "          out.push(req.type);"
-      "        } else if (req && req.constructor && typeof req.constructor.name === 'string' &&"
-      "                   req.constructor.name.length > 0) {"
-      "          out.push(req.constructor.name);"
-      "        } else if (req) {"
-      "          out.push('FSReqCallback');"
-      "        }"
-      "      }"
-      "    }"
-      "  } catch {}"
-      "  return out;"
-      "})()";
-  napi_value out = RunScriptOrEmptyArray(env, kScript);
+  napi_value out = UbiGetActiveResourcesInfoArray(env);
   bool is_array = false;
   if (out == nullptr || napi_is_array(env, out, &is_array) != napi_ok || !is_array) {
     napi_create_array(env, &out);

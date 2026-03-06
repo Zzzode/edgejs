@@ -162,6 +162,7 @@ napi_value JsStreamCtor(napi_env env, napi_callback_info info) {
     if (js_wrap == nullptr) return;
     UbiStreamBaseFinalize(&js_wrap->base);
   }, nullptr, &wrap->base.wrapper_ref);
+  UbiStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
   UbiStreamBaseSetInitialStreamProperties(&wrap->base, false, false);
   return self;
 }

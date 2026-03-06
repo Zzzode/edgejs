@@ -7,6 +7,7 @@
 #include <uv.h>
 
 // #include "ubi_async_wrap.h"
+#include "ubi_active_resource.h"
 #include "ubi_runtime.h"
 
 namespace {
@@ -15,6 +16,7 @@ struct SignalWrap {
   napi_env env = nullptr;
   napi_ref wrapper_ref = nullptr;
   napi_ref close_cb_ref = nullptr;
+  void* active_handle_token = nullptr;
   uv_signal_t handle{};
   bool initialized = false;
   bool closed = false;
@@ -24,6 +26,19 @@ struct SignalWrap {
   bool destroy_queued = false;
   // int64_t async_id = 0;
 };
+
+napi_value GetRefValue(napi_env env, napi_ref ref);
+
+bool SignalWrapHasRef(void* data) {
+  auto* wrap = static_cast<SignalWrap*>(data);
+  if (wrap == nullptr || !wrap->initialized || wrap->closed) return false;
+  return uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->handle)) != 0;
+}
+
+napi_value SignalWrapGetActiveOwner(napi_env env, void* data) {
+  auto* wrap = static_cast<SignalWrap*>(data);
+  return wrap != nullptr ? GetRefValue(env, wrap->wrapper_ref) : nullptr;
+}
 
 std::mutex g_handled_signals_mutex;
 std::map<int, int64_t> g_handled_signals;
@@ -117,6 +132,11 @@ void OnClosed(uv_handle_t* handle) {
     wrap->close_cb_ref = nullptr;
   }
 
+  if (wrap->active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(wrap->env, wrap->active_handle_token);
+    wrap->active_handle_token = nullptr;
+  }
+
   if (wrap->delete_on_close || wrap->finalized) {
     delete wrap;
   }
@@ -135,6 +155,10 @@ void SignalFinalize(napi_env env, void* data, void* /*hint*/) {
     wrap->close_cb_ref = nullptr;
   }
   if (!wrap->initialized || wrap->closed) {
+    if (wrap->active_handle_token != nullptr) {
+      UbiUnregisterActiveHandle(env, wrap->active_handle_token);
+      wrap->active_handle_token = nullptr;
+    }
     QueueDestroy(wrap);
     delete wrap;
     return;
@@ -166,6 +190,8 @@ napi_value SignalCtor(napi_env env, napi_callback_info info) {
     wrap->handle.data = wrap;
   }
   napi_wrap(env, self, wrap, SignalFinalize, nullptr, &wrap->wrapper_ref);
+  wrap->active_handle_token =
+      UbiRegisterActiveHandle(env, self, "SIGNALWRAP", SignalWrapHasRef, SignalWrapGetActiveOwner, wrap);
 
   // UbiAsyncWrapEmitInit(env,
   //                        static_cast<double>(wrap->async_id),

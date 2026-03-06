@@ -245,7 +245,9 @@ int RunRawNodeTestScript(napi_env env,
                          std::string* error_out,
                          bool keep_event_loop_alive = false);
 
-int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::string* error_out);
+int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path,
+                                     std::string* error_out,
+                                     bool redirect_stdio_to_files = false);
 
 int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* error_out) {
   return RunRawNodeTestScript(env, relative_path, error_out, false);
@@ -392,20 +394,61 @@ void BestEffortKillLeakedFixtureChildren() {
 #endif
 }
 
-int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::string* error_out) {
+std::string ReadFileText(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) return {};
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path,
+                                     std::string* error_out,
+                                     bool redirect_stdio_to_files) {
 #if defined(NAPI_V8_NODE_ROOT_PATH) || defined(PROJECT_ROOT_PATH)
 #if defined(_WIN32)
   (void)node_test_relative_path;
+  (void)redirect_stdio_to_files;
   if (error_out != nullptr) {
     *error_out = "Raw subprocess runner is not implemented on win32.";
   }
   return -1;
 #else
   (void)ResolveUbiCliPathForRawSubprocess;
+  namespace fs = std::filesystem;
+  fs::path stdout_path;
+  fs::path stderr_path;
+  int stdout_fd = -1;
+  int stderr_fd = -1;
+  auto close_fd = [](int* fd) {
+    if (fd != nullptr && *fd >= 0) {
+      close(*fd);
+      *fd = -1;
+    }
+  };
+  if (redirect_stdio_to_files) {
+    char stdout_template[] = "/tmp/ubi-raw-stdout-XXXXXX";
+    char stderr_template[] = "/tmp/ubi-raw-stderr-XXXXXX";
+    stdout_fd = mkstemp(stdout_template);
+    stderr_fd = mkstemp(stderr_template);
+    if (stdout_fd < 0 || stderr_fd < 0) {
+      const int create_errno = errno;
+      close_fd(&stdout_fd);
+      close_fd(&stderr_fd);
+      if (error_out != nullptr) {
+        *error_out = "mkstemp failed: " + std::string(std::strerror(create_errno));
+      }
+      return 1;
+    }
+    stdout_path = stdout_template;
+    stderr_path = stderr_template;
+  }
   int status = 0;
   const pid_t child_pid = fork();
   if (child_pid < 0) {
     const int fork_errno = errno;
+    close_fd(&stdout_fd);
+    close_fd(&stderr_fd);
+    if (!stdout_path.empty()) (void)fs::remove(stdout_path);
+    if (!stderr_path.empty()) (void)fs::remove(stderr_path);
     if (error_out != nullptr) {
       *error_out = "fork failed: " + std::string(std::strerror(fork_errno));
     }
@@ -413,6 +456,16 @@ int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::s
   }
 
   if (child_pid == 0) {
+    if (redirect_stdio_to_files) {
+      if (stdout_fd >= 0) {
+        (void)dup2(stdout_fd, STDOUT_FILENO);
+      }
+      if (stderr_fd >= 0) {
+        (void)dup2(stderr_fd, STDERR_FILENO);
+      }
+      close_fd(&stdout_fd);
+      close_fd(&stderr_fd);
+    }
     // Put each raw-test subprocess tree in its own process group so the parent
     // the parent can always reap/kill descendants after the child exits.
     (void)setpgid(0, 0);
@@ -437,6 +490,9 @@ int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::s
     }
     _exit(child_exit);
   }
+
+  close_fd(&stdout_fd);
+  close_fd(&stderr_fd);
 
   while (waitpid(child_pid, &status, 0) < 0) {
     if (errno == EINTR) continue;
@@ -463,8 +519,20 @@ int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::s
       error_out->clear();
     } else {
       *error_out = "subprocess exit(" + std::to_string(exit_code) + ")";
+      if (redirect_stdio_to_files) {
+        const std::string stdout_text = ReadFileText(stdout_path);
+        const std::string stderr_text = ReadFileText(stderr_path);
+        if (!stdout_text.empty()) {
+          *error_out += "\nstdout=" + stdout_text;
+        }
+        if (!stderr_text.empty()) {
+          *error_out += "\nstderr=" + stderr_text;
+        }
+      }
     }
   }
+  if (!stdout_path.empty()) (void)fs::remove(stdout_path);
+  if (!stderr_path.empty()) (void)fs::remove(stderr_path);
   return exit_code;
 #endif
 #else
@@ -897,6 +965,18 @@ TEST_F(Test3NodeDropinSubsetPhase02, NodeCompatEventEmitterMethodNamesTest) {
     EXPECT_TRUE(error.empty()) << "error=" << error;            \
   }
 
+#define DEFINE_RAW_NODE_FILE_STDIO_SUBPROCESS_TEST(test_name, script_name) \
+  TEST_F(Test3NodeDropinSubsetPhase02, test_name) {                        \
+    if (RawNodeScriptStartsWithFlagsHeader(script_name)) {                 \
+      GTEST_SKIP() << "Skipping Node.js raw test with // Flags header: " << script_name; \
+    }                                                                      \
+    std::string error;                                                     \
+    const int exit_code =                                                  \
+        RunRawNodeTestScriptInSubprocess(script_name, &error, true);       \
+    EXPECT_EQ(exit_code, 0) << "error=" << error;                          \
+    EXPECT_TRUE(error.empty()) << "error=" << error;                       \
+  }
+
 #define DEFINE_RAW_NODE_IN_PROCESS_TEST(test_name, script_name)  \
   TEST_F(Test3NodeDropinSubsetPhase02, test_name) {              \
     if (RawNodeScriptStartsWithFlagsHeader(script_name)) {       \
@@ -1182,11 +1262,11 @@ DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExternalStdioCloseFromNodeTest, "test-
 DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExternalStdioCloseSpawnFromNodeTest, "test-process-external-stdio-close-spawn.js")
 DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactivehandlesFromNodeTest, "test-process-getactivehandles.js")
 DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiverequestsFromNodeTest, "test-process-getactiverequests.js")
-DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesFromNodeTest, "test-process-getactiveresources.js")
-DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackActiveRequestsFromNodeTest, "test-process-getactiveresources-track-active-requests.js")
-DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackTimerLifetimeFromNodeTest, "test-process-getactiveresources-track-timer-lifetime.js")
-DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackMultipleTimersFromNodeTest, "test-process-getactiveresources-track-multiple-timers.js")
-DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackIntervalLifetimeFromNodeTest, "test-process-getactiveresources-track-interval-lifetime.js")
+DEFINE_RAW_NODE_FILE_STDIO_SUBPROCESS_TEST(RawProcessGetactiveresourcesFromNodeTest, "test-process-getactiveresources.js")
+DEFINE_RAW_NODE_FILE_STDIO_SUBPROCESS_TEST(RawProcessGetactiveresourcesTrackActiveRequestsFromNodeTest, "test-process-getactiveresources-track-active-requests.js")
+DEFINE_RAW_NODE_FILE_STDIO_SUBPROCESS_TEST(RawProcessGetactiveresourcesTrackTimerLifetimeFromNodeTest, "test-process-getactiveresources-track-timer-lifetime.js")
+DEFINE_RAW_NODE_FILE_STDIO_SUBPROCESS_TEST(RawProcessGetactiveresourcesTrackMultipleTimersFromNodeTest, "test-process-getactiveresources-track-multiple-timers.js")
+DEFINE_RAW_NODE_FILE_STDIO_SUBPROCESS_TEST(RawProcessGetactiveresourcesTrackIntervalLifetimeFromNodeTest, "test-process-getactiveresources-track-interval-lifetime.js")
 DEFINE_RAW_NODE_TEST(RawTimersFromNodeTest, "test-timers.js")
 DEFINE_RAW_NODE_TEST(RawTimersArgsFromNodeTest, "test-timers-args.js")
 DEFINE_RAW_NODE_TEST(RawTimersThisFromNodeTest, "test-timers-this.js")

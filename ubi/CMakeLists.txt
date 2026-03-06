@@ -249,6 +249,7 @@ add_library(ubi_runtime STATIC
   src/ubi_runtime.cc
   src/ubi_runtime_platform_v8.cc
   src/ubi_process.cc
+  src/ubi_active_resource.cc
   src/ubi_module_loader.cc
   src/internal_binding/dispatch.cc
   src/internal_binding/binding_async_context_frame.cc

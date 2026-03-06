@@ -192,6 +192,7 @@ napi_value PipeCtor(napi_env env, napi_callback_info info) {
     if (pipe_wrap == nullptr) return;
     UbiStreamBaseFinalize(&pipe_wrap->base);
   }, nullptr, &wrap->base.wrapper_ref);
+  UbiStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
   UbiStreamBaseSetInitialStreamProperties(&wrap->base, false, false);
   return self;
 }

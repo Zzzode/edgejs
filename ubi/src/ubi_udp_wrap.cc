@@ -18,6 +18,7 @@
 #endif
 
 #include "ubi_runtime.h"
+#include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
 #include "ubi_udp_listener.h"
 
@@ -596,6 +597,7 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
   napi_env env = nullptr;
   napi_ref wrapper_ref = nullptr;
   napi_ref close_cb_ref = nullptr;
+  void* active_handle_token = nullptr;
   uv_udp_t handle{};
   bool closed = false;
   bool finalized = false;
@@ -606,6 +608,17 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
   napi_value current_send_chunks_obj = nullptr;
   bool current_send_has_callback = false;
 };
+
+bool UdpHandleHasRef(void* data) {
+  auto* wrap = static_cast<UdpWrap*>(data);
+  if (wrap == nullptr || wrap->closed) return false;
+  return uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->handle)) != 0;
+}
+
+napi_value UdpGetActiveOwner(napi_env env, void* data) {
+  auto* wrap = static_cast<UdpWrap*>(data);
+  return wrap != nullptr ? GetRefValue(env, wrap->wrapper_ref) : nullptr;
+}
 
 UdpWrap* UnwrapUdpWrap(napi_env env, napi_value value, bool throw_type_error) {
   if (value == nullptr) {
@@ -671,6 +684,10 @@ void UdpFinalize(napi_env env, void* data, void* hint) {
     if (!uv_is_closing(h)) uv_close(h, OnClosed);
     return;
   }
+  if (wrap->active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(env, wrap->active_handle_token);
+    wrap->active_handle_token = nullptr;
+  }
   QueueUdpWrapDestroyIfNeeded(wrap);
   delete wrap;
 }
@@ -691,6 +708,8 @@ napi_value UdpCtor(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   auto* wrap = new UdpWrap(env);
   napi_wrap(env, self, wrap, UdpFinalize, nullptr, &wrap->wrapper_ref);
+  wrap->active_handle_token =
+      UbiRegisterActiveHandle(env, self, "UDPWRAP", UdpHandleHasRef, UdpGetActiveOwner, wrap);
 
   // Match Node's dgram handle aliasing for udp6 sockets.
   const char* mutable_methods[] = {"bind", "bind6", "connect", "connect6", "send", "send6"};
@@ -724,6 +743,10 @@ void OnClosed(uv_handle_t* h) {
     }
     napi_delete_reference(wrap->env, wrap->close_cb_ref);
     wrap->close_cb_ref = nullptr;
+  }
+  if (wrap->active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(wrap->env, wrap->active_handle_token);
+    wrap->active_handle_token = nullptr;
   }
   QueueUdpWrapDestroyIfNeeded(wrap);
   if (wrap->delete_on_close || wrap->finalized) delete wrap;

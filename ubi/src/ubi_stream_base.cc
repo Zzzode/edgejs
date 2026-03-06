@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "internal_binding/helpers.h"
+#include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
 #include "ubi_module_loader.h"
 #include "ubi_runtime.h"
@@ -18,6 +19,44 @@ struct StreamSymbolCache {
   napi_ref owner_symbol_ref = nullptr;
   napi_ref handle_onclose_symbol_ref = nullptr;
 };
+
+napi_value GetOwnerSymbol(napi_env env);
+
+bool StreamBaseHasRefForTracking(void* data) {
+  return UbiStreamBaseHasRef(static_cast<UbiStreamBase*>(data));
+}
+
+napi_value StreamBaseGetActiveOwner(napi_env env, void* data) {
+  auto* base = static_cast<UbiStreamBase*>(data);
+  if (base == nullptr) return nullptr;
+  napi_value wrapper = UbiStreamBaseGetWrapper(base);
+  if (wrapper == nullptr) return nullptr;
+
+  napi_value owner_symbol = GetOwnerSymbol(env);
+  if (owner_symbol == nullptr) return nullptr;
+
+  napi_value owner = nullptr;
+  if (napi_get_property(env, wrapper, owner_symbol, &owner) != napi_ok || owner == nullptr) return nullptr;
+  napi_valuetype owner_type = napi_undefined;
+  if (napi_typeof(env, owner, &owner_type) != napi_ok) return nullptr;
+  if (owner_type == napi_undefined || owner_type == napi_null) return nullptr;
+  return owner;
+}
+
+const char* ActiveResourceNameForProvider(int32_t provider_type) {
+  switch (provider_type) {
+    case kUbiProviderTcpWrap:
+    case kUbiProviderTcpServerWrap:
+      return "TCPWRAP";
+    case kUbiProviderPipeWrap:
+    case kUbiProviderPipeServerWrap:
+      return "PIPEWRAP";
+    case kUbiProviderJsStream:
+      return "JSSTREAM";
+    default:
+      return "STREAM";
+  }
+}
 
 struct LibuvWriteReq {
   uv_write_t req{};
@@ -449,6 +488,15 @@ void UbiStreamBaseInit(UbiStreamBase* base,
 void UbiStreamBaseSetWrapperRef(UbiStreamBase* base, napi_ref wrapper_ref) {
   if (base == nullptr) return;
   base->wrapper_ref = wrapper_ref;
+  if (base->env == nullptr || wrapper_ref == nullptr || base->active_handle_token != nullptr) return;
+  napi_value owner = UbiStreamBaseGetWrapper(base);
+  if (owner == nullptr) return;
+  base->active_handle_token = UbiRegisterActiveHandle(base->env,
+                                                      owner,
+                                                      ActiveResourceNameForProvider(base->provider_type),
+                                                      StreamBaseHasRefForTracking,
+                                                      StreamBaseGetActiveOwner,
+                                                      base);
 }
 
 napi_value UbiStreamBaseGetWrapper(UbiStreamBase* base) {
@@ -490,6 +538,10 @@ void UbiStreamBaseFinalize(UbiStreamBase* base) {
                             ? base->ops->get_handle(base)
                             : nullptr;
   if (handle == nullptr) {
+    if (base->active_handle_token != nullptr) {
+      UbiUnregisterActiveHandle(base->env, base->active_handle_token);
+      base->active_handle_token = nullptr;
+    }
     DestroyBase(base);
     return;
   }
@@ -519,6 +571,11 @@ void UbiStreamBaseOnClosed(UbiStreamBase* base) {
   }
 
   MaybeCallHandleOnClose(base);
+
+  if (base->active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(base->env, base->active_handle_token);
+    base->active_handle_token = nullptr;
+  }
 
   if (base->delete_on_close || base->finalized) {
     DeleteOnReadRefs(base);

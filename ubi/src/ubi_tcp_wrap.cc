@@ -212,6 +212,7 @@ napi_value TcpCtor(napi_env env, napi_callback_info info) {
     if (tcp_wrap == nullptr) return;
     UbiStreamBaseFinalize(&tcp_wrap->base);
   }, nullptr, &wrap->base.wrapper_ref);
+  UbiStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
   UbiStreamBaseSetInitialStreamProperties(&wrap->base, true, true);
   return self;
 }

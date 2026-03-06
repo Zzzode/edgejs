@@ -1231,53 +1231,6 @@ bool IsUndefinedValue(napi_env env, napi_value value) {
   return napi_typeof(env, value, &type) == napi_ok && type == napi_undefined;
 }
 
-bool EnsureProcessStdinEndMethod(napi_env env) {
-  napi_value global = nullptr;
-  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
-
-  napi_value process_obj = nullptr;
-  if (!GetNamedProperty(env, global, "process", &process_obj)) return false;
-
-  napi_value stdin_obj = nullptr;
-  if (!GetNamedProperty(env, process_obj, "stdin", &stdin_obj) || stdin_obj == nullptr) return false;
-
-  napi_valuetype stdin_type = napi_undefined;
-  if (napi_typeof(env, stdin_obj, &stdin_type) != napi_ok ||
-      (stdin_type != napi_object && stdin_type != napi_function)) {
-    return false;
-  }
-
-  napi_value is_tty_value = nullptr;
-  if (!GetNamedProperty(env, stdin_obj, "isTTY", &is_tty_value)) {
-    return true;
-  }
-  bool is_tty = false;
-  const bool has_tty_flag = (napi_get_value_bool(env, is_tty_value, &is_tty) == napi_ok);
-  const bool is_pseudo_tty_fixture =
-      g_ubi_current_script_path.find("/node/test/pseudo-tty/") != std::string::npos ||
-      g_ubi_current_script_path.find("\\node\\test\\pseudo-tty\\") != std::string::npos;
-  if ((!has_tty_flag || !is_tty) && !is_pseudo_tty_fixture) {
-    return true;
-  }
-
-  napi_value end_value = nullptr;
-  if (GetNamedProperty(env, stdin_obj, "end", &end_value) && IsFunction(env, end_value)) {
-    return true;
-  }
-
-  napi_value end_fn = nullptr;
-  if (napi_create_function(env,
-                           "end",
-                           NAPI_AUTO_LENGTH,
-                           ReturnUndefinedCallback,
-                           nullptr,
-                           &end_fn) != napi_ok ||
-      end_fn == nullptr) {
-    return false;
-  }
-  return napi_set_named_property(env, stdin_obj, "end", end_fn) == napi_ok;
-}
-
 bool CallFunction(napi_env env,
                   napi_value recv,
                   napi_value fn,
@@ -1956,8 +1909,6 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-  (void)EnsureProcessStdinEndMethod(env);
-
   // Bootstrapped JS may assign these via plain property sets; enforce
   // Node-like hidden bootstrap hooks before user code starts.
   if (!define_hidden_global("internalBinding", internal_binding) ||

@@ -11,6 +11,7 @@
 
 #include "internal_binding/helpers.h"
 #include "../ubi_module_loader.h"
+#include "ubi_active_resource.h"
 #include "ubi_runtime.h"
 
 namespace internal_binding {
@@ -426,77 +427,14 @@ struct DeferredReqCompletion {
   napi_ref value_ref = nullptr;
 };
 
-napi_value GetNodeActiveRequestsSymbol(napi_env env) {
-  napi_value global = GetGlobal(env);
-  if (global == nullptr) return nullptr;
-  napi_value symbol_ctor = nullptr;
-  napi_value symbol_for = nullptr;
-  if (napi_get_named_property(env, global, "Symbol", &symbol_ctor) != napi_ok ||
-      symbol_ctor == nullptr ||
-      napi_get_named_property(env, symbol_ctor, "for", &symbol_for) != napi_ok ||
-      symbol_for == nullptr) {
-    return nullptr;
-  }
-  napi_valuetype fn_type = napi_undefined;
-  if (napi_typeof(env, symbol_for, &fn_type) != napi_ok || fn_type != napi_function) return nullptr;
-  napi_value key = nullptr;
-  if (napi_create_string_utf8(env, "node.activeRequests", NAPI_AUTO_LENGTH, &key) != napi_ok || key == nullptr) {
-    return nullptr;
-  }
-  napi_value symbol = nullptr;
-  napi_value argv[1] = {key};
-  if (napi_call_function(env, symbol_ctor, symbol_for, 1, argv, &symbol) != napi_ok || symbol == nullptr) {
-    return nullptr;
-  }
-  return symbol;
-}
-
-napi_value GetOrCreateNodeActiveRequestsArray(napi_env env) {
-  napi_value global = GetGlobal(env);
-  napi_value symbol = GetNodeActiveRequestsSymbol(env);
-  if (global == nullptr || symbol == nullptr) return nullptr;
-
-  napi_value requests = nullptr;
-  if (napi_get_property(env, global, symbol, &requests) == napi_ok && requests != nullptr) {
-    bool is_array = false;
-    if (napi_is_array(env, requests, &is_array) == napi_ok && is_array) return requests;
-  }
-
-  requests = nullptr;
-  if (napi_create_array(env, &requests) != napi_ok || requests == nullptr) return nullptr;
-  if (napi_set_property(env, global, symbol, requests) != napi_ok) return nullptr;
-  return requests;
-}
-
 void TrackActiveRequest(napi_env env, napi_value req) {
   if (req == nullptr || IsUndefined(env, req)) return;
-  napi_value requests = GetOrCreateNodeActiveRequestsArray(env);
-  if (requests == nullptr) return;
-  uint32_t len = 0;
-  if (napi_get_array_length(env, requests, &len) != napi_ok) return;
-  napi_set_element(env, requests, len, req);
+  UbiTrackActiveRequest(env, req, "FSReqCallback");
 }
 
 void UntrackActiveRequest(napi_env env, napi_value req) {
   if (req == nullptr || IsUndefined(env, req)) return;
-  napi_value requests = GetOrCreateNodeActiveRequestsArray(env);
-  if (requests == nullptr) return;
-  uint32_t len = 0;
-  if (napi_get_array_length(env, requests, &len) != napi_ok || len == 0) return;
-  for (uint32_t i = 0; i < len; ++i) {
-    napi_value item = nullptr;
-    if (napi_get_element(env, requests, i, &item) != napi_ok || item == nullptr) continue;
-    bool same = false;
-    if (napi_strict_equals(env, item, req, &same) != napi_ok || !same) continue;
-    for (uint32_t j = i + 1; j < len; ++j) {
-      napi_value next = nullptr;
-      if (napi_get_element(env, requests, j, &next) != napi_ok || next == nullptr) continue;
-      napi_set_element(env, requests, j - 1, next);
-    }
-    bool deleted = false;
-    napi_delete_element(env, requests, len - 1, &deleted);
-    break;
-  }
+  UbiUntrackActiveRequest(env, req);
 }
 
 void DestroyDeferredReqCompletion(DeferredReqCompletion* completion) {

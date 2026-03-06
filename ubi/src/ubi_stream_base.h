@@ -40,6 +40,7 @@ struct UbiStreamBase {
   uint64_t bytes_written = 0;
   int64_t async_id = -1;
   int32_t provider_type = 0;
+  void* active_handle_token = nullptr;
   const UbiStreamBaseOps* ops = nullptr;
 };
 
