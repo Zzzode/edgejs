@@ -1294,8 +1294,11 @@ static napi_value UvGetErrorMapCallback(napi_env env, napi_callback_info /*info*
   UV_ERRNO_MAP(UBI_SET_UV_ERRMAP_ENTRY);
 #undef UBI_SET_UV_ERRMAP_ENTRY
 #ifdef UV_EAI_MEMORY
-  if (!AddUvErrorMapEntry(
-          env, err_map, static_cast<int32_t>(UV_EAI_MEMORY), "EAI_MEMORY", "memory allocation failure")) {
+  const int32_t eai_memory_code =
+      static_cast<int32_t>(UV_EAI_MEMORY) != static_cast<int32_t>(UV_EAI_AGAIN)
+          ? static_cast<int32_t>(UV_EAI_MEMORY)
+          : -3006;
+  if (!AddUvErrorMapEntry(env, err_map, eai_memory_code, "EAI_MEMORY", "memory allocation failure")) {
     return nullptr;
   }
 #endif
@@ -2921,9 +2924,12 @@ static napi_value ResolveUvBinding(napi_env env) {
   set_int32("UV_UNKNOWN", -4094);
 #endif
 #ifdef UV_EAI_MEMORY
-  set_int32("UV_EAI_MEMORY", static_cast<int32_t>(UV_EAI_MEMORY));
+  set_int32("UV_EAI_MEMORY",
+            static_cast<int32_t>(UV_EAI_MEMORY) != static_cast<int32_t>(UV_EAI_AGAIN)
+                ? static_cast<int32_t>(UV_EAI_MEMORY)
+                : -3006);
 #else
-  set_int32("UV_EAI_MEMORY", -3001);
+  set_int32("UV_EAI_MEMORY", -3006);
 #endif
 
   auto define_method = [&](const char* method_name, napi_callback cb) -> bool {

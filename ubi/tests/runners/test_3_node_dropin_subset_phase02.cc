@@ -954,6 +954,14 @@ TEST_F(Test3NodeDropinSubsetPhase02, NodeCompatEventEmitterMethodNamesTest) {
     EXPECT_TRUE(error.empty()) << "error=" << error;            \
   }
 
+#define DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(test_name, script_name) \
+  TEST_F(Test3NodeDropinSubsetPhase02, test_name) {              \
+    std::string error;                                            \
+    const int exit_code = RunRawNodeTestScriptInSubprocess(script_name, &error); \
+    EXPECT_EQ(exit_code, 0) << "error=" << error;                \
+    EXPECT_TRUE(error.empty()) << "error=" << error;             \
+  }
+
 #define DEFINE_RAW_NODE_SUBPROCESS_TEST(test_name, script_name) \
   TEST_F(Test3NodeDropinSubsetPhase02, test_name) {             \
     if (RawNodeScriptStartsWithFlagsHeader(script_name)) {      \
@@ -1492,25 +1500,25 @@ DEFINE_RAW_NODE_TEST(RawDnsFromNodeTest, "test-dns.js")
 DEFINE_RAW_NODE_TEST(RawDnsSetserversTypeCheckFromNodeTest, "test-dns-setservers-type-check.js")
 DEFINE_RAW_NODE_TEST(RawDnsSetserverWhenQueryingFromNodeTest, "test-dns-setserver-when-querying.js")
 DEFINE_RAW_NODE_TEST(RawDnsSetlocaladdressFromNodeTest, "test-dns-setlocaladdress.js")
-DEFINE_RAW_NODE_TEST(RawDnsSetDefaultOrderFromNodeTest, "test-dns-set-default-order.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsSetDefaultOrderFromNodeTest, "test-dns-set-default-order.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolverMaxTimeoutFromNodeTest, "test-dns-resolver-max-timeout.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolvensTypeerrorFromNodeTest, "test-dns-resolvens-typeerror.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolveanyFromNodeTest, "test-dns-resolveany.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolveanyBadAncountFromNodeTest, "test-dns-resolveany-bad-ancount.js")
-DEFINE_RAW_NODE_TEST(RawDnsResolvePromisesFromNodeTest, "test-dns-resolve-promises.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsResolvePromisesFromNodeTest, "test-dns-resolve-promises.js")
 DEFINE_RAW_NODE_TEST(RawDnsPromisesExistsFromNodeTest, "test-dns-promises-exists.js")
 DEFINE_RAW_NODE_TEST(RawDnsPerfHooksFromNodeTest, "test-dns-perf_hooks.js")
 DEFINE_RAW_NODE_TEST(RawDnsMultiChannelFromNodeTest, "test-dns-multi-channel.js")
-DEFINE_RAW_NODE_TEST(RawDnsMemoryErrorFromNodeTest, "test-dns-memory-error.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupServiceFromNodeTest, "test-dns-lookupService.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsMemoryErrorFromNodeTest, "test-dns-memory-error.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupServiceFromNodeTest, "test-dns-lookupService.js")
 DEFINE_RAW_NODE_TEST(RawDnsLookupServicePromisesFromNodeTest, "test-dns-lookupService-promises.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupFromNodeTest, "test-dns-lookup.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupPromisesFromNodeTest, "test-dns-lookup-promises.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupPromisesOptionsDeprecatedFromNodeTest, "test-dns-lookup-promises-options-deprecated.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupFromNodeTest, "test-dns-lookup.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupPromisesFromNodeTest, "test-dns-lookup-promises.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupPromisesOptionsDeprecatedFromNodeTest, "test-dns-lookup-promises-options-deprecated.js")
 DEFINE_RAW_NODE_TEST(RawDnsGetServerFromNodeTest, "test-dns-get-server.js")
-DEFINE_RAW_NODE_TEST(RawDnsDefaultOrderVerbatimFromNodeTest, "test-dns-default-order-verbatim.js")
-DEFINE_RAW_NODE_TEST(RawDnsDefaultOrderIpv6FromNodeTest, "test-dns-default-order-ipv6.js")
-DEFINE_RAW_NODE_TEST(RawDnsDefaultOrderIpv4FromNodeTest, "test-dns-default-order-ipv4.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsDefaultOrderVerbatimFromNodeTest, "test-dns-default-order-verbatim.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsDefaultOrderIpv6FromNodeTest, "test-dns-default-order-ipv6.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsDefaultOrderIpv4FromNodeTest, "test-dns-default-order-ipv4.js")
 DEFINE_RAW_NODE_TEST(RawDnsChannelTimeoutFromNodeTest, "test-dns-channel-timeout.js")
 DEFINE_RAW_NODE_TEST(RawDnsChannelCancelFromNodeTest, "test-dns-channel-cancel.js")
 DEFINE_RAW_NODE_TEST(RawDnsChannelCancelPromiseFromNodeTest, "test-dns-channel-cancel-promise.js")
