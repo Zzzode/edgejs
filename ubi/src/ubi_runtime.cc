@@ -20,8 +20,11 @@
 
 #include <uv.h>
 #include <openssl/crypto.h>
+#include <openssl/conf.h>
+#include <openssl/err.h>
 
 #include "unofficial_napi.h"
+#include "ncrypto.h"
 
 #if defined(_WIN32)
 #include <io.h>
@@ -431,6 +434,11 @@ bool EmitProcessLifecycleEvent(napi_env env, const char* event_name, int exit_co
 bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled_out) {
   if (handled_out != nullptr) *handled_out = false;
   if (exception == nullptr) return false;
+  // Worker-thread environments should surface uncaught exceptions back to the
+  // parent Worker object instead of running process._fatalException locally.
+  if (!UbiWorkerEnvOwnsProcessState(env)) {
+    return false;
+  }
 
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
@@ -1094,6 +1102,42 @@ bool ReadExecArgvUint64Option(const char* prefix, uint64_t* out, bool* found) {
   return true;
 }
 
+bool ReadExecArgvStringOptionFrom(const std::vector<std::string>& exec_argv,
+                                  const char* prefix,
+                                  std::string* out,
+                                  bool* found) {
+  if (found != nullptr) *found = false;
+  if (prefix == nullptr || out == nullptr) return false;
+  const std::string needle(prefix);
+  for (const auto& arg : exec_argv) {
+    if (arg.rfind(needle, 0) != 0) continue;
+    out->assign(arg.data() + needle.size(), arg.size() - needle.size());
+    if (found != nullptr) *found = true;
+  }
+  return true;
+}
+
+bool ExecArgvHasFlagIn(const std::vector<std::string>& exec_argv, const char* flag) {
+  if (flag == nullptr || flag[0] == '\0') return false;
+  for (const auto& arg : exec_argv) {
+    if (arg == flag) return true;
+  }
+  return false;
+}
+
+std::string GetOpenSslErrorString() {
+  std::string out;
+  ERR_print_errors_cb(
+      [](const char* str, size_t len, void* opaque) -> int {
+        std::string* text = static_cast<std::string*>(opaque);
+        text->append(str, len);
+        text->push_back('\n');
+        return 0;
+      },
+      static_cast<void*>(&out));
+  return out;
+}
+
 bool ConfigureSecureHeapFromExecArgv(std::string* error_out) {
   uint64_t secure_heap = 0;
   uint64_t secure_heap_min = 0;
@@ -1135,6 +1179,63 @@ bool ConfigureSecureHeapFromExecArgv(std::string* error_out) {
     return false;
   }
   return true;
+}
+
+bool ConfigureOpenSslFromExecArgv(const std::vector<std::string>& exec_argv,
+                                  std::string* error_out) {
+#if OPENSSL_VERSION_MAJOR < 3
+  return true;
+#else
+  const char* conf_file = nullptr;
+  const char* conf_section_name = "nodejs_conf";
+  if (ExecArgvHasFlagIn(exec_argv, "--openssl-shared-config")) {
+    conf_section_name = "openssl_conf";
+  }
+
+  std::string env_openssl_conf;
+  if (const char* env = std::getenv("OPENSSL_CONF"); env != nullptr && env[0] != '\0') {
+    env_openssl_conf = env;
+    conf_file = env_openssl_conf.c_str();
+  }
+
+  std::string arg_openssl_conf;
+  bool has_arg_openssl_conf = false;
+  if (!ReadExecArgvStringOptionFrom(
+          exec_argv, "--openssl-config=", &arg_openssl_conf, &has_arg_openssl_conf)) {
+    if (error_out != nullptr) {
+      *error_out = "Invalid --openssl-config value";
+    }
+    return false;
+  }
+  if (has_arg_openssl_conf) {
+    conf_file = arg_openssl_conf.c_str();
+  }
+
+  OPENSSL_INIT_SETTINGS* settings = OPENSSL_INIT_new();
+  if (settings == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to allocate OpenSSL init settings";
+    }
+    return false;
+  }
+
+  OPENSSL_INIT_set_config_filename(settings, conf_file);
+  OPENSSL_INIT_set_config_appname(settings, conf_section_name);
+  OPENSSL_INIT_set_config_file_flags(settings, CONF_MFLAGS_IGNORE_MISSING_FILE);
+
+  ERR_clear_error();
+  OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, settings);
+  OPENSSL_INIT_free(settings);
+
+  if (ERR_peek_error() != 0) {
+    if (error_out != nullptr) {
+      *error_out = "OpenSSL configuration error:\n" + GetOpenSslErrorString();
+    }
+    return false;
+  }
+
+  return true;
+#endif
 }
 
 bool ExecArgvHasFlag(const char* flag) {
@@ -2379,6 +2480,18 @@ int UbiRunWorkerThreadMain(napi_env env,
       "})()";
   return RunScriptWithGlobals(
       env, kWorkerBootstrapSource, nullptr, error_out, true, UbiBootstrapMode::kWorkerThread);
+}
+
+bool UbiInitializeOpenSslForCli(std::string* error_out) {
+  if (!ConfigureOpenSslFromExecArgv(g_ubi_cli_exec_argv, error_out)) {
+    return false;
+  }
+  // Match Node's startup behavior closely enough to fail fast when the loaded
+  // provider configuration leaves no usable CSPRNG implementation.
+  if (!ncrypto::CSPRNG(nullptr, 0)) {
+    std::abort();
+  }
+  return true;
 }
 
 void UbiSetScriptArgv(const std::vector<std::string>& script_argv) {

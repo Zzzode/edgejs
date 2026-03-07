@@ -63,6 +63,10 @@ void ResetSignalHandlersLikeNode() {
 }
 
 int RunWithFreshEnv(const std::function<int(napi_env)>& runner, std::string* error_out) {
+  if (!UbiInitializeOpenSslForCli(error_out)) {
+    return 1;
+  }
+
   napi_env env = nullptr;
   void* env_scope = nullptr;
   const napi_status create_status = unofficial_napi_create_env(8, &env, &env_scope);

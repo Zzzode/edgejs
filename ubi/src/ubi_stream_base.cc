@@ -558,24 +558,26 @@ void UbiStreamBaseSetInitialStreamProperties(UbiStreamBase* base,
   if (base == nullptr || base->env == nullptr) return;
   napi_value self = UbiStreamBaseGetWrapper(base);
   if (self == nullptr) return;
+  const auto writable_js_property = static_cast<napi_property_attributes>(
+      napi_writable | napi_enumerable | napi_configurable);
 
   DefineValueProperty(base->env,
                       self,
                       "isStreamBase",
                       UbiStreamBaseMakeBool(base->env, true),
-                      static_cast<napi_property_attributes>(0));
+                      napi_default);
   DefineValueProperty(base->env,
                       self,
                       "reading",
                       UbiStreamBaseMakeBool(base->env, false),
-                      napi_writable);
+                      writable_js_property);
 
   if (set_onconnection) {
     DefineValueProperty(base->env,
                         self,
                         "onconnection",
                         UbiStreamBaseUndefined(base->env),
-                        napi_writable);
+                        writable_js_property);
   }
 
   if (set_owner_symbol) {

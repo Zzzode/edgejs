@@ -26,6 +26,7 @@ int UbiRunScriptFileWithLoop(napi_env env,
 int UbiRunWorkerThreadMain(napi_env env,
                            const std::vector<std::string>& exec_argv,
                            std::string* error_out);
+bool UbiInitializeOpenSslForCli(std::string* error_out);
 void UbiSetScriptArgv(const std::vector<std::string>& script_argv);
 void UbiSetExecArgv(const std::vector<std::string>& exec_argv);
 bool UbiExecArgvHasFlag(const char* flag);

@@ -291,15 +291,9 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
 #ifdef RSA_PSS_SALTLEN_AUTO
   EnsureInt32Default(env, crypto_obj, "RSA_PSS_SALTLEN_AUTO", RSA_PSS_SALTLEN_AUTO);
 #endif
-#ifdef POINT_CONVERSION_COMPRESSED
   EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_COMPRESSED", POINT_CONVERSION_COMPRESSED);
-#endif
-#ifdef POINT_CONVERSION_UNCOMPRESSED
   EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_UNCOMPRESSED", POINT_CONVERSION_UNCOMPRESSED);
-#endif
-#ifdef POINT_CONVERSION_HYBRID
   EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_HYBRID", POINT_CONVERSION_HYBRID);
-#endif
 }
 
 }  // namespace

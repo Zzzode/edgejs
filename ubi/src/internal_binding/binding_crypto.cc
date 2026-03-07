@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -14,9 +15,11 @@
 
 #include <openssl/bio.h>
 #include <openssl/bn.h>
+#include <openssl/bnerr.h>
 #include <openssl/crypto.h>
 #include <openssl/core_names.h>
 #include <openssl/dh.h>
+#include <openssl/dherr.h>
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
 #include <openssl/err.h>
@@ -52,6 +55,7 @@ constexpr int32_t kKeyEncodingSPKI = 2;
 constexpr int32_t kKeyEncodingSEC1 = 3;
 constexpr int32_t kKeyVariantRSA_SSA_PKCS1_v1_5 = 0;
 constexpr int32_t kKeyVariantRSA_PSS = 1;
+constexpr int32_t kKeyVariantRSA_OAEP = 2;
 
 struct CryptoBindingState {
   napi_ref binding_ref = nullptr;
@@ -122,6 +126,46 @@ void SetNamedBool(napi_env env, napi_value obj, const char* name, bool value) {
   if (napi_get_boolean(env, value, &v) == napi_ok && v != nullptr) napi_set_named_property(env, obj, name, v);
 }
 
+void ClearPendingException(napi_env env) {
+  if (env == nullptr) return;
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return;
+  napi_value ignored = nullptr;
+  napi_get_and_clear_last_exception(env, &ignored);
+}
+
+void EmitProcessDeprecationWarning(napi_env env, const char* message, const char* code) {
+  if (env == nullptr || message == nullptr) return;
+  napi_value global = nullptr;
+  napi_value process = nullptr;
+  napi_value emit_warning = nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "process", &process) != napi_ok || process == nullptr ||
+      napi_get_named_property(env, process, "emitWarning", &emit_warning) != napi_ok || emit_warning == nullptr ||
+      napi_typeof(env, emit_warning, &type) != napi_ok || type != napi_function) {
+    return;
+  }
+
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  size_t argc = 1;
+  if (napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &argv[0]) != napi_ok || argv[0] == nullptr) return;
+  if (napi_create_string_utf8(env, "DeprecationWarning", NAPI_AUTO_LENGTH, &argv[1]) == napi_ok &&
+      argv[1] != nullptr) {
+    argc = 2;
+    if (code != nullptr &&
+        napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &argv[2]) == napi_ok &&
+        argv[2] != nullptr) {
+      argc = 3;
+    }
+  }
+
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, process, emit_warning, argc, argv, &ignored) != napi_ok) {
+    ClearPendingException(env);
+  }
+}
+
 bool GetByteSpan(napi_env env, napi_value value, const uint8_t** data, size_t* length) {
   if (value == nullptr || data == nullptr || length == nullptr) return false;
   *data = nullptr;
@@ -154,6 +198,7 @@ bool GetByteSpan(napi_env env, napi_value value, const uint8_t** data, size_t* l
         break;
       case napi_int16_array:
       case napi_uint16_array:
+      case napi_float16_array:
         bytes_per_element = 2;
         break;
       case napi_int32_array:
@@ -180,6 +225,21 @@ bool GetByteSpan(napi_env env, napi_value value, const uint8_t** data, size_t* l
     void* raw = nullptr;
     if (napi_get_arraybuffer_info(env, value, &raw, length) != napi_ok || raw == nullptr) return false;
     *data = static_cast<const uint8_t*>(raw);
+    return true;
+  }
+
+  bool is_dataview = false;
+  if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) {
+    size_t byte_length = 0;
+    void* raw = nullptr;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_dataview_info(env, value, &byte_length, &raw, &arraybuffer, &byte_offset) != napi_ok ||
+        raw == nullptr) {
+      return false;
+    }
+    *data = static_cast<const uint8_t*>(raw);
+    *length = byte_length;
     return true;
   }
 
@@ -409,6 +469,23 @@ napi_value CopyAsArrayBuffer(napi_env env, napi_value value) {
   return out;
 }
 
+napi_value CreateArrayBufferCopy(napi_env env, const uint8_t* data, size_t len) {
+  napi_value out = nullptr;
+  void* raw = nullptr;
+  if (napi_create_arraybuffer(env, len, &raw, &out) != napi_ok || out == nullptr) {
+    return Undefined(env);
+  }
+  if (len > 0) {
+    if (raw == nullptr) return Undefined(env);
+    std::memcpy(raw, data, len);
+  }
+  return out;
+}
+
+napi_value CreateArrayBufferCopy(napi_env env, const std::vector<uint8_t>& bytes) {
+  return CreateArrayBufferCopy(env, bytes.empty() ? nullptr : bytes.data(), bytes.size());
+}
+
 void SetClassPrototypeMethod(napi_env env,
                              napi_value binding,
                              const char* class_name,
@@ -446,7 +523,12 @@ napi_value CreateErrorWithCode(napi_env env, const char* code, const std::string
   napi_value code_v = nullptr;
   napi_value msg_v = nullptr;
   napi_value err_v = nullptr;
-  napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_v);
+  const bool has_code = code != nullptr;
+  if (code != nullptr) {
+    napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_v);
+  } else {
+    napi_get_undefined(env, &code_v);
+  }
   napi_create_string_utf8(env, message.c_str(), NAPI_AUTO_LENGTH, &msg_v);
   bool as_type_error = false;
   bool as_range_error = false;
@@ -454,10 +536,12 @@ napi_value CreateErrorWithCode(napi_env env, const char* code, const std::string
     if (std::strcmp(code, "ERR_INVALID_ARG_TYPE") == 0 ||
         std::strcmp(code, "ERR_INVALID_ARG_VALUE") == 0 ||
         std::strcmp(code, "ERR_MISSING_OPTION") == 0 ||
-        std::strcmp(code, "ERR_CRYPTO_INVALID_CURVE") == 0) {
+        std::strcmp(code, "ERR_CRYPTO_INVALID_CURVE") == 0 ||
+        std::strcmp(code, "ERR_CRYPTO_INVALID_AUTH_TAG") == 0) {
       as_type_error = true;
     } else if (std::strcmp(code, "ERR_OUT_OF_RANGE") == 0 ||
-               std::strcmp(code, "ERR_CRYPTO_INVALID_KEYLEN") == 0) {
+               std::strcmp(code, "ERR_CRYPTO_INVALID_KEYLEN") == 0 ||
+               std::strcmp(code, "ERR_CRYPTO_INVALID_KEYPAIR") == 0) {
       as_range_error = true;
     }
   }
@@ -468,14 +552,254 @@ napi_value CreateErrorWithCode(napi_env env, const char* code, const std::string
   } else {
     napi_create_error(env, code_v, msg_v, &err_v);
   }
-  if (err_v != nullptr && code_v != nullptr) napi_set_named_property(env, err_v, "code", code_v);
+  if (has_code && err_v != nullptr && code_v != nullptr) napi_set_named_property(env, err_v, "code", code_v);
   return err_v != nullptr ? err_v : Undefined(env);
 }
+
+void SetErrorStringProperty(napi_env env, napi_value err, const char* name, const char* value) {
+  if (err == nullptr || name == nullptr || value == nullptr || value[0] == '\0') return;
+  napi_value v = nullptr;
+  if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &v) == napi_ok && v != nullptr) {
+    napi_set_named_property(env, err, name, v);
+  }
+}
+
+const char* MapOpenSslErrorCode(unsigned long err) {
+  if (err == 0) return nullptr;
+  const char* library = ERR_lib_error_string(err);
+  const char* reason = ERR_reason_error_string(err);
+  if (reason != nullptr &&
+      std::strcmp(reason, "bad decrypt") == 0) {
+    return "ERR_OSSL_BAD_DECRYPT";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "wrong final block length") == 0) {
+    return "ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "data not multiple of block length") == 0) {
+    return "ERR_OSSL_DATA_NOT_MULTIPLE_OF_BLOCK_LENGTH";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "bignum too long") == 0) {
+    return "ERR_OSSL_BN_BIGNUM_TOO_LONG";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "missing OID") == 0) {
+    return "ERR_OSSL_MISSING_OID";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "modulus too small") == 0) {
+    return "ERR_OSSL_DH_MODULUS_TOO_SMALL";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "bits too small") == 0) {
+    return "ERR_OSSL_BN_BITS_TOO_SMALL";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "bad generator") == 0) {
+    return "ERR_OSSL_DH_BAD_GENERATOR";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "mismatching domain parameters") == 0) {
+    return "ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "different parameters") == 0) {
+    return "ERR_OSSL_EVP_DIFFERENT_PARAMETERS";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "interrupted or cancelled") == 0) {
+    return "ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED";
+  }
+  if (library != nullptr &&
+      reason != nullptr &&
+      std::strcmp(library, "DECODER routines") == 0 &&
+      std::strcmp(reason, "unsupported") == 0) {
+    return "ERR_OSSL_UNSUPPORTED";
+  }
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+  const char* function = ERR_func_error_string(err);
+  if (library != nullptr &&
+      reason != nullptr &&
+      function != nullptr &&
+      std::strcmp(library, "PEM routines") == 0 &&
+      std::strcmp(function, "get_name") == 0 &&
+      std::strcmp(reason, "no start line") == 0) {
+    return "ERR_OSSL_PEM_NO_START_LINE";
+  }
+#endif
+  return nullptr;
+}
+
+int OpenSslErrorPriority(unsigned long err) {
+  if (err == 0) return -1;
+  const char* library = ERR_lib_error_string(err);
+  const char* reason = ERR_reason_error_string(err);
+  if (reason != nullptr &&
+      std::strcmp(reason, "bad decrypt") == 0) {
+    return 110;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "wrong final block length") == 0) {
+    return 108;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "data not multiple of block length") == 0) {
+    return 107;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "bignum too long") == 0) {
+    return 106;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "missing OID") == 0) {
+    return 95;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "modulus too small") == 0) {
+    return 94;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "bits too small") == 0) {
+    return 94;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "bad generator") == 0) {
+    return 94;
+  }
+  if (reason != nullptr &&
+      (std::strcmp(reason, "mismatching domain parameters") == 0 ||
+       std::strcmp(reason, "different parameters") == 0)) {
+    return 94;
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "interrupted or cancelled") == 0) {
+    return 90;
+  }
+  if (library != nullptr &&
+      reason != nullptr &&
+      std::strcmp(library, "DECODER routines") == 0 &&
+      std::strcmp(reason, "unsupported") == 0) {
+    return 90;
+  }
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+  const char* function = ERR_func_error_string(err);
+  if (library != nullptr &&
+      reason != nullptr &&
+      function != nullptr &&
+      std::strcmp(library, "PEM routines") == 0 &&
+      std::strcmp(function, "get_name") == 0 &&
+      std::strcmp(reason, "no start line") == 0) {
+    return 80;
+  }
+#endif
+  return 0;
+}
+
+napi_value CreateOpenSslError(napi_env env,
+                              const char* code,
+                              unsigned long err,
+                              const char* fallback_message) {
+  std::string message = fallback_message != nullptr ? fallback_message : "OpenSSL error";
+  if (err != 0) {
+    char buf[256];
+    ERR_error_string_n(err, buf, sizeof(buf));
+    message = buf;
+  }
+  napi_value error = CreateErrorWithCode(env, code, message);
+  if (error == nullptr || IsUndefined(env, error) || err == 0) return error;
+  SetErrorStringProperty(env, error, "library", ERR_lib_error_string(err));
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+  SetErrorStringProperty(env, error, "function", ERR_func_error_string(err));
+#endif
+  SetErrorStringProperty(env, error, "reason", ERR_reason_error_string(err));
+  return error;
+}
+
+void ThrowLastOpenSslMessage(napi_env env, const char* fallback_message) {
+  unsigned long err = 0;
+  unsigned long selected = 0;
+  int selected_priority = -1;
+  while ((err = ERR_get_error()) != 0) {
+    const int priority = OpenSslErrorPriority(err);
+    if (selected == 0 || priority > selected_priority) {
+      selected = err;
+      selected_priority = priority;
+    }
+  }
+  if (selected == 0) {
+    napi_throw_error(env, nullptr, fallback_message);
+    return;
+  }
+  napi_throw(env, CreateOpenSslError(env, MapOpenSslErrorCode(selected), selected, fallback_message));
+}
+
+unsigned long ConsumePreferredOpenSslError() {
+  unsigned long err = 0;
+  unsigned long selected = 0;
+  int selected_priority = -1;
+  while ((err = ERR_get_error()) != 0) {
+    const int priority = OpenSslErrorPriority(err);
+    if (selected == 0 || priority > selected_priority) {
+      selected = err;
+      selected_priority = priority;
+    }
+  }
+  return selected;
+}
+
+constexpr unsigned long kOpenSslDecoderUnsupportedError = 0x1E08010CUL;
 
 napi_value BuildJobResult(napi_env env, napi_value err, napi_value value);
 
 napi_value BuildJobErrorResult(napi_env env, const char* code, const std::string& message) {
   return BuildJobResult(env, CreateErrorWithCode(env, code, message), Undefined(env));
+}
+
+napi_value BuildJobOpenSslErrorResult(napi_env env,
+                                      const char* fallback_code,
+                                      const char* fallback_message) {
+  const unsigned long err = ConsumePreferredOpenSslError();
+  napi_value error = err != 0 ? CreateOpenSslError(env, MapOpenSslErrorCode(err), err, fallback_message)
+                              : CreateErrorWithCode(env, fallback_code, fallback_message);
+  return BuildJobResult(env, error, Undefined(env));
+}
+
+void SetPreferredOpenSslError(std::string* code,
+                              std::string* message,
+                              const char* fallback_code,
+                              const char* fallback_message) {
+  if (code == nullptr || message == nullptr) return;
+
+  unsigned long err = 0;
+  unsigned long selected = 0;
+  int selected_priority = -1;
+  while ((err = ERR_get_error()) != 0) {
+    const int priority = OpenSslErrorPriority(err);
+    if (selected == 0 || priority > selected_priority) {
+      selected = err;
+      selected_priority = priority;
+    }
+  }
+
+  if (selected != 0) {
+    if (const char* mapped = MapOpenSslErrorCode(selected)) {
+      *code = mapped;
+    } else if (fallback_code != nullptr) {
+      *code = fallback_code;
+    } else {
+      code->clear();
+    }
+
+    char buf[256];
+    ERR_error_string_n(selected, buf, sizeof(buf));
+    *message = buf;
+    return;
+  }
+
+  *code = fallback_code != nullptr ? fallback_code : "";
+  *message = fallback_message != nullptr ? fallback_message : "OpenSSL error";
 }
 
 std::vector<uint8_t> BytesFromBio(BIO* bio) {
@@ -536,6 +860,14 @@ void SetJwkFieldFromBigNum(napi_env env, napi_value obj, const char* name, const
   SetObjectString(env, obj, name, encoded);
 }
 
+std::vector<uint8_t> BigNumToPaddedBytes(const BIGNUM* bn, size_t size) {
+  if (bn == nullptr) return {};
+  if (size == 0) return BigNumToBytes(bn);
+  std::vector<uint8_t> out(size, 0);
+  if (BN_bn2binpad(bn, out.data(), static_cast<int>(size)) < 0) return {};
+  return out;
+}
+
 int CurveNidFromName(const std::string& name) {
   if (name.empty()) return NID_undef;
   if (name == "P-256") return NID_X9_62_prime256v1;
@@ -560,6 +892,53 @@ std::string JwkCurveFromNid(int nid) {
     default:
       return "";
   }
+}
+
+bool ResolveEcJwkCurve(EVP_PKEY* pkey,
+                       const std::string& curve_name_hint,
+                       int* out_nid,
+                       std::string* out_curve_name,
+                       size_t* out_field_bytes) {
+  if (out_nid != nullptr) *out_nid = NID_undef;
+  if (out_curve_name != nullptr) *out_curve_name = curve_name_hint;
+  if (out_field_bytes != nullptr) *out_field_bytes = 0;
+  if (pkey == nullptr) return false;
+
+  int nid = NID_undef;
+  std::string curve_name = curve_name_hint;
+  char group_name[80];
+  size_t group_name_len = 0;
+  if (EVP_PKEY_get_utf8_string_param(
+          pkey, OSSL_PKEY_PARAM_GROUP_NAME, group_name, sizeof(group_name), &group_name_len) == 1 &&
+      group_name_len > 0) {
+    curve_name.assign(group_name, group_name_len);
+    nid = CurveNidFromName(curve_name);
+  }
+
+  EC_KEY* ec = EVP_PKEY_get1_EC_KEY(pkey);
+  if (ec != nullptr) {
+    const EC_GROUP* group = EC_KEY_get0_group(ec);
+    if (group != nullptr) {
+      if (nid == NID_undef) nid = EC_GROUP_get_curve_name(group);
+      if (out_field_bytes != nullptr) {
+        const int degree = EC_GROUP_get_degree(group);
+        if (degree > 0) *out_field_bytes = static_cast<size_t>((degree + 7) / 8);
+      }
+    }
+    EC_KEY_free(ec);
+  }
+
+  if (out_nid != nullptr) *out_nid = nid;
+  if (out_curve_name != nullptr) *out_curve_name = curve_name;
+  return nid != NID_undef;
+}
+
+int RawKeyNidFromName(const std::string& name) {
+  if (name == "Ed25519") return EVP_PKEY_ED25519;
+  if (name == "Ed448") return EVP_PKEY_ED448;
+  if (name == "X25519") return EVP_PKEY_X25519;
+  if (name == "X448") return EVP_PKEY_X448;
+  return NID_undef;
 }
 
 std::string AsymmetricKeyTypeName(const EVP_PKEY* pkey) {
@@ -588,39 +967,95 @@ std::string AsymmetricKeyTypeName(const EVP_PKEY* pkey) {
   }
 }
 
-EVP_PKEY* ParsePrivateKeyBytes(const uint8_t* data, size_t len) {
+std::vector<uint8_t> Base64UrlDecode(std::string in) {
+  std::vector<uint8_t> out;
+  if (in.empty()) return out;
+  for (char& ch : in) {
+    if (ch == '-') {
+      ch = '+';
+    } else if (ch == '_') {
+      ch = '/';
+    }
+  }
+  const size_t remainder = in.size() % 4;
+  if (remainder == 1) return {};
+  const size_t padding = remainder == 0 ? 0 : 4 - remainder;
+  in.append(padding, '=');
+  out.resize((in.size() / 4) * 3);
+  const int written =
+      EVP_DecodeBlock(out.data(),
+                      reinterpret_cast<const unsigned char*>(in.data()),
+                      static_cast<int>(in.size()));
+  if (written < 0) return {};
+  size_t out_len = static_cast<size_t>(written);
+  if (padding > 0 && out_len >= padding) out_len -= padding;
+  out.resize(out_len);
+  return out;
+}
+
+EVP_PKEY* ParsePrivateKeyBytesWithPassphrase(const uint8_t* data,
+                                             size_t len,
+                                             const uint8_t* passphrase,
+                                             size_t passphrase_len,
+                                             bool has_passphrase) {
   if (data == nullptr || len == 0) return nullptr;
+  auto looks_like_pem = [](const uint8_t* bytes, size_t size) {
+    size_t i = 0;
+    while (i < size && (bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\r' || bytes[i] == '\n')) ++i;
+    static constexpr char kPemPrefix[] = "-----BEGIN ";
+    const size_t prefix_len = sizeof(kPemPrefix) - 1;
+    return size >= i + prefix_len && std::memcmp(bytes + i, kPemPrefix, prefix_len) == 0;
+  };
   BIO* bio = BIO_new_mem_buf(data, static_cast<int>(len));
   if (bio == nullptr) return nullptr;
-  EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
-  if (pkey == nullptr) {
-    (void)BIO_reset(bio);
+  void* passphrase_ptr = has_passphrase
+                             ? const_cast<unsigned char*>(
+                                   passphrase_len == 0 ? reinterpret_cast<const unsigned char*>("")
+                                                       : passphrase)
+                             : nullptr;
+  EVP_PKEY* pkey = nullptr;
+  if (looks_like_pem(data, len)) {
+    pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, passphrase_ptr);
+  } else {
     pkey = d2i_PrivateKey_bio(bio, nullptr);
   }
   BIO_free(bio);
   return pkey;
 }
 
+EVP_PKEY* ParsePrivateKeyBytes(const uint8_t* data, size_t len) {
+  return ParsePrivateKeyBytesWithPassphrase(data, len, nullptr, 0, false);
+}
+
 EVP_PKEY* ParsePublicKeyBytes(const uint8_t* data, size_t len) {
   if (data == nullptr || len == 0) return nullptr;
+  auto looks_like_pem = [](const uint8_t* bytes, size_t size) {
+    size_t i = 0;
+    while (i < size && (bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\r' || bytes[i] == '\n')) ++i;
+    static constexpr char kPemPrefix[] = "-----BEGIN ";
+    const size_t prefix_len = sizeof(kPemPrefix) - 1;
+    return size >= i + prefix_len && std::memcmp(bytes + i, kPemPrefix, prefix_len) == 0;
+  };
   BIO* bio = BIO_new_mem_buf(data, static_cast<int>(len));
   if (bio == nullptr) return nullptr;
-  EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
-  if (pkey == nullptr) {
-    (void)BIO_reset(bio);
+  EVP_PKEY* pkey = nullptr;
+  X509* cert = nullptr;
+  if (looks_like_pem(data, len)) {
+    pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    if (pkey == nullptr) {
+      (void)BIO_reset(bio);
+      cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    }
+  } else {
     pkey = d2i_PUBKEY_bio(bio, nullptr);
-  }
-  if (pkey == nullptr) {
-    (void)BIO_reset(bio);
-    X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
-    if (cert == nullptr) {
+    if (pkey == nullptr) {
       (void)BIO_reset(bio);
       cert = d2i_X509_bio(bio, nullptr);
     }
-    if (cert != nullptr) {
-      pkey = X509_get_pubkey(cert);
-      X509_free(cert);
-    }
+  }
+  if (cert != nullptr) {
+    pkey = X509_get_pubkey(cert);
+    X509_free(cert);
   }
   BIO_free(bio);
   return pkey;
@@ -632,11 +1067,21 @@ EVP_PKEY* ParseAnyKeyBytes(const std::vector<uint8_t>& data) {
   return pkey;
 }
 
+EVP_PKEY* ParseAnyKeyBytes(const std::vector<uint8_t>& data,
+                          const std::vector<uint8_t>& passphrase,
+                          bool has_passphrase) {
+  EVP_PKEY* pkey = ParsePrivateKeyBytesWithPassphrase(
+      data.data(), data.size(), passphrase.data(), passphrase.size(), has_passphrase);
+  if (pkey == nullptr) pkey = ParsePublicKeyBytes(data.data(), data.size());
+  return pkey;
+}
+
 struct HashWrap {
   napi_ref wrapper_ref = nullptr;
   std::string algorithm;
   std::vector<uint8_t> data;
-  int32_t xof_len = -1;
+  int32_t output_len = -1;
+  bool use_xof = false;
   bool finalized = false;
   std::vector<uint8_t> digest_cache;
 };
@@ -668,27 +1113,54 @@ napi_value HashCtor(napi_env env, napi_callback_info info) {
     if (source != nullptr) {
       wrap->algorithm = source->algorithm;
       wrap->data = source->data;
-      wrap->xof_len = source->xof_len;
       wrap->finalized = source->finalized;
       wrap->digest_cache = source->digest_cache;
-      napi_wrap(env, this_arg, wrap, HashFinalize, nullptr, &wrap->wrapper_ref);
-      return this_arg;
-    }
-  }
-  if (argc >= 1 && argv[0] != nullptr) {
-    size_t len = 0;
-    if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &len) == napi_ok) {
-      wrap->algorithm.resize(len + 1);
-      size_t copied = 0;
-      if (napi_get_value_string_utf8(env, argv[0], wrap->algorithm.data(), wrap->algorithm.size(), &copied) == napi_ok) {
-        wrap->algorithm.resize(copied);
+    } else {
+      size_t len = 0;
+      if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &len) == napi_ok) {
+        wrap->algorithm.resize(len + 1);
+        size_t copied = 0;
+        if (napi_get_value_string_utf8(
+                env, argv[0], wrap->algorithm.data(), wrap->algorithm.size(), &copied) == napi_ok) {
+          wrap->algorithm.resize(copied);
+        }
       }
     }
   }
-  if (argc >= 2 && argv[1] != nullptr) {
-    napi_get_value_int32(env, argv[1], &wrap->xof_len);
+
+  if (wrap->algorithm.empty()) {
+    delete wrap;
+    napi_throw_error(env, nullptr, "Digest method not supported");
+    return nullptr;
   }
-  if (wrap->algorithm.empty()) wrap->algorithm = "sha256";
+
+  const ncrypto::Digest md = ncrypto::Digest::FromName(wrap->algorithm.c_str());
+  if (!md) {
+    delete wrap;
+    napi_throw_error(env, nullptr, "Digest method not supported");
+    return nullptr;
+  }
+
+  const EVP_MD* evp_md = md.get();
+  const bool is_xof = evp_md != nullptr && (EVP_MD_flags(evp_md) & EVP_MD_FLAG_XOF) != 0;
+  const int32_t digest_size = evp_md != nullptr ? EVP_MD_size(evp_md) : -1;
+  if (argc >= 2 && argv[1] != nullptr && !IsNullOrUndefinedValue(env, argv[1])) {
+    if (napi_get_value_int32(env, argv[1], &wrap->output_len) != napi_ok || wrap->output_len < 0) {
+      delete wrap;
+      napi_throw_error(env, "ERR_INVALID_ARG_VALUE", "Invalid output length");
+      return nullptr;
+    }
+    if (is_xof) {
+      wrap->use_xof = true;
+    } else if (wrap->output_len != digest_size) {
+      delete wrap;
+      napi_throw_error(env,
+                       "ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH",
+                       "error:030000B2:digital envelope routines::not XOF or invalid length");
+      return nullptr;
+    }
+  }
+
   napi_wrap(env, this_arg, wrap, HashFinalize, nullptr, &wrap->wrapper_ref);
   return this_arg;
 }
@@ -727,9 +1199,9 @@ napi_value HashDigest(napi_env env, napi_callback_info info) {
   napi_create_string_utf8(env, wrap->algorithm.c_str(), NAPI_AUTO_LENGTH, &algorithm);
   napi_value data = BytesToBuffer(env, wrap->data);
   napi_value out = nullptr;
-  if (wrap->xof_len >= 0) {
+  if (wrap->use_xof) {
     napi_value xof_len_value = nullptr;
-    napi_create_int32(env, wrap->xof_len, &xof_len_value);
+    napi_create_int32(env, wrap->output_len, &xof_len_value);
     napi_value call_argv[3] = {algorithm, data, xof_len_value};
     if (!CallBindingMethod(env, binding, "hashOneShotXof", 3, call_argv, &out)) return Undefined(env);
   } else {
@@ -1030,6 +1502,14 @@ struct DiffieHellmanWrap {
   int32_t verify_error = 0;
 };
 
+enum class DhCheckPublicKeyResult {
+  kNone,
+  kInvalid,
+  kTooSmall,
+  kTooLarge,
+  kCheckFailed,
+};
+
 void DiffieHellmanFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<DiffieHellmanWrap*>(data);
   if (wrap == nullptr) return;
@@ -1046,6 +1526,16 @@ DiffieHellmanWrap* UnwrapDiffieHellman(napi_env env, napi_value this_arg) {
   void* data = nullptr;
   if (napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr) return nullptr;
   return static_cast<DiffieHellmanWrap*>(data);
+}
+
+DhCheckPublicKeyResult CheckDhPublicKey(DH* dh, const BIGNUM* peer_key) {
+  if (dh == nullptr || peer_key == nullptr) return DhCheckPublicKeyResult::kCheckFailed;
+  int codes = 0;
+  if (DH_check_pub_key(dh, peer_key, &codes) != 1) return DhCheckPublicKeyResult::kCheckFailed;
+  if ((codes & DH_CHECK_PUBKEY_TOO_SMALL) != 0) return DhCheckPublicKeyResult::kTooSmall;
+  if ((codes & DH_CHECK_PUBKEY_TOO_LARGE) != 0) return DhCheckPublicKeyResult::kTooLarge;
+  if ((codes & DH_CHECK_PUBKEY_INVALID) != 0) return DhCheckPublicKeyResult::kInvalid;
+  return DhCheckPublicKeyResult::kNone;
 }
 
 DH* CreateDhFromPQG(BIGNUM* prime, BIGNUM* generator, int32_t* verify_error) {
@@ -1117,27 +1607,66 @@ BIGNUM* DhGeneratorFromNumber(int32_t generator_number) {
   return g;
 }
 
+void PushDhModulusTooSmallError() {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  ERR_raise(ERR_LIB_DH, DH_R_MODULUS_TOO_SMALL);
+#else
+  ERR_raise(ERR_LIB_BN, BN_R_BITS_TOO_SMALL);
+#endif
+}
+
+void PushDhBadGeneratorError() {
+  ERR_raise(ERR_LIB_DH, DH_R_BAD_GENERATOR);
+}
+
+bool IsValidDhGenerator(const BIGNUM* generator) {
+  return generator != nullptr && !BN_is_zero(generator) && !BN_is_one(generator);
+}
+
 DH* CreateDhFromSize(int32_t bits,
                      int32_t generator_number,
                      const std::vector<uint8_t>& generator_bytes,
+                     bool generator_from_bytes,
                      int32_t* verify_error) {
-  if (bits <= 0) return nullptr;
+  if (bits < 2) {
+    PushDhModulusTooSmallError();
+    return nullptr;
+  }
 
   BIGNUM* prime = DhPrimeFromBitLength(bits);
   if (prime != nullptr) {
     BIGNUM* generator = nullptr;
-    if (!generator_bytes.empty()) {
+    if (generator_from_bytes) {
+      if (generator_bytes.empty()) {
+        PushDhBadGeneratorError();
+        BN_free(prime);
+        return nullptr;
+      }
       generator = BN_bin2bn(generator_bytes.data(), static_cast<int>(generator_bytes.size()), nullptr);
     } else {
+      if (generator_number < 2) {
+        PushDhBadGeneratorError();
+        BN_free(prime);
+        return nullptr;
+      }
       generator = DhGeneratorFromNumber(generator_number);
+    }
+    if (!IsValidDhGenerator(generator)) {
+      if (generator != nullptr) BN_free(generator);
+      BN_free(prime);
+      PushDhBadGeneratorError();
+      return nullptr;
     }
     return CreateDhFromPQG(prime, generator, verify_error);
   }
 
-  if (!generator_bytes.empty()) {
+  if (generator_from_bytes) {
     return nullptr;
   }
-  if (generator_number == 0) generator_number = 2;
+  if (generator_number < 2) {
+    PushDhBadGeneratorError();
+    return nullptr;
+  }
   DH* dh = DH_new();
   if (dh == nullptr) return nullptr;
   if (DH_generate_parameters_ex(dh, bits, generator_number, nullptr) != 1) {
@@ -1152,14 +1681,31 @@ DH* CreateDhFromSize(int32_t bits,
 DH* CreateDhFromPrimeAndGenerator(const std::vector<uint8_t>& prime_bytes,
                                   int32_t generator_number,
                                   const std::vector<uint8_t>& generator_bytes,
+                                  bool generator_from_bytes,
                                   int32_t* verify_error) {
   if (prime_bytes.empty()) return nullptr;
   BIGNUM* prime = BN_bin2bn(prime_bytes.data(), static_cast<int>(prime_bytes.size()), nullptr);
   BIGNUM* generator = nullptr;
-  if (!generator_bytes.empty()) {
+  if (generator_from_bytes) {
+    if (generator_bytes.empty()) {
+      if (prime != nullptr) BN_free(prime);
+      PushDhBadGeneratorError();
+      return nullptr;
+    }
     generator = BN_bin2bn(generator_bytes.data(), static_cast<int>(generator_bytes.size()), nullptr);
   } else {
+    if (generator_number < 2) {
+      if (prime != nullptr) BN_free(prime);
+      PushDhBadGeneratorError();
+      return nullptr;
+    }
     generator = DhGeneratorFromNumber(generator_number);
+  }
+  if (!IsValidDhGenerator(generator)) {
+    if (prime != nullptr) BN_free(prime);
+    if (generator != nullptr) BN_free(generator);
+    PushDhBadGeneratorError();
+    return nullptr;
   }
   return CreateDhFromPQG(prime, generator, verify_error);
 }
@@ -1186,25 +1732,31 @@ napi_value DiffieHellmanCtor(napi_env env, napi_callback_info info) {
 
   int32_t generator_number = 2;
   std::vector<uint8_t> generator_bytes;
+  bool generator_from_bytes = false;
   if (argc >= 2 && argv[1] != nullptr && !IsNullOrUndefinedValue(env, argv[1])) {
     napi_valuetype generator_type = napi_undefined;
     if (napi_typeof(env, argv[1], &generator_type) == napi_ok && generator_type == napi_number) {
       generator_number = GetInt32Value(env, argv[1], 2);
     } else {
       generator_bytes = ValueToBytes(env, argv[1]);
+      generator_from_bytes = true;
     }
   }
 
   if (size_or_key_type == napi_number) {
     const int32_t bits = GetInt32Value(env, argv[0], 0);
-    dh = CreateDhFromSize(bits, generator_number, generator_bytes, &verify_error);
+    dh = CreateDhFromSize(bits, generator_number, generator_bytes, generator_from_bytes, &verify_error);
   } else {
     const std::vector<uint8_t> prime_bytes = ValueToBytes(env, argv[0]);
-    dh = CreateDhFromPrimeAndGenerator(prime_bytes, generator_number, generator_bytes, &verify_error);
+    dh = CreateDhFromPrimeAndGenerator(prime_bytes,
+                                       generator_number,
+                                       generator_bytes,
+                                       generator_from_bytes,
+                                       &verify_error);
   }
 
   if (dh == nullptr) {
-    napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Diffie-Hellman initialization failed");
+    ThrowLastOpenSslMessage(env, "Diffie-Hellman initialization failed");
     return nullptr;
   }
 
@@ -1274,6 +1826,24 @@ napi_value DiffieHellmanComputeSecret(napi_env env, napi_callback_info info) {
     return nullptr;
   }
 
+  switch (CheckDhPublicKey(wrap->dh, peer_key)) {
+    case DhCheckPublicKeyResult::kTooSmall:
+      BN_free(peer_key);
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_KEYLEN", "Supplied key is too small"));
+      return nullptr;
+    case DhCheckPublicKeyResult::kTooLarge:
+      BN_free(peer_key);
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_KEYLEN", "Supplied key is too large"));
+      return nullptr;
+    case DhCheckPublicKeyResult::kInvalid:
+    case DhCheckPublicKeyResult::kCheckFailed:
+      BN_free(peer_key);
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Unspecified validation error"));
+      return nullptr;
+    case DhCheckPublicKeyResult::kNone:
+      break;
+  }
+
   std::vector<uint8_t> secret(static_cast<size_t>(DH_size(wrap->dh)));
   const int secret_len = DH_compute_key(secret.data(), peer_key, wrap->dh);
   BN_free(peer_key);
@@ -1283,7 +1853,11 @@ napi_value DiffieHellmanComputeSecret(napi_env env, napi_callback_info info) {
     napi_create_string_utf8(env, "invalid public key", NAPI_AUTO_LENGTH, &err_text);
     return err_text;
   }
-  secret.resize(static_cast<size_t>(secret_len));
+  if (static_cast<size_t>(secret_len) < secret.size()) {
+    const size_t padding = secret.size() - static_cast<size_t>(secret_len);
+    std::memmove(secret.data() + padding, secret.data(), static_cast<size_t>(secret_len));
+    std::memset(secret.data(), 0, padding);
+  }
   return BytesToBuffer(env, secret);
 }
 
@@ -1474,7 +2048,10 @@ napi_value EcdhGetPublicKey(napi_env env, napi_callback_info info) {
   }
   const EC_GROUP* group = EC_KEY_get0_group(wrap->ec);
   const EC_POINT* point = EC_KEY_get0_public_key(wrap->ec);
-  if (group == nullptr || point == nullptr) return BytesToBuffer(env, {});
+  if (group == nullptr || point == nullptr) {
+    napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get ECDH public key");
+    return nullptr;
+  }
   const size_t len = EC_POINT_point2oct(group, point, conversion, nullptr, 0, nullptr);
   std::vector<uint8_t> out(len);
   if (len == 0 ||
@@ -1485,6 +2062,67 @@ napi_value EcdhGetPublicKey(napi_env env, napi_callback_info info) {
   return BytesToBuffer(env, out);
 }
 
+napi_value EcdhConvertKey(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 3) return nullptr;
+
+  const uint8_t* key_bytes = nullptr;
+  size_t key_len = 0;
+  if (!GetByteSpan(env, argv[0], &key_bytes, &key_len)) {
+    napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "key must be an ArrayBuffer or BufferView");
+    return nullptr;
+  }
+  if (key_len == 0) {
+    napi_value empty = nullptr;
+    napi_create_string_utf8(env, "", 0, &empty);
+    return empty;
+  }
+
+  const std::string curve = GetStringValue(env, argv[1]);
+  int nid = OBJ_sn2nid(curve.c_str());
+  if (nid == NID_undef) {
+    ERR_clear_error();
+    napi_throw_type_error(env, "ERR_CRYPTO_INVALID_CURVE", "Invalid EC curve name");
+    return nullptr;
+  }
+
+  const int32_t form = GetInt32Value(env, argv[2], POINT_CONVERSION_UNCOMPRESSED);
+  point_conversion_form_t conversion = POINT_CONVERSION_UNCOMPRESSED;
+  if (form == POINT_CONVERSION_COMPRESSED) {
+    conversion = POINT_CONVERSION_COMPRESSED;
+  } else if (form == POINT_CONVERSION_HYBRID) {
+    conversion = POINT_CONVERSION_HYBRID;
+  }
+
+  EC_GROUP* group = EC_GROUP_new_by_curve_name(nid);
+  EC_POINT* point = group != nullptr ? EC_POINT_new(group) : nullptr;
+  if (group == nullptr ||
+      point == nullptr ||
+      EC_POINT_oct2point(group, point, key_bytes, key_len, nullptr) != 1) {
+    if (point != nullptr) EC_POINT_free(point);
+    if (group != nullptr) EC_GROUP_free(group);
+    ERR_clear_error();
+    napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to convert Buffer to EC_POINT");
+    return nullptr;
+  }
+
+  const size_t out_len = EC_POINT_point2oct(group, point, conversion, nullptr, 0, nullptr);
+  std::vector<uint8_t> out(out_len);
+  if (out_len == 0 || EC_POINT_point2oct(group, point, conversion, out.data(), out.size(), nullptr) != out_len) {
+    EC_POINT_free(point);
+    EC_GROUP_free(group);
+    ERR_clear_error();
+    napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to convert EC_POINT to Buffer");
+    return nullptr;
+  }
+
+  EC_POINT_free(point);
+  EC_GROUP_free(group);
+  ERR_clear_error();
+  return BytesToBuffer(env, out);
+}
+
 napi_value EcdhGetPrivateKey(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
@@ -1492,6 +2130,10 @@ napi_value EcdhGetPrivateKey(napi_env env, napi_callback_info info) {
   EcdhWrap* wrap = UnwrapEcdh(env, this_arg);
   if (wrap == nullptr || wrap->ec == nullptr) return Undefined(env);
   const BIGNUM* private_key = EC_KEY_get0_private_key(wrap->ec);
+  if (private_key == nullptr) {
+    napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get ECDH private key");
+    return nullptr;
+  }
   return BytesToBuffer(env, BigNumToBytes(private_key));
 }
 
@@ -1508,12 +2150,29 @@ napi_value EcdhSetPrivateKey(napi_env env, napi_callback_info info) {
     napi_throw_error(env, "ERR_INVALID_ARG_TYPE", "Invalid private key");
     return nullptr;
   }
+  const EC_GROUP* group = EC_KEY_get0_group(wrap->ec);
+  BIGNUM* order = group != nullptr ? BN_new() : nullptr;
+  const bool valid_private_key =
+      group != nullptr &&
+      order != nullptr &&
+      !BN_is_zero(private_key) &&
+      !BN_is_negative(private_key) &&
+      EC_GROUP_get_order(group, order, nullptr) == 1 &&
+      BN_cmp(private_key, order) < 0;
+  if (order != nullptr) BN_free(order);
+  if (!valid_private_key) {
+    BN_free(private_key);
+    napi_throw(env,
+               CreateErrorWithCode(env,
+                                   "ERR_CRYPTO_INVALID_KEYTYPE",
+                                   "Private key is not valid for specified curve."));
+    return nullptr;
+  }
   if (EC_KEY_set_private_key(wrap->ec, private_key) != 1) {
     BN_free(private_key);
     napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to set ECDH private key");
     return nullptr;
   }
-  const EC_GROUP* group = EC_KEY_get0_group(wrap->ec);
   EC_POINT* public_key = group != nullptr ? EC_POINT_new(group) : nullptr;
   BN_CTX* bn_ctx = BN_CTX_new();
   if (group == nullptr ||
@@ -1547,7 +2206,7 @@ napi_value EcdhSetPublicKey(napi_env env, napi_callback_info info) {
       EC_POINT_oct2point(group, public_key, key_bytes.data(), key_bytes.size(), nullptr) != 1 ||
       EC_KEY_set_public_key(wrap->ec, public_key) != 1) {
     if (public_key != nullptr) EC_POINT_free(public_key);
-    napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to set ECDH public key");
+    napi_throw_error(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to convert Buffer to EC_POINT");
     return nullptr;
   }
   EC_POINT_free(public_key);
@@ -1561,6 +2220,11 @@ napi_value EcdhComputeSecret(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   EcdhWrap* wrap = UnwrapEcdh(env, this_arg);
   if (wrap == nullptr || wrap->ec == nullptr || argc < 1 || argv[0] == nullptr) return Undefined(env);
+  if (EC_KEY_check_key(wrap->ec) != 1) {
+    ERR_clear_error();
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_KEYPAIR", "Invalid key pair"));
+    return nullptr;
+  }
   const std::vector<uint8_t> peer_bytes = ValueToBytes(env, argv[0]);
   const EC_GROUP* group = EC_KEY_get0_group(wrap->ec);
   EC_POINT* peer_point = group != nullptr ? EC_POINT_new(group) : nullptr;
@@ -1587,7 +2251,17 @@ napi_value EcdhComputeSecret(napi_env env, napi_callback_info info) {
 
 struct CipherBaseWrap {
   napi_ref wrapper_ref = nullptr;
+  EVP_CIPHER_CTX* aead_ctx = nullptr;
   bool encrypt = true;
+  bool auto_padding = true;
+  bool aead_mode = false;
+  bool gcm_mode = false;
+  bool ccm_mode = false;
+  bool ocb_mode = false;
+  bool chacha20_poly1305_mode = false;
+  bool auth_tag_length_specified = false;
+  bool auth_tag_set = false;
+  bool aad_called = false;
   std::string algorithm;
   std::vector<uint8_t> key;
   bool iv_is_null = false;
@@ -1595,7 +2269,10 @@ struct CipherBaseWrap {
   std::vector<uint8_t> input;
   std::vector<uint8_t> aad;
   std::vector<uint8_t> auth_tag;
-  int32_t auth_tag_length = 16;
+  int32_t auth_tag_length = -1;
+  int32_t plaintext_length = -1;
+  int32_t max_message_size = std::numeric_limits<int32_t>::max();
+  bool pending_auth_failed = false;
   bool finalized = false;
 };
 
@@ -1629,6 +2306,10 @@ bool ExportPrivateKeyValue(napi_env env,
 void CipherBaseFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<CipherBaseWrap*>(data);
   if (wrap == nullptr) return;
+  if (wrap->aead_ctx != nullptr) {
+    EVP_CIPHER_CTX_free(wrap->aead_ctx);
+    wrap->aead_ctx = nullptr;
+  }
   ResetRef(env, &wrap->wrapper_ref);
   delete wrap;
 }
@@ -1648,9 +2329,109 @@ bool IsAeadCipherName(std::string name) {
          name.find("chacha20-poly1305") != std::string::npos;
 }
 
+bool IsGcmCipherName(std::string name) {
+  for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return name.find("gcm") != std::string::npos;
+}
+
+bool IsCcmCipherName(std::string name) {
+  for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return name.find("ccm") != std::string::npos;
+}
+
+bool IsOcbCipherName(std::string name) {
+  for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return name.find("ocb") != std::string::npos;
+}
+
+bool IsChaCha20Poly1305CipherName(std::string name) {
+  for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return name.find("chacha20-poly1305") != std::string::npos;
+}
+
 bool IsWrapCipherName(std::string name) {
   for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
   return name.find("wrap") != std::string::npos;
+}
+
+bool IsValidGcmAuthTagLength(size_t tag_len) {
+  return tag_len == 4 || tag_len == 8 || (tag_len >= 12 && tag_len <= 16);
+}
+
+bool IsValidCcmAuthTagLength(int32_t tag_len) {
+  return tag_len >= 4 && tag_len <= 16 && (tag_len % 2) == 0;
+}
+
+bool IsValidGenericAeadTagLength(int32_t tag_len) {
+  return tag_len >= 1 && tag_len <= 16;
+}
+
+int32_t ComputeCcmMaxMessageSize(size_t iv_len) {
+  if (iv_len == 12) return 16777215;
+  if (iv_len == 13) return 65535;
+  return std::numeric_limits<int32_t>::max();
+}
+
+bool CipherBaseCheckAeadTagLength(CipherBaseWrap* wrap, size_t provided_tag_len) {
+  if (wrap == nullptr || !wrap->aead_mode) return false;
+  if (wrap->gcm_mode) {
+    return (!wrap->auth_tag_length_specified ||
+            wrap->auth_tag_length == static_cast<int32_t>(provided_tag_len)) &&
+           IsValidGcmAuthTagLength(provided_tag_len);
+  }
+  if (wrap->auth_tag_length < 0) return false;
+  return wrap->auth_tag_length == static_cast<int32_t>(provided_tag_len) &&
+         IsValidGenericAeadTagLength(static_cast<int32_t>(provided_tag_len));
+}
+
+void ThrowInvalidAuthTagLength(napi_env env, size_t provided_tag_len) {
+  napi_throw(
+      env,
+      CreateErrorWithCode(env,
+                          "ERR_CRYPTO_INVALID_AUTH_TAG",
+                          "Invalid authentication tag length: " + std::to_string(provided_tag_len)));
+}
+
+bool InitCipherBaseAeadContext(napi_env env, CipherBaseWrap* wrap) {
+  if (wrap == nullptr || !wrap->aead_mode) return true;
+  const EVP_CIPHER* cipher = EVP_get_cipherbyname(wrap->algorithm.c_str());
+  if (cipher == nullptr) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_UNKNOWN_CIPHER", "Unknown cipher"));
+    return false;
+  }
+
+  wrap->aead_ctx = EVP_CIPHER_CTX_new();
+  if (wrap->aead_ctx == nullptr) {
+    ThrowLastOpenSslMessage(env, "cipher initialization failed");
+    return false;
+  }
+
+  const int enc = wrap->encrypt ? 1 : 0;
+  int ok = EVP_CipherInit_ex(wrap->aead_ctx, cipher, nullptr, nullptr, nullptr, enc);
+  if (ok == 1) {
+    ok = EVP_CIPHER_CTX_ctrl(wrap->aead_ctx,
+                             EVP_CTRL_AEAD_SET_IVLEN,
+                             static_cast<int>(wrap->iv.size()),
+                             nullptr);
+  }
+  if (ok == 1 && (wrap->ccm_mode || wrap->ocb_mode) && wrap->auth_tag_length > 0) {
+    ok = EVP_CIPHER_CTX_ctrl(wrap->aead_ctx, EVP_CTRL_AEAD_SET_TAG, wrap->auth_tag_length, nullptr);
+  }
+  if (ok == 1) {
+    ok = EVP_CipherInit_ex(wrap->aead_ctx,
+                           nullptr,
+                           nullptr,
+                           wrap->key.empty() ? nullptr : wrap->key.data(),
+                           wrap->iv.empty() ? nullptr : wrap->iv.data(),
+                           enc);
+  }
+  if (ok != 1) {
+    EVP_CIPHER_CTX_free(wrap->aead_ctx);
+    wrap->aead_ctx = nullptr;
+    ThrowLastOpenSslMessage(env, "cipher initialization failed");
+    return false;
+  }
+  return true;
 }
 
 napi_value CipherBaseCtor(napi_env env, napi_callback_info info) {
@@ -1696,10 +2477,16 @@ napi_value CipherBaseCtor(napi_env env, napi_callback_info info) {
       wrap->iv = ValueToBytes(env, argv[3]);
     }
   }
-  if (argc >= 5 && argv[4] != nullptr) {
+  if (argc >= 5 && argv[4] != nullptr && !IsUndefined(env, argv[4])) {
     napi_get_value_int32(env, argv[4], &wrap->auth_tag_length);
+    wrap->auth_tag_length_specified = wrap->auth_tag_length >= 0;
+    if (!wrap->auth_tag_length_specified) wrap->auth_tag_length = -1;
   }
-  if (wrap->auth_tag_length <= 0 || wrap->auth_tag_length > 16) wrap->auth_tag_length = 16;
+  wrap->gcm_mode = IsGcmCipherName(wrap->algorithm);
+  wrap->ccm_mode = IsCcmCipherName(wrap->algorithm);
+  wrap->ocb_mode = IsOcbCipherName(wrap->algorithm);
+  wrap->chacha20_poly1305_mode = IsChaCha20Poly1305CipherName(wrap->algorithm);
+  wrap->aead_mode = wrap->gcm_mode || wrap->ccm_mode || wrap->ocb_mode || wrap->chacha20_poly1305_mode;
 
   // Validate cipher/key/iv shape at construction time without performing
   // a data transform, so valid ciphers do not fail early.
@@ -1742,8 +2529,18 @@ napi_value CipherBaseCtor(napi_env env, napi_callback_info info) {
     }
 
     const int32_t actual_iv_len = wrap->iv_is_null ? 0 : static_cast<int32_t>(wrap->iv.size());
-    if (IsAeadCipherName(wrap->algorithm)) {
+    if (wrap->aead_mode) {
       if (actual_iv_len <= 0) {
+        napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_IV", "Invalid initialization vector"));
+        delete wrap;
+        return nullptr;
+      }
+      if (wrap->ccm_mode && (actual_iv_len < 7 || actual_iv_len > 13)) {
+        napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_IV", "Invalid initialization vector"));
+        delete wrap;
+        return nullptr;
+      }
+      if (wrap->chacha20_poly1305_mode && actual_iv_len > 12) {
         napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_IV", "Invalid initialization vector"));
         delete wrap;
         return nullptr;
@@ -1753,6 +2550,51 @@ napi_value CipherBaseCtor(napi_env env, napi_callback_info info) {
       delete wrap;
       return nullptr;
     }
+  }
+
+  if (wrap->aead_mode) {
+    if (wrap->gcm_mode) {
+      if (wrap->auth_tag_length_specified &&
+          !IsValidGcmAuthTagLength(static_cast<size_t>(wrap->auth_tag_length))) {
+        ThrowInvalidAuthTagLength(env, static_cast<size_t>(wrap->auth_tag_length));
+        delete wrap;
+        return nullptr;
+      }
+    } else if (wrap->chacha20_poly1305_mode) {
+      if (!wrap->auth_tag_length_specified) {
+        wrap->auth_tag_length = 16;
+      } else if (!IsValidGenericAeadTagLength(wrap->auth_tag_length)) {
+        ThrowInvalidAuthTagLength(env, static_cast<size_t>(wrap->auth_tag_length));
+        delete wrap;
+        return nullptr;
+      }
+    } else {
+      if (!wrap->auth_tag_length_specified) {
+        napi_throw(
+            env,
+            CreateErrorWithCode(env,
+                                "ERR_CRYPTO_INVALID_AUTH_TAG",
+                                "authTagLength required for " + wrap->algorithm));
+        delete wrap;
+        return nullptr;
+      }
+      const bool valid =
+          wrap->ccm_mode ? IsValidCcmAuthTagLength(wrap->auth_tag_length)
+                         : IsValidGenericAeadTagLength(wrap->auth_tag_length);
+      if (!valid) {
+        ThrowInvalidAuthTagLength(env, static_cast<size_t>(wrap->auth_tag_length));
+        delete wrap;
+        return nullptr;
+      }
+    }
+
+    if (wrap->ccm_mode) {
+      wrap->max_message_size = ComputeCcmMaxMessageSize(wrap->iv.size());
+    }
+  }
+  if (wrap->aead_mode && !InitCipherBaseAeadContext(env, wrap)) {
+    delete wrap;
+    return nullptr;
   }
   napi_wrap(env, this_arg, wrap, CipherBaseFinalize, nullptr, &wrap->wrapper_ref);
   return this_arg;
@@ -1766,8 +2608,49 @@ napi_value CipherBaseUpdate(napi_env env, napi_callback_info info) {
   CipherBaseWrap* wrap = UnwrapCipherBase(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
   if (wrap->finalized) return BytesToBuffer(env, {});
+  if (wrap->aead_mode && wrap->aead_ctx != nullptr) {
+    if (argc < 1 || argv[0] == nullptr) return BytesToBuffer(env, {});
+    std::vector<uint8_t> bytes = ValueToBytesWithEncoding(env, argv[0], argc >= 2 ? argv[1] : nullptr);
+    if (wrap->ccm_mode) {
+      const size_t next_size = wrap->input.size() + bytes.size();
+      if (next_size > static_cast<size_t>(wrap->max_message_size) ||
+          (wrap->plaintext_length >= 0 && next_size > static_cast<size_t>(wrap->plaintext_length))) {
+        napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_MESSAGELEN", "Invalid message length"));
+        return nullptr;
+      }
+      wrap->input.insert(wrap->input.end(), bytes.begin(), bytes.end());
+    }
+    std::vector<uint8_t> out(bytes.size() + 32);
+    int out_len = 0;
+    static const uint8_t kEmptyAeadInput = 0;
+    const uint8_t* input_ptr = bytes.empty() ? &kEmptyAeadInput : bytes.data();
+    const int ok =
+        EVP_CipherUpdate(wrap->aead_ctx, out.data(), &out_len, input_ptr, static_cast<int>(bytes.size()));
+    if (ok != 1) {
+      if (wrap->ccm_mode && !wrap->encrypt) {
+        wrap->pending_auth_failed = true;
+        return BytesToBuffer(env, {});
+      }
+      ERR_clear_error();
+      napi_throw(env,
+                 CreateErrorWithCode(env,
+                                     "ERR_CRYPTO_INVALID_STATE",
+                                     "Unsupported state or unable to authenticate data"));
+      return nullptr;
+    }
+    out.resize(static_cast<size_t>(out_len));
+    return BytesToBuffer(env, out);
+  }
   if (argc >= 1 && argv[0] != nullptr) {
     std::vector<uint8_t> bytes = ValueToBytesWithEncoding(env, argv[0], argc >= 2 ? argv[1] : nullptr);
+    if (wrap->ccm_mode) {
+      const size_t next_size = wrap->input.size() + bytes.size();
+      if (next_size > static_cast<size_t>(wrap->max_message_size) ||
+          (wrap->plaintext_length >= 0 && next_size > static_cast<size_t>(wrap->plaintext_length))) {
+        napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_MESSAGELEN", "Invalid message length"));
+        return nullptr;
+      }
+    }
     wrap->input.insert(wrap->input.end(), bytes.begin(), bytes.end());
   }
   // RFC3394/5649 wrap algorithms emit their full output on update() in Node.
@@ -1787,14 +2670,17 @@ napi_value CipherBaseUpdate(napi_env env, napi_callback_info info) {
       iv_arg = (iv != nullptr ? iv : Undefined(env));
     }
     napi_create_string_utf8(env, wrap->algorithm.c_str(), NAPI_AUTO_LENGTH, &algo);
-    napi_value argv_transform[6] = {algo != nullptr ? algo : Undefined(env),
+    napi_value auto_padding = nullptr;
+    napi_get_boolean(env, wrap->auto_padding, &auto_padding);
+    napi_value argv_transform[7] = {algo != nullptr ? algo : Undefined(env),
                                     key != nullptr ? key : Undefined(env),
                                     iv_arg,
                                     input != nullptr ? input : Undefined(env),
                                     decrypt != nullptr ? decrypt : Undefined(env),
-                                    Undefined(env)};
+                                    Undefined(env),
+                                    auto_padding != nullptr ? auto_padding : Undefined(env)};
     napi_value out = nullptr;
-    if (!CallBindingMethod(env, binding, "cipherTransform", 6, argv_transform, &out)) return nullptr;
+    if (!CallBindingMethod(env, binding, "cipherTransform", 7, argv_transform, &out)) return nullptr;
     wrap->input.clear();
     wrap->finalized = true;
     return EnsureBufferValue(env, out);
@@ -1809,10 +2695,119 @@ napi_value CipherBaseFinal(napi_env env, napi_callback_info info) {
   CipherBaseWrap* wrap = UnwrapCipherBase(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
   if (wrap->finalized) return BytesToBuffer(env, {});
-  wrap->finalized = true;
+  if (wrap->aead_mode && wrap->aead_ctx != nullptr) {
+    wrap->finalized = true;
+    auto close_ctx = [&]() {
+      if (wrap->aead_ctx != nullptr) {
+        EVP_CIPHER_CTX_free(wrap->aead_ctx);
+        wrap->aead_ctx = nullptr;
+      }
+    };
+
+    if (!wrap->encrypt && !wrap->auth_tag_set) {
+      close_ctx();
+      napi_throw(
+          env,
+          CreateErrorWithCode(env,
+                              "ERR_CRYPTO_INVALID_STATE",
+                              "Unsupported state or unable to authenticate data"));
+      return nullptr;
+    }
+
+    if (!wrap->encrypt && !wrap->ccm_mode) {
+      if (EVP_CIPHER_CTX_ctrl(wrap->aead_ctx,
+                              EVP_CTRL_AEAD_SET_TAG,
+                              wrap->auth_tag_length,
+                              wrap->auth_tag.empty() ? nullptr : wrap->auth_tag.data()) != 1) {
+        close_ctx();
+        ERR_clear_error();
+        napi_throw(
+            env,
+            CreateErrorWithCode(env,
+                                "ERR_CRYPTO_INVALID_STATE",
+                                "Unsupported state or unable to authenticate data"));
+        return nullptr;
+      }
+    }
+
+    if (!wrap->encrypt && wrap->ccm_mode) {
+      close_ctx();
+      if (wrap->pending_auth_failed) {
+        napi_throw(
+            env,
+            CreateErrorWithCode(env,
+                                "ERR_CRYPTO_INVALID_STATE",
+                                "Unsupported state or unable to authenticate data"));
+        return nullptr;
+      }
+      return BytesToBuffer(env, {});
+    }
+
+    if (wrap->encrypt && wrap->ccm_mode && wrap->plaintext_length < 0 && wrap->input.empty()) {
+      close_ctx();
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+      napi_throw(env, CreateErrorWithCode(env, "ERR_OSSL_TAG_NOT_SET", "tag not set"));
+#else
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_STATE", "Unsupported state"));
+#endif
+      return nullptr;
+    }
+
+    std::vector<uint8_t> out(32);
+    int out_len = 0;
+    const int ok = EVP_CipherFinal_ex(wrap->aead_ctx, out.data(), &out_len);
+    if (ok != 1) {
+      close_ctx();
+      if (!wrap->encrypt) {
+        ERR_clear_error();
+        napi_throw(
+            env,
+            CreateErrorWithCode(env,
+                                "ERR_CRYPTO_INVALID_STATE",
+                                "Unsupported state or unable to authenticate data"));
+      } else {
+        ThrowLastOpenSslMessage(env, "AEAD cipher operation failed");
+      }
+      return nullptr;
+    }
+
+    if (wrap->encrypt) {
+      const int tag_len = wrap->auth_tag_length >= 0 ? wrap->auth_tag_length : 16;
+      wrap->auth_tag.assign(static_cast<size_t>(tag_len), 0);
+      if (EVP_CIPHER_CTX_ctrl(wrap->aead_ctx,
+                              EVP_CTRL_AEAD_GET_TAG,
+                              tag_len,
+                              wrap->auth_tag.data()) != 1) {
+        wrap->auth_tag.clear();
+      }
+    }
+
+    close_ctx();
+    out.resize(static_cast<size_t>(out_len));
+    return BytesToBuffer(env, out);
+  }
 
   napi_value binding = GetBinding(env);
   if (binding == nullptr) return Undefined(env);
+
+  if (!wrap->encrypt && wrap->aead_mode && !wrap->auth_tag_set) {
+    wrap->finalized = true;
+    napi_throw(
+        env,
+        CreateErrorWithCode(env,
+                            "ERR_CRYPTO_INVALID_STATE",
+                            "Unsupported state or unable to authenticate data"));
+    return nullptr;
+  }
+  if (wrap->ccm_mode &&
+      (wrap->input.size() > static_cast<size_t>(wrap->max_message_size) ||
+       (wrap->plaintext_length >= 0 && wrap->input.size() > static_cast<size_t>(wrap->plaintext_length)))) {
+    wrap->finalized = true;
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_MESSAGELEN", "Invalid message length"));
+    return nullptr;
+  }
+
+  wrap->finalized = true;
 
   napi_value algo = nullptr;
   napi_create_string_utf8(env, wrap->algorithm.c_str(), NAPI_AUTO_LENGTH, &algo);
@@ -1823,7 +2818,7 @@ napi_value CipherBaseFinal(napi_env env, napi_callback_info info) {
   napi_get_boolean(env, !wrap->encrypt, &decrypt);
 
   napi_value output = nullptr;
-  if (IsAeadCipherName(wrap->algorithm)) {
+  if (wrap->aead_mode) {
     napi_value aad = BytesToBuffer(env, wrap->aad);
     napi_value auth_tag = wrap->auth_tag.empty() ? Undefined(env) : BytesToBuffer(env, wrap->auth_tag);
     napi_value auth_tag_len = nullptr;
@@ -1856,14 +2851,17 @@ napi_value CipherBaseFinal(napi_env env, napi_callback_info info) {
     } else {
       iv_arg = (iv != nullptr ? iv : Undefined(env));
     }
-    napi_value argv_transform[6] = {algo != nullptr ? algo : Undefined(env),
+    napi_value auto_padding = nullptr;
+    napi_get_boolean(env, wrap->auto_padding, &auto_padding);
+    napi_value argv_transform[7] = {algo != nullptr ? algo : Undefined(env),
                                     key != nullptr ? key : Undefined(env),
                                     iv_arg,
                                     input != nullptr ? input : Undefined(env),
                                     decrypt != nullptr ? decrypt : Undefined(env),
-                                    Undefined(env)};
+                                    Undefined(env),
+                                    auto_padding != nullptr ? auto_padding : Undefined(env)};
     napi_value out = nullptr;
-    if (!CallBindingMethod(env, binding, "cipherTransform", 6, argv_transform, &out)) return nullptr;
+    if (!CallBindingMethod(env, binding, "cipherTransform", 7, argv_transform, &out)) return nullptr;
     output = EnsureBufferValue(env, out);
   }
 
@@ -1871,6 +2869,20 @@ napi_value CipherBaseFinal(napi_env env, napi_callback_info info) {
 }
 
 napi_value CipherBaseSetAutoPadding(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  CipherBaseWrap* wrap = UnwrapCipherBase(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  bool enabled = true;
+  if (argc >= 1 && argv[0] != nullptr) napi_get_value_bool(env, argv[0], &enabled);
+  if (wrap->finalized) {
+    napi_value out = nullptr;
+    napi_get_boolean(env, false, &out);
+    return out != nullptr ? out : Undefined(env);
+  }
+  wrap->auto_padding = enabled;
   napi_value out = nullptr;
   napi_get_boolean(env, true, &out);
   return out != nullptr ? out : Undefined(env);
@@ -1883,10 +2895,44 @@ napi_value CipherBaseSetAAD(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   CipherBaseWrap* wrap = UnwrapCipherBase(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
+  if (wrap->finalized || !wrap->aead_mode) {
+    napi_value out = nullptr;
+    napi_get_boolean(env, false, &out);
+    return out != nullptr ? out : Undefined(env);
+  }
+  const int32_t plaintext_length = argc >= 2 && argv[1] != nullptr ? GetInt32Value(env, argv[1], -1) : -1;
+  if (wrap->ccm_mode) {
+    if (plaintext_length < 0) {
+      napi_throw(env,
+                 CreateErrorWithCode(env, nullptr, "options.plaintextLength required for CCM mode with AAD"));
+      return nullptr;
+    }
+    if (plaintext_length > wrap->max_message_size) {
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_MESSAGELEN", "Invalid message length"));
+      return nullptr;
+    }
+    wrap->plaintext_length = plaintext_length;
+  }
   wrap->aad.clear();
   if (argc >= 1 && argv[0] != nullptr) {
     wrap->aad = ValueToBytes(env, argv[0]);
   }
+  if (wrap->aead_ctx != nullptr) {
+    int tmp_len = 0;
+    if (wrap->ccm_mode) {
+      if (EVP_CipherUpdate(wrap->aead_ctx, nullptr, &tmp_len, nullptr, plaintext_length) != 1) {
+        ThrowLastOpenSslMessage(env, "Invalid message length");
+        return nullptr;
+      }
+    }
+    if (!wrap->aad.empty() &&
+        EVP_CipherUpdate(
+            wrap->aead_ctx, nullptr, &tmp_len, wrap->aad.data(), static_cast<int>(wrap->aad.size())) != 1) {
+      ThrowLastOpenSslMessage(env, "Unsupported state");
+      return nullptr;
+    }
+  }
+  wrap->aad_called = true;
   napi_value out = nullptr;
   napi_get_boolean(env, true, &out);
   return out != nullptr ? out : Undefined(env);
@@ -1897,7 +2943,7 @@ napi_value CipherBaseGetAuthTag(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   CipherBaseWrap* wrap = UnwrapCipherBase(env, this_arg);
-  if (wrap == nullptr || wrap->auth_tag.empty()) return Undefined(env);
+  if (wrap == nullptr || !wrap->encrypt || !wrap->finalized || wrap->auth_tag.empty()) return Undefined(env);
   return BytesToBuffer(env, wrap->auth_tag);
 }
 
@@ -1908,26 +2954,181 @@ napi_value CipherBaseSetAuthTag(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   CipherBaseWrap* wrap = UnwrapCipherBase(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
+  if (wrap->finalized || !wrap->aead_mode || wrap->encrypt || wrap->auth_tag_set) {
+    napi_value out = nullptr;
+    napi_get_boolean(env, false, &out);
+    return out != nullptr ? out : Undefined(env);
+  }
   wrap->auth_tag.clear();
   if (argc >= 1 && argv[0] != nullptr) {
     wrap->auth_tag = ValueToBytes(env, argv[0]);
   }
+  if (!CipherBaseCheckAeadTagLength(wrap, wrap->auth_tag.size())) {
+    ThrowInvalidAuthTagLength(env, wrap->auth_tag.size());
+    return nullptr;
+  }
+  if (wrap->gcm_mode && !wrap->auth_tag_length_specified) {
+    wrap->auth_tag_length = static_cast<int32_t>(wrap->auth_tag.size());
+    if (wrap->auth_tag.size() != static_cast<size_t>(EVP_GCM_TLS_TAG_LEN)) {
+      EmitProcessDeprecationWarning(
+          env,
+          "Using AES-GCM authentication tags of less than 128 bits without "
+          "specifying the authTagLength option when initializing decryption is deprecated.",
+          "DEP0182");
+    }
+  }
+  if (wrap->ccm_mode && wrap->aead_ctx != nullptr) {
+    if (EVP_CIPHER_CTX_ctrl(wrap->aead_ctx,
+                            EVP_CTRL_AEAD_SET_TAG,
+                            wrap->auth_tag_length,
+                            wrap->auth_tag.empty() ? nullptr : wrap->auth_tag.data()) != 1) {
+      ThrowLastOpenSslMessage(env, "Unsupported state or unable to authenticate data");
+      return nullptr;
+    }
+  }
+  wrap->auth_tag_set = true;
   napi_value out = nullptr;
   napi_get_boolean(env, true, &out);
   return out != nullptr ? out : Undefined(env);
 }
 
+napi_value EmptyString(napi_env env) {
+  napi_value out = nullptr;
+  napi_create_string_utf8(env, "", 0, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+NETSCAPE_SPKI* DecodeSpkac(const uint8_t* data, size_t len) {
+  if (data == nullptr || len == 0 || len > static_cast<size_t>(std::numeric_limits<int>::max())) return nullptr;
+  return NETSCAPE_SPKI_b64_decode(reinterpret_cast<const char*>(data), static_cast<int>(len));
+}
+
+napi_value CertVerifySpkac(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return nullptr;
+  }
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  if (!GetByteSpan(env, argv[0], &data, &len)) return nullptr;
+  if (len == 0) return EmptyString(env);
+  if (len > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_OUT_OF_RANGE", "spkac is too large"));
+    return nullptr;
+  }
+
+  NETSCAPE_SPKI* spki = DecodeSpkac(data, len);
+  bool verified = false;
+  if (spki != nullptr) {
+    EVP_PKEY* pkey = NETSCAPE_SPKI_get_pubkey(spki);
+    if (pkey != nullptr) {
+      verified = NETSCAPE_SPKI_verify(spki, pkey) == 1;
+      EVP_PKEY_free(pkey);
+    }
+    NETSCAPE_SPKI_free(spki);
+  }
+
+  napi_value out = nullptr;
+  napi_get_boolean(env, verified, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value CertExportPublicKey(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return nullptr;
+  }
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  if (!GetByteSpan(env, argv[0], &data, &len)) return nullptr;
+  if (len == 0) return EmptyString(env);
+  if (len > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_OUT_OF_RANGE", "spkac is too large"));
+    return nullptr;
+  }
+
+  NETSCAPE_SPKI* spki = DecodeSpkac(data, len);
+  if (spki == nullptr) return EmptyString(env);
+
+  napi_value out = EmptyString(env);
+  EVP_PKEY* pkey = NETSCAPE_SPKI_get_pubkey(spki);
+  BIO* bio = pkey != nullptr ? BIO_new(BIO_s_mem()) : nullptr;
+  if (pkey != nullptr && bio != nullptr && PEM_write_bio_PUBKEY(bio, pkey) == 1) {
+    BUF_MEM* bio_mem = nullptr;
+    BIO_get_mem_ptr(bio, &bio_mem);
+    if (bio_mem != nullptr && bio_mem->data != nullptr && bio_mem->length > 0) {
+      out = BytesToBuffer(env,
+                          std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(bio_mem->data),
+                                               reinterpret_cast<const uint8_t*>(bio_mem->data) +
+                                                   static_cast<size_t>(bio_mem->length)));
+    }
+  }
+  if (bio != nullptr) BIO_free(bio);
+  if (pkey != nullptr) EVP_PKEY_free(pkey);
+  NETSCAPE_SPKI_free(spki);
+  return out != nullptr ? out : EmptyString(env);
+}
+
+napi_value CertExportChallenge(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return nullptr;
+  }
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  if (!GetByteSpan(env, argv[0], &data, &len)) return nullptr;
+  if (len == 0) return EmptyString(env);
+  if (len > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_OUT_OF_RANGE", "spkac is too large"));
+    return nullptr;
+  }
+
+  NETSCAPE_SPKI* spki = DecodeSpkac(data, len);
+  if (spki == nullptr || spki->spkac == nullptr || spki->spkac->challenge == nullptr) {
+    if (spki != nullptr) NETSCAPE_SPKI_free(spki);
+    return EmptyString(env);
+  }
+
+  ASN1_IA5STRING* challenge = spki->spkac->challenge;
+  napi_value out = BytesToBuffer(
+      env,
+      std::vector<uint8_t>(challenge->data, challenge->data + challenge->length));
+  NETSCAPE_SPKI_free(spki);
+  return out != nullptr ? out : EmptyString(env);
+}
+
 struct KeyObjectWrap {
   napi_ref wrapper_ref = nullptr;
   int32_t key_type = kKeyTypeSecret;
+  EVP_PKEY* native_pkey = nullptr;
   std::vector<uint8_t> key_data;
   std::vector<uint8_t> key_passphrase;
   bool has_key_passphrase = false;
 };
 
+std::vector<uint8_t> ExportPublicDerSpki(EVP_PKEY* pkey);
+std::vector<uint8_t> ExportPrivateDerPkcs8(EVP_PKEY* pkey);
+napi_value ExportJwkPublic(napi_env env,
+                           EVP_PKEY* pkey,
+                           std::string* error_code,
+                           std::string* error_message,
+                           const std::string& curve_name_hint);
+napi_value ExportJwkPrivate(napi_env env,
+                            EVP_PKEY* pkey,
+                            std::string* error_code,
+                            std::string* error_message,
+                            const std::string& curve_name_hint);
+
 void KeyObjectFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<KeyObjectWrap*>(data);
   if (wrap == nullptr) return;
+  if (wrap->native_pkey != nullptr) {
+    EVP_PKEY_free(wrap->native_pkey);
+    wrap->native_pkey = nullptr;
+  }
   ResetRef(env, &wrap->wrapper_ref);
   delete wrap;
 }
@@ -1937,6 +3138,288 @@ KeyObjectWrap* UnwrapKeyObject(napi_env env, napi_value this_arg) {
   void* data = nullptr;
   if (napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr) return nullptr;
   return static_cast<KeyObjectWrap*>(data);
+}
+
+bool GetNamedProperty(napi_env env, napi_value obj, const char* name, napi_value* out) {
+  if (obj == nullptr || name == nullptr || out == nullptr) return false;
+  *out = nullptr;
+  return napi_get_named_property(env, obj, name, out) == napi_ok && *out != nullptr;
+}
+
+BIGNUM* GetJwkBigNum(napi_env env, napi_value jwk, const char* name) {
+  std::string encoded;
+  if (!GetNamedStringValue(env, jwk, name, &encoded)) return nullptr;
+  const std::vector<uint8_t> bytes = Base64UrlDecode(encoded);
+  if (bytes.empty()) return nullptr;
+  return BN_bin2bn(bytes.data(), static_cast<int>(bytes.size()), nullptr);
+}
+
+EVP_PKEY* ParseKeyObjectAsymmetricKey(KeyObjectWrap* wrap) {
+  if (wrap == nullptr || wrap->key_type == kKeyTypeSecret) return nullptr;
+  if (wrap->native_pkey != nullptr) {
+    if (EVP_PKEY_up_ref(wrap->native_pkey) != 1) return nullptr;
+    return wrap->native_pkey;
+  }
+  return ParseAnyKeyBytes(wrap->key_data, wrap->key_passphrase, wrap->has_key_passphrase);
+}
+
+void ResetKeyObjectNativeKey(KeyObjectWrap* wrap) {
+  if (wrap == nullptr || wrap->native_pkey == nullptr) return;
+  EVP_PKEY_free(wrap->native_pkey);
+  wrap->native_pkey = nullptr;
+}
+
+void SetObjectInt32(napi_env env, napi_value obj, const char* name, int32_t value) {
+  napi_value out = nullptr;
+  if (napi_create_int32(env, value, &out) == napi_ok && out != nullptr) {
+    napi_set_named_property(env, obj, name, out);
+  }
+}
+
+std::string NormalizeDigestName(std::string in) {
+  for (char& ch : in) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  if (in.rfind("sha2-", 0) == 0) in.erase(3, 2);
+  return in;
+}
+
+bool PopulateAsymmetricKeyDetails(napi_env env, EVP_PKEY* pkey, napi_value target) {
+  if (env == nullptr || pkey == nullptr || target == nullptr) return false;
+
+  const int pkey_type = EVP_PKEY_base_id(pkey);
+  if (pkey_type == EVP_PKEY_RSA || pkey_type == EVP_PKEY_RSA_PSS) {
+    const int bits = EVP_PKEY_bits(pkey);
+    if (bits > 0) SetObjectInt32(env, target, "modulusLength", bits);
+
+    BIGNUM* e = nullptr;
+    if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, &e) == 1 && e != nullptr) {
+      SetObjectBuffer(env, target, "publicExponent", BigNumToBytes(e));
+      BN_free(e);
+    }
+
+    if (pkey_type == EVP_PKEY_RSA_PSS) {
+      RSA* rsa = EVP_PKEY_get1_RSA(pkey);
+      if (rsa != nullptr) {
+        const RSA_PSS_PARAMS* params = RSA_get0_pss_params(rsa);
+        if (params != nullptr) {
+          std::string hash_algorithm = "sha1";
+          if (params->hashAlgorithm != nullptr) {
+            const ASN1_OBJECT* hash_obj = nullptr;
+            X509_ALGOR_get0(&hash_obj, nullptr, nullptr, params->hashAlgorithm);
+            if (hash_obj != nullptr) {
+              hash_algorithm = NormalizeDigestName(OBJ_nid2ln(OBJ_obj2nid(hash_obj)));
+            }
+          }
+
+          std::string mgf1_hash_algorithm = hash_algorithm;
+          if (params->maskGenAlgorithm != nullptr) {
+            const ASN1_OBJECT* mgf_obj = nullptr;
+            X509_ALGOR_get0(&mgf_obj, nullptr, nullptr, params->maskGenAlgorithm);
+            if (mgf_obj != nullptr && OBJ_obj2nid(mgf_obj) == NID_mgf1 && params->maskHash != nullptr) {
+              const ASN1_OBJECT* mgf1_hash_obj = nullptr;
+              X509_ALGOR_get0(&mgf1_hash_obj, nullptr, nullptr, params->maskHash);
+              if (mgf1_hash_obj != nullptr) {
+                mgf1_hash_algorithm = NormalizeDigestName(OBJ_nid2ln(OBJ_obj2nid(mgf1_hash_obj)));
+              }
+            }
+          }
+
+          int64_t salt_len = 20;
+          if (params->saltLength != nullptr && ASN1_INTEGER_get_int64(&salt_len, params->saltLength) != 1) {
+            salt_len = -1;
+          }
+
+          SetObjectString(env, target, "hashAlgorithm", hash_algorithm);
+          SetObjectString(env, target, "mgf1HashAlgorithm", mgf1_hash_algorithm);
+          if (salt_len >= 0) SetObjectInt32(env, target, "saltLength", static_cast<int32_t>(salt_len));
+        }
+        RSA_free(rsa);
+      }
+    }
+    return true;
+  }
+
+  if (pkey_type == EVP_PKEY_DSA) {
+    const int bits = EVP_PKEY_bits(pkey);
+    if (bits > 0) SetObjectInt32(env, target, "modulusLength", bits);
+
+    int q_bits = 0;
+    if (EVP_PKEY_get_int_param(pkey, OSSL_PKEY_PARAM_FFC_QBITS, &q_bits) == 1 && q_bits > 0) {
+      SetObjectInt32(env, target, "divisorLength", q_bits);
+    } else {
+      BIGNUM* q = nullptr;
+      if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_FFC_Q, &q) == 1 && q != nullptr) {
+        const int q_len = BN_num_bits(q);
+        if (q_len > 0) SetObjectInt32(env, target, "divisorLength", q_len);
+        BN_free(q);
+      }
+    }
+    return true;
+  }
+
+  if (pkey_type == EVP_PKEY_EC) {
+    std::string curve_name;
+    ResolveEcJwkCurve(pkey, "", nullptr, &curve_name, nullptr);
+    if (!curve_name.empty()) SetObjectString(env, target, "namedCurve", curve_name);
+    return true;
+  }
+
+  return true;
+}
+
+EVP_PKEY* ImportJwkRsaKey(napi_env env, napi_value jwk, bool is_private) {
+  BIGNUM* n = GetJwkBigNum(env, jwk, "n");
+  BIGNUM* e = GetJwkBigNum(env, jwk, "e");
+  if (n == nullptr || e == nullptr) {
+    if (n != nullptr) BN_free(n);
+    if (e != nullptr) BN_free(e);
+    return nullptr;
+  }
+
+  BIGNUM* d = nullptr;
+  BIGNUM* p = nullptr;
+  BIGNUM* q = nullptr;
+  BIGNUM* dp = nullptr;
+  BIGNUM* dq = nullptr;
+  BIGNUM* qi = nullptr;
+  if (is_private) {
+    d = GetJwkBigNum(env, jwk, "d");
+    p = GetJwkBigNum(env, jwk, "p");
+    q = GetJwkBigNum(env, jwk, "q");
+    dp = GetJwkBigNum(env, jwk, "dp");
+    dq = GetJwkBigNum(env, jwk, "dq");
+    qi = GetJwkBigNum(env, jwk, "qi");
+    if (d == nullptr || p == nullptr || q == nullptr || dp == nullptr || dq == nullptr || qi == nullptr) {
+      if (d != nullptr) BN_free(d);
+      if (p != nullptr) BN_free(p);
+      if (q != nullptr) BN_free(q);
+      if (dp != nullptr) BN_free(dp);
+      if (dq != nullptr) BN_free(dq);
+      if (qi != nullptr) BN_free(qi);
+      BN_free(n);
+      BN_free(e);
+      return nullptr;
+    }
+  }
+
+  RSA* rsa = RSA_new();
+  if (rsa == nullptr || RSA_set0_key(rsa, n, e, d) != 1) {
+    if (rsa != nullptr) RSA_free(rsa);
+    else {
+      BN_free(n);
+      BN_free(e);
+      if (d != nullptr) BN_free(d);
+    }
+    if (p != nullptr) BN_free(p);
+    if (q != nullptr) BN_free(q);
+    if (dp != nullptr) BN_free(dp);
+    if (dq != nullptr) BN_free(dq);
+    if (qi != nullptr) BN_free(qi);
+    return nullptr;
+  }
+
+  if (is_private) {
+    if (RSA_set0_factors(rsa, p, q) != 1 || RSA_set0_crt_params(rsa, dp, dq, qi) != 1) {
+      RSA_free(rsa);
+      return nullptr;
+    }
+  }
+
+  EVP_PKEY* pkey = EVP_PKEY_new();
+  if (pkey == nullptr || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+    if (pkey != nullptr) EVP_PKEY_free(pkey);
+    else RSA_free(rsa);
+    return nullptr;
+  }
+  return pkey;
+}
+
+EVP_PKEY* ImportJwkEcKey(napi_env env, napi_value jwk, const std::string& curve_hint) {
+  std::string curve = curve_hint;
+  if (curve.empty() && !GetNamedStringValue(env, jwk, "crv", &curve)) return nullptr;
+  const int nid = CurveNidFromName(curve);
+  if (nid == NID_undef) return nullptr;
+
+  BIGNUM* x = GetJwkBigNum(env, jwk, "x");
+  BIGNUM* y = GetJwkBigNum(env, jwk, "y");
+  if (x == nullptr || y == nullptr) {
+    if (x != nullptr) BN_free(x);
+    if (y != nullptr) BN_free(y);
+    return nullptr;
+  }
+
+  BIGNUM* d = GetJwkBigNum(env, jwk, "d");
+  EC_KEY* ec = EC_KEY_new_by_curve_name(nid);
+  if (ec == nullptr) {
+    BN_free(x);
+    BN_free(y);
+    if (d != nullptr) BN_free(d);
+    return nullptr;
+  }
+
+  const EC_GROUP* group = EC_KEY_get0_group(ec);
+  EC_POINT* point = group == nullptr ? nullptr : EC_POINT_new(group);
+  if (point == nullptr ||
+      EC_POINT_set_affine_coordinates(group, point, x, y, nullptr) != 1 ||
+      EC_KEY_set_public_key(ec, point) != 1 ||
+      (d != nullptr && EC_KEY_set_private_key(ec, d) != 1) ||
+      EC_KEY_check_key(ec) != 1) {
+    if (point != nullptr) EC_POINT_free(point);
+    EC_KEY_free(ec);
+    BN_free(x);
+    BN_free(y);
+    if (d != nullptr) BN_free(d);
+    return nullptr;
+  }
+
+  EC_POINT_free(point);
+  BN_free(x);
+  BN_free(y);
+  if (d != nullptr) BN_free(d);
+
+  EVP_PKEY* pkey = EVP_PKEY_new();
+  if (pkey == nullptr || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+    if (pkey != nullptr) EVP_PKEY_free(pkey);
+    else EC_KEY_free(ec);
+    return nullptr;
+  }
+  return pkey;
+}
+
+EVP_PKEY* ImportECRawPublicKey(const std::string& named_curve,
+                               const std::vector<uint8_t>& key_data) {
+  const int nid = CurveNidFromName(named_curve);
+  if (nid == NID_undef) return nullptr;
+  EC_KEY* ec = EC_KEY_new_by_curve_name(nid);
+  if (ec == nullptr) return nullptr;
+  const EC_GROUP* group = EC_KEY_get0_group(ec);
+  EC_POINT* point = group == nullptr ? nullptr : EC_POINT_new(group);
+  if (point == nullptr ||
+      EC_POINT_oct2point(group, point, key_data.data(), key_data.size(), nullptr) != 1 ||
+      EC_KEY_set_public_key(ec, point) != 1 ||
+      EC_KEY_check_key(ec) != 1) {
+    if (point != nullptr) EC_POINT_free(point);
+    EC_KEY_free(ec);
+    return nullptr;
+  }
+  EC_POINT_free(point);
+
+  EVP_PKEY* pkey = EVP_PKEY_new();
+  if (pkey == nullptr || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+    if (pkey != nullptr) EVP_PKEY_free(pkey);
+    else EC_KEY_free(ec);
+    return nullptr;
+  }
+  return pkey;
+}
+
+EVP_PKEY* ImportEdRawKey(const std::string& name,
+                         const std::vector<uint8_t>& key_data,
+                         int32_t key_type) {
+  const int nid = RawKeyNidFromName(name);
+  if (nid == NID_undef) return nullptr;
+  return key_type == kKeyTypePrivate
+             ? EVP_PKEY_new_raw_private_key(nid, nullptr, key_data.data(), key_data.size())
+             : EVP_PKEY_new_raw_public_key(nid, nullptr, key_data.data(), key_data.size());
 }
 
 napi_value KeyObjectCtor(napi_env env, napi_callback_info info) {
@@ -1956,6 +3439,7 @@ napi_value KeyObjectInit(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
+  ResetKeyObjectNativeKey(wrap);
   int32_t key_type = kKeyTypeSecret;
   if (argc >= 1 && argv[0] != nullptr) napi_get_value_int32(env, argv[0], &key_type);
   wrap->key_type = key_type;
@@ -1966,8 +3450,250 @@ napi_value KeyObjectInit(napi_env env, napi_callback_info info) {
     wrap->key_passphrase = ValueToBytes(env, argv[4]);
     wrap->has_key_passphrase = true;
   }
+
+  if (wrap->key_type == kKeyTypePrivate) {
+    EVP_PKEY* pkey = ParsePrivateKeyBytesWithPassphrase(
+        wrap->key_data.data(),
+        wrap->key_data.size(),
+        wrap->key_passphrase.data(),
+        wrap->key_passphrase.size(),
+        wrap->has_key_passphrase);
+    if (pkey == nullptr) {
+      if (wrap->key_data.empty()) {
+        napi_throw(env,
+                   CreateOpenSslError(env,
+                                      "ERR_OSSL_UNSUPPORTED",
+                                      kOpenSslDecoderUnsupportedError,
+                                      "error:1E08010C:DECODER routines::unsupported"));
+        return nullptr;
+      }
+      ThrowLastOpenSslMessage(env, "Failed to read private key");
+      return nullptr;
+    }
+    EVP_PKEY_free(pkey);
+  } else if (wrap->key_type == kKeyTypePublic) {
+    EVP_PKEY* pkey = ParsePublicKeyBytes(wrap->key_data.data(), wrap->key_data.size());
+    if (pkey == nullptr) {
+      pkey = ParsePrivateKeyBytesWithPassphrase(
+          wrap->key_data.data(),
+          wrap->key_data.size(),
+          wrap->key_passphrase.data(),
+          wrap->key_passphrase.size(),
+          wrap->has_key_passphrase);
+    }
+    if (pkey == nullptr) {
+      ThrowLastOpenSslMessage(env, "Failed to read public key");
+      return nullptr;
+    }
+    EVP_PKEY_free(pkey);
+  }
+
   napi_value out = nullptr;
   napi_get_boolean(env, true, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value KeyObjectInitJwk(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  if (wrap == nullptr || argc < 1 || argv[0] == nullptr) return Undefined(env);
+  ResetKeyObjectNativeKey(wrap);
+
+  std::string kty;
+  if (!GetNamedStringValue(env, argv[0], "kty", &kty)) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK"));
+    return nullptr;
+  }
+
+  std::string curve_hint;
+  if (argc >= 2 && argv[1] != nullptr && !IsNullOrUndefinedValue(env, argv[1])) {
+    curve_hint = GetStringValue(env, argv[1]);
+  }
+
+  EVP_PKEY* pkey = nullptr;
+  if (kty == "RSA") {
+    std::string private_value;
+    const bool is_private = GetNamedStringValue(env, argv[0], "d", &private_value);
+    pkey = ImportJwkRsaKey(env, argv[0], is_private);
+    wrap->key_type = is_private ? kKeyTypePrivate : kKeyTypePublic;
+  } else if (kty == "EC") {
+    std::string private_value;
+    const bool is_private = GetNamedStringValue(env, argv[0], "d", &private_value);
+    pkey = ImportJwkEcKey(env, argv[0], curve_hint);
+    wrap->key_type = is_private ? kKeyTypePrivate : kKeyTypePublic;
+  } else if (kty == "oct") {
+    std::string encoded;
+    if (!GetNamedStringValue(env, argv[0], "k", &encoded)) {
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK secret key format"));
+      return nullptr;
+    }
+    wrap->key_type = kKeyTypeSecret;
+    wrap->key_data = Base64UrlDecode(encoded);
+    if (wrap->key_data.empty()) {
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK secret key format"));
+      return nullptr;
+    }
+    wrap->key_passphrase.clear();
+    wrap->has_key_passphrase = false;
+    napi_value out = nullptr;
+    napi_create_int32(env, wrap->key_type, &out);
+    return out != nullptr ? out : Undefined(env);
+  } else {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK"));
+    return nullptr;
+  }
+
+  if (pkey == nullptr) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK"));
+    return nullptr;
+  }
+
+  wrap->key_passphrase.clear();
+  wrap->has_key_passphrase = false;
+  wrap->key_data = wrap->key_type == kKeyTypePrivate ? ExportPrivateDerPkcs8(pkey) : ExportPublicDerSpki(pkey);
+  EVP_PKEY_free(pkey);
+  if (wrap->key_data.empty()) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_INVALID_JWK", "Invalid JWK"));
+    return nullptr;
+  }
+
+  napi_value out = nullptr;
+  napi_create_int32(env, wrap->key_type, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value KeyObjectExportJwk(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  if (wrap == nullptr || argc < 1 || argv[0] == nullptr) return Undefined(env);
+
+  if (wrap->key_type == kKeyTypeSecret) {
+    SetObjectString(env, argv[0], "kty", "oct");
+    SetObjectString(env, argv[0], "k", Base64UrlEncode(wrap->key_data));
+    return argv[0];
+  }
+
+  bool handle_rsa_pss = false;
+  if (argc >= 2 && argv[1] != nullptr && !IsNullOrUndefinedValue(env, argv[1])) {
+    napi_get_value_bool(env, argv[1], &handle_rsa_pss);
+  }
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
+  if (pkey == nullptr) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key"));
+    return nullptr;
+  }
+
+  const int base = EVP_PKEY_base_id(pkey);
+  std::string error_code;
+  std::string error_message;
+  napi_value exported = nullptr;
+  if (base == EVP_PKEY_RSA_PSS && !handle_rsa_pss) {
+    error_code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
+    error_message = "Unsupported JWK Key Type.";
+  } else if (wrap->key_type == kKeyTypePrivate) {
+    exported = ExportJwkPrivate(env, pkey, &error_code, &error_message, "");
+  } else {
+    exported = ExportJwkPublic(env, pkey, &error_code, &error_message, "");
+  }
+  EVP_PKEY_free(pkey);
+
+  if (exported == nullptr) {
+    if (error_code.empty()) error_code = "ERR_CRYPTO_OPERATION_FAILED";
+    if (error_message.empty()) error_message = "Failed to export JWK";
+    napi_throw(env, CreateErrorWithCode(env, error_code.c_str(), error_message));
+    return nullptr;
+  }
+
+  napi_value names = nullptr;
+  if (napi_get_property_names(env, exported, &names) != napi_ok || names == nullptr) return argv[0];
+  uint32_t length = 0;
+  if (napi_get_array_length(env, names, &length) != napi_ok) return argv[0];
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value key = nullptr;
+    napi_value value = nullptr;
+    if (napi_get_element(env, names, i, &key) != napi_ok || key == nullptr) continue;
+    if (napi_get_property(env, exported, key, &value) != napi_ok || value == nullptr) continue;
+    napi_set_property(env, argv[0], key, value);
+  }
+  return argv[0];
+}
+
+napi_value KeyObjectInitECRaw(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  if (wrap == nullptr || argc < 2) return Undefined(env);
+  ResetKeyObjectNativeKey(wrap);
+
+  EVP_PKEY* pkey = ImportECRawPublicKey(GetStringValue(env, argv[0]), ValueToBytes(env, argv[1]));
+  bool ok = pkey != nullptr;
+  if (ok) {
+    wrap->key_type = kKeyTypePublic;
+    wrap->key_passphrase.clear();
+    wrap->has_key_passphrase = false;
+    wrap->key_data = ExportPublicDerSpki(pkey);
+    ok = !wrap->key_data.empty();
+    EVP_PKEY_free(pkey);
+  }
+  napi_value out = nullptr;
+  napi_get_boolean(env, ok, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value KeyObjectInitEDRaw(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  if (wrap == nullptr || argc < 3) return Undefined(env);
+  ResetKeyObjectNativeKey(wrap);
+
+  int32_t key_type = kKeyTypePublic;
+  napi_get_value_int32(env, argv[2], &key_type);
+  EVP_PKEY* pkey = ImportEdRawKey(GetStringValue(env, argv[0]), ValueToBytes(env, argv[1]), key_type);
+  bool ok = pkey != nullptr;
+  if (ok) {
+    wrap->key_type = key_type;
+    wrap->key_passphrase.clear();
+    wrap->has_key_passphrase = false;
+    wrap->key_data = key_type == kKeyTypePrivate ? ExportPrivateDerPkcs8(pkey) : ExportPublicDerSpki(pkey);
+    ok = !wrap->key_data.empty();
+    EVP_PKEY_free(pkey);
+  }
+  napi_value out = nullptr;
+  napi_get_boolean(env, ok, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value KeyObjectCheckEcKeyData(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  bool ok = false;
+  if (wrap != nullptr) {
+    EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
+    if (pkey != nullptr && EVP_PKEY_base_id(pkey) == EVP_PKEY_EC) {
+      EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+      if (ctx != nullptr) {
+        ok = wrap->key_type == kKeyTypePrivate ? EVP_PKEY_private_check(ctx) == 1
+                                               : EVP_PKEY_public_check(ctx) == 1;
+        EVP_PKEY_CTX_free(ctx);
+      }
+      EVP_PKEY_free(pkey);
+    }
+  }
+  napi_value out = nullptr;
+  napi_get_boolean(env, ok, &out);
   return out != nullptr ? out : Undefined(env);
 }
 
@@ -1980,7 +3706,7 @@ napi_value KeyObjectExport(napi_env env, napi_callback_info info) {
   if (wrap == nullptr) return Undefined(env);
   if (wrap->key_type == kKeyTypeSecret) return BytesToBuffer(env, wrap->key_data);
 
-  EVP_PKEY* pkey = ParseAnyKeyBytes(wrap->key_data);
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
   if (pkey == nullptr) return BytesToBuffer(env, wrap->key_data);
 
   KeyEncodingSelection encoding;
@@ -2025,34 +3751,34 @@ napi_value KeyObjectGetAsymmetricKeyType(napi_env env, napi_callback_info info) 
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
-  napi_value binding = GetBinding(env);
-  if (binding == nullptr) return Undefined(env);
-  napi_value key = BytesToBuffer(env, wrap->key_data);
-  napi_value passphrase = wrap->has_key_passphrase ? BytesToBuffer(env, wrap->key_passphrase) : Undefined(env);
-  napi_value argv[2] = {key != nullptr ? key : Undefined(env), passphrase != nullptr ? passphrase : Undefined(env)};
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
+  if (pkey == nullptr) return Undefined(env);
+  const std::string type = AsymmetricKeyTypeName(pkey);
+  EVP_PKEY_free(pkey);
+  if (type.empty()) return Undefined(env);
   napi_value out = nullptr;
-  if (!CallBindingMethod(env, binding, "getAsymmetricKeyType", 2, argv, &out)) return Undefined(env);
+  napi_create_string_utf8(env, type.c_str(), NAPI_AUTO_LENGTH, &out);
   return out != nullptr ? out : Undefined(env);
 }
 
 napi_value KeyObjectGetAsymmetricKeyDetails(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
   napi_value this_arg = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
-  napi_value binding = GetBinding(env);
-  if (binding == nullptr) return Undefined(env);
-  napi_value key = BytesToBuffer(env, wrap->key_data);
-  napi_value passphrase = wrap->has_key_passphrase ? BytesToBuffer(env, wrap->key_passphrase) : Undefined(env);
-  napi_value argv[2] = {key != nullptr ? key : Undefined(env), passphrase != nullptr ? passphrase : Undefined(env)};
-  napi_value out = nullptr;
-  if (!CallBindingMethod(env, binding, "getAsymmetricKeyDetails", 2, argv, &out) || out == nullptr) {
-    napi_value empty = nullptr;
-    napi_create_object(env, &empty);
-    return empty != nullptr ? empty : Undefined(env);
+  napi_value target = argc >= 1 && argv[0] != nullptr ? argv[0] : nullptr;
+  if (target == nullptr) napi_create_object(env, &target);
+  if (wrap->key_type == kKeyTypeSecret) {
+    SetObjectInt32(env, target, "length", static_cast<int32_t>(wrap->key_data.size() * CHAR_BIT));
+    return target != nullptr ? target : Undefined(env);
   }
-  return out;
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
+  if (pkey == nullptr) return target != nullptr ? target : Undefined(env);
+  PopulateAsymmetricKeyDetails(env, pkey, target);
+  EVP_PKEY_free(pkey);
+  return target != nullptr ? target : Undefined(env);
 }
 
 napi_value KeyObjectGetSymmetricKeySize(napi_env env, napi_callback_info info) {
@@ -2075,12 +3801,23 @@ napi_value KeyObjectEquals(napi_env env, napi_callback_info info) {
   bool equal = false;
   if (left != nullptr && argc >= 1 && argv[0] != nullptr) {
     KeyObjectWrap* right = UnwrapKeyObject(env, argv[0]);
-    if (right != nullptr && left->key_type == right->key_type && left->key_data.size() == right->key_data.size()) {
-      equal = std::memcmp(left->key_data.data(), right->key_data.data(), left->key_data.size()) == 0;
-    } else {
-      std::vector<uint8_t> exported = ValueToBytes(env, argv[0]);
-      equal = exported.size() == left->key_data.size() &&
-              std::memcmp(exported.data(), left->key_data.data(), left->key_data.size()) == 0;
+    if (right != nullptr && left->key_type == right->key_type) {
+      if (left->key_type == kKeyTypeSecret) {
+        equal = left->key_data.size() == right->key_data.size() &&
+                std::memcmp(left->key_data.data(), right->key_data.data(), left->key_data.size()) == 0;
+      } else {
+        EVP_PKEY* left_pkey = ParseKeyObjectAsymmetricKey(left);
+        EVP_PKEY* right_pkey = ParseKeyObjectAsymmetricKey(right);
+        if (left_pkey != nullptr && right_pkey != nullptr) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+          equal = EVP_PKEY_eq(left_pkey, right_pkey) == 1;
+#else
+          equal = EVP_PKEY_cmp(left_pkey, right_pkey) == 1;
+#endif
+        }
+        if (left_pkey != nullptr) EVP_PKEY_free(left_pkey);
+        if (right_pkey != nullptr) EVP_PKEY_free(right_pkey);
+      }
     }
   }
   napi_value out = nullptr;
@@ -2401,6 +4138,32 @@ napi_value PBKDF2JobCtor(napi_env env, napi_callback_info info) {
       const std::string digest = GetStringValue(env, argv[5]);
       const std::string message = "Invalid digest: " + digest;
       napi_throw_type_error(env, "ERR_CRYPTO_INVALID_DIGEST", message.c_str());
+      return nullptr;
+    }
+  }
+
+  if (!FinalizeJobCtor(env, this_arg, argc, argv)) return nullptr;
+  return this_arg;
+}
+
+napi_value CheckPrimeJobCtor(napi_env env, napi_callback_info info) {
+  size_t argc = 16;
+  napi_value argv[16] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  if (this_arg == nullptr) return nullptr;
+
+  if (argc >= 2 && argv[1] != nullptr && !IsNullOrUndefinedValue(env, argv[1])) {
+    const uint8_t* candidate = nullptr;
+    size_t candidate_len = 0;
+    if (!GetByteSpan(env, argv[1], &candidate, &candidate_len)) {
+      napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "candidate must be an ArrayBuffer or BufferView");
+      return nullptr;
+    }
+    ncrypto::BignumPointer bn(candidate, candidate_len);
+    if (!bn) {
+      const unsigned long err = ConsumePreferredOpenSslError();
+      napi_throw(env, CreateOpenSslError(env, MapOpenSslErrorCode(err), err, "BignumPointer"));
       return nullptr;
     }
   }
@@ -2779,6 +4542,30 @@ napi_value CreateKeyObjectHandleValue(napi_env env, int32_t key_type, const std:
   return handle;
 }
 
+napi_value CreateNativeKeyObjectHandleValue(napi_env env, int32_t key_type, EVP_PKEY* pkey) {
+  if (pkey == nullptr) return Undefined(env);
+  napi_value binding = GetBinding(env);
+  if (binding == nullptr) return Undefined(env);
+  napi_value ctor = nullptr;
+  if (napi_get_named_property(env, binding, "KeyObjectHandle", &ctor) != napi_ok || ctor == nullptr) {
+    return Undefined(env);
+  }
+  napi_valuetype ctor_type = napi_undefined;
+  if (napi_typeof(env, ctor, &ctor_type) != napi_ok || ctor_type != napi_function) return Undefined(env);
+
+  napi_value handle = nullptr;
+  if (napi_new_instance(env, ctor, 0, nullptr, &handle) != napi_ok || handle == nullptr) return Undefined(env);
+
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, handle);
+  if (wrap == nullptr || EVP_PKEY_up_ref(pkey) != 1) return Undefined(env);
+  wrap->key_type = key_type;
+  wrap->key_data.clear();
+  wrap->key_passphrase.clear();
+  wrap->has_key_passphrase = false;
+  wrap->native_pkey = pkey;
+  return handle;
+}
+
 bool ExportRsaPublic(EVP_PKEY* pkey,
                      BIO* bio,
                      int32_t format,
@@ -2796,16 +4583,14 @@ bool ExportRsaPublic(EVP_PKEY* pkey,
     const int ok = (format == kKeyFormatPEM) ? PEM_write_bio_RSAPublicKey(bio, rsa) : i2d_RSAPublicKey_bio(bio, rsa);
     RSA_free(rsa);
     if (ok != 1) {
-      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-      *error_message = "RSA key export failed";
+      SetPreferredOpenSslError(error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "RSA key export failed");
       return false;
     }
     return true;
   }
   const int ok = (format == kKeyFormatPEM) ? PEM_write_bio_PUBKEY(bio, pkey) : i2d_PUBKEY_bio(bio, pkey);
   if (ok != 1) {
-    *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-    *error_message = "Public key export failed";
+    SetPreferredOpenSslError(error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "Public key export failed");
     return false;
   }
   return true;
@@ -2838,8 +4623,8 @@ bool ExportRsaPrivate(EVP_PKEY* pkey,
           bio, rsa, cipher, pass_ptr, pass_len, nullptr, nullptr);
       RSA_free(rsa);
       if (ok != 1) {
-        *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-        *error_message = "RSA private key export failed";
+        SetPreferredOpenSslError(
+            error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "RSA private key export failed");
         return false;
       }
       return true;
@@ -2847,8 +4632,8 @@ bool ExportRsaPrivate(EVP_PKEY* pkey,
     const int ok = PEM_write_bio_PKCS8PrivateKey(
         bio, pkey, cipher, reinterpret_cast<char*>(pass_ptr), pass_len, nullptr, nullptr);
     if (ok != 1) {
-      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-      *error_message = "PKCS8 private key export failed";
+      SetPreferredOpenSslError(
+          error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "PKCS8 private key export failed");
       return false;
     }
     return true;
@@ -2863,8 +4648,8 @@ bool ExportRsaPrivate(EVP_PKEY* pkey,
     RSA* rsa = EVP_PKEY_get1_RSA(pkey);
     if (rsa == nullptr || i2d_RSAPrivateKey_bio(bio, rsa) != 1) {
       if (rsa != nullptr) RSA_free(rsa);
-      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-      *error_message = "RSA private key export failed";
+      SetPreferredOpenSslError(
+          error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "RSA private key export failed");
       return false;
     }
     RSA_free(rsa);
@@ -2874,8 +4659,8 @@ bool ExportRsaPrivate(EVP_PKEY* pkey,
   const int ok = i2d_PKCS8PrivateKey_bio(
       bio, pkey, cipher, reinterpret_cast<char*>(pass_ptr), pass_len, nullptr, nullptr);
   if (ok != 1) {
-    *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-    *error_message = "PKCS8 private key export failed";
+    SetPreferredOpenSslError(
+        error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "PKCS8 private key export failed");
     return false;
   }
   return true;
@@ -2917,8 +4702,7 @@ bool ExportEcPrivate(EVP_PKEY* pkey,
     }
     EC_KEY_free(ec);
     if (ok != 1) {
-      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-      *error_message = "EC private key export failed";
+      SetPreferredOpenSslError(error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "EC private key export failed");
       return false;
     }
     return true;
@@ -2928,8 +4712,8 @@ bool ExportEcPrivate(EVP_PKEY* pkey,
     const int ok = PEM_write_bio_PKCS8PrivateKey(
         bio, pkey, cipher, reinterpret_cast<char*>(pass_ptr), pass_len, nullptr, nullptr);
     if (ok != 1) {
-      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-      *error_message = "PKCS8 private key export failed";
+      SetPreferredOpenSslError(
+          error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "PKCS8 private key export failed");
       return false;
     }
     return true;
@@ -2938,8 +4722,8 @@ bool ExportEcPrivate(EVP_PKEY* pkey,
   const int ok = i2d_PKCS8PrivateKey_bio(
       bio, pkey, cipher, reinterpret_cast<char*>(pass_ptr), pass_len, nullptr, nullptr);
   if (ok != 1) {
-    *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-    *error_message = "PKCS8 private key export failed";
+    SetPreferredOpenSslError(
+        error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "PKCS8 private key export failed");
     return false;
   }
   return true;
@@ -2977,22 +4761,8 @@ napi_value ExportJwkPublic(napi_env env,
   if (base == EVP_PKEY_EC) {
     int nid = NID_undef;
     std::string curve_name = curve_name_hint;
-    char group_name[80];
-    size_t group_name_len = 0;
-    if (EVP_PKEY_get_utf8_string_param(pkey, OSSL_PKEY_PARAM_GROUP_NAME, group_name, sizeof(group_name),
-                                       &group_name_len) == 1 &&
-        group_name_len > 0) {
-      curve_name.assign(group_name, group_name_len);
-      nid = CurveNidFromName(curve_name);
-    }
-    if (nid == NID_undef) {
-      EC_KEY* ec = EVP_PKEY_get1_EC_KEY(pkey);
-      if (ec != nullptr) {
-        const EC_GROUP* group = EC_KEY_get0_group(ec);
-        if (group != nullptr) nid = EC_GROUP_get_curve_name(group);
-        EC_KEY_free(ec);
-      }
-    }
+    size_t field_bytes = 0;
+    ResolveEcJwkCurve(pkey, curve_name_hint, &nid, &curve_name, &field_bytes);
     const std::string jwk_curve = JwkCurveFromNid(nid);
     if (jwk_curve.empty()) {
       *error_code = "ERR_CRYPTO_JWK_UNSUPPORTED_CURVE";
@@ -3011,12 +4781,54 @@ napi_value ExportJwkPublic(napi_env env,
       *error_message = "Failed to export EC key as JWK";
       return nullptr;
     }
+    std::vector<uint8_t> x_bytes = field_bytes == 0 ? BigNumToBytes(x) : BigNumToPaddedBytes(x, field_bytes);
+    std::vector<uint8_t> y_bytes = field_bytes == 0 ? BigNumToBytes(y) : BigNumToPaddedBytes(y, field_bytes);
     SetObjectString(env, jwk, "kty", "EC");
     SetObjectString(env, jwk, "crv", jwk_curve);
-    SetObjectString(env, jwk, "x", Base64UrlEncode(BigNumToBytes(x)));
-    SetObjectString(env, jwk, "y", Base64UrlEncode(BigNumToBytes(y)));
+    SetObjectString(env, jwk, "x", Base64UrlEncode(x_bytes));
+    SetObjectString(env, jwk, "y", Base64UrlEncode(y_bytes));
     BN_free(x);
     BN_free(y);
+    return jwk;
+  }
+
+  if (base == EVP_PKEY_ED25519 || base == EVP_PKEY_ED448 ||
+      base == EVP_PKEY_X25519 || base == EVP_PKEY_X448) {
+    size_t raw_len = 0;
+    if (EVP_PKEY_get_raw_public_key(pkey, nullptr, &raw_len) != 1 || raw_len == 0) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "Failed to export OKP key as JWK";
+      return nullptr;
+    }
+    std::vector<uint8_t> raw(raw_len);
+    if (EVP_PKEY_get_raw_public_key(pkey, raw.data(), &raw_len) != 1) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "Failed to export OKP key as JWK";
+      return nullptr;
+    }
+    raw.resize(raw_len);
+
+    const char* curve_name = nullptr;
+    switch (base) {
+      case EVP_PKEY_ED25519:
+        curve_name = "Ed25519";
+        break;
+      case EVP_PKEY_ED448:
+        curve_name = "Ed448";
+        break;
+      case EVP_PKEY_X25519:
+        curve_name = "X25519";
+        break;
+      case EVP_PKEY_X448:
+        curve_name = "X448";
+        break;
+      default:
+        break;
+    }
+
+    SetObjectString(env, jwk, "kty", "OKP");
+    if (curve_name != nullptr) SetObjectString(env, jwk, "crv", curve_name);
+    SetObjectString(env, jwk, "x", Base64UrlEncode(raw));
     return jwk;
   }
 
@@ -3082,8 +4894,30 @@ napi_value ExportJwkPrivate(napi_env env,
       *error_message = "Failed to export EC private key as JWK";
       return nullptr;
     }
-    SetObjectString(env, jwk, "d", Base64UrlEncode(BigNumToBytes(d)));
+    size_t field_bytes = 0;
+    ResolveEcJwkCurve(pkey, curve_name_hint, nullptr, nullptr, &field_bytes);
+    const std::vector<uint8_t> d_bytes = field_bytes == 0 ? BigNumToBytes(d) : BigNumToPaddedBytes(d, field_bytes);
+    SetObjectString(env, jwk, "d", Base64UrlEncode(d_bytes));
     BN_free(d);
+    return jwk;
+  }
+
+  if (base == EVP_PKEY_ED25519 || base == EVP_PKEY_ED448 ||
+      base == EVP_PKEY_X25519 || base == EVP_PKEY_X448) {
+    size_t raw_len = 0;
+    if (EVP_PKEY_get_raw_private_key(pkey, nullptr, &raw_len) != 1 || raw_len == 0) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "Failed to export OKP private key as JWK";
+      return nullptr;
+    }
+    std::vector<uint8_t> raw(raw_len);
+    if (EVP_PKEY_get_raw_private_key(pkey, raw.data(), &raw_len) != 1) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "Failed to export OKP private key as JWK";
+      return nullptr;
+    }
+    raw.resize(raw_len);
+    SetObjectString(env, jwk, "d", Base64UrlEncode(raw));
     return jwk;
   }
 
@@ -3100,8 +4934,7 @@ bool ExportPublicKeyValue(napi_env env,
                           std::string* error_code,
                           std::string* error_message) {
   if (!encoding.has_public_encoding) {
-    const std::vector<uint8_t> der_spki = ExportPublicDerSpki(pkey);
-    *out_value = CreateKeyObjectHandleValue(env, kKeyTypePublic, der_spki);
+    *out_value = CreateNativeKeyObjectHandleValue(env, kKeyTypePublic, pkey);
     if (*out_value == nullptr || IsUndefined(env, *out_value)) {
       *error_code = "ERR_CRYPTO_OPERATION_FAILED";
       *error_message = "Failed to create public key object";
@@ -3145,8 +4978,7 @@ bool ExportPrivateKeyValue(napi_env env,
                            std::string* error_code,
                            std::string* error_message) {
   if (!encoding.has_private_encoding) {
-    const std::vector<uint8_t> der_pkcs8 = ExportPrivateDerPkcs8(pkey);
-    *out_value = CreateKeyObjectHandleValue(env, kKeyTypePrivate, der_pkcs8);
+    *out_value = CreateNativeKeyObjectHandleValue(env, kKeyTypePrivate, pkey);
     if (*out_value == nullptr || IsUndefined(env, *out_value)) {
       *error_code = "ERR_CRYPTO_OPERATION_FAILED";
       *error_message = "Failed to create private key object";
@@ -3220,8 +5052,8 @@ bool ExportPrivateKeyValue(napi_env env,
                bio, pkey, cipher, reinterpret_cast<char*>(pass_ptr), pass_len, nullptr, nullptr) == 1;
     }
     if (!ok) {
-      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
-      *error_message = "Private key export failed";
+      SetPreferredOpenSslError(
+          error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "Private key export failed");
     }
   }
 
@@ -3428,7 +5260,7 @@ EVP_PKEY* GenerateDhKeyPairFromPrimeNative(const std::vector<uint8_t>& prime,
                                            std::string* error_code,
                                            std::string* error_message) {
   int32_t verify_error = 0;
-  DH* dh = CreateDhFromPrimeAndGenerator(prime, generator, {}, &verify_error);
+  DH* dh = CreateDhFromPrimeAndGenerator(prime, generator, {}, false, &verify_error);
   if (dh == nullptr) {
     *error_code = "ERR_CRYPTO_OPERATION_FAILED";
     *error_message = "DH parameter initialization failed";
@@ -3442,7 +5274,7 @@ EVP_PKEY* GenerateDhKeyPairFromPrimeLengthNative(int32_t prime_length,
                                                  std::string* error_code,
                                                  std::string* error_message) {
   int32_t verify_error = 0;
-  DH* dh = CreateDhFromSize(prime_length, generator, {}, &verify_error);
+  DH* dh = CreateDhFromSize(prime_length, generator, {}, false, &verify_error);
   if (dh == nullptr) {
     *error_code = "ERR_CRYPTO_OPERATION_FAILED";
     *error_message = "DH parameter generation failed";
@@ -3461,23 +5293,71 @@ EVP_PKEY* GenerateEcKeyPairNative(const std::string& named_curve,
     *error_message = "Invalid EC curve name";
     return nullptr;
   }
-  EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
-  if (ctx == nullptr || EVP_PKEY_keygen_init(ctx) != 1 ||
-      EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx, nid) != 1 ||
-      EVP_PKEY_CTX_set_ec_param_enc(ctx, param_encoding) != 1) {
-    if (ctx != nullptr) EVP_PKEY_CTX_free(ctx);
+  EVP_PKEY_CTX* param_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+  if (param_ctx == nullptr ||
+      EVP_PKEY_paramgen_init(param_ctx) != 1 ||
+      EVP_PKEY_CTX_set_ec_paramgen_curve_nid(param_ctx, nid) != 1 ||
+      EVP_PKEY_CTX_set_ec_param_enc(param_ctx, param_encoding) != 1) {
+    if (param_ctx != nullptr) EVP_PKEY_CTX_free(param_ctx);
     *error_code = "ERR_CRYPTO_OPERATION_FAILED";
     *error_message = "EC key generation initialization failed";
     return nullptr;
   }
+
+  EVP_PKEY* params = nullptr;
+  if (EVP_PKEY_paramgen(param_ctx, &params) != 1 || params == nullptr) {
+    EVP_PKEY_CTX_free(param_ctx);
+    *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+    *error_message = "EC parameter generation failed";
+    return nullptr;
+  }
+  EVP_PKEY_CTX_free(param_ctx);
+
+  EVP_PKEY_CTX* key_ctx = EVP_PKEY_CTX_new(params, nullptr);
+  if (key_ctx == nullptr || EVP_PKEY_keygen_init(key_ctx) != 1) {
+    if (key_ctx != nullptr) EVP_PKEY_CTX_free(key_ctx);
+    EVP_PKEY_free(params);
+    *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+    *error_message = "EC key generation initialization failed";
+    return nullptr;
+  }
+
   EVP_PKEY* pkey = nullptr;
-  if (EVP_PKEY_keygen(ctx, &pkey) != 1 || pkey == nullptr) {
-    EVP_PKEY_CTX_free(ctx);
+  if (EVP_PKEY_keygen(key_ctx, &pkey) != 1 || pkey == nullptr) {
+    EVP_PKEY_CTX_free(key_ctx);
+    EVP_PKEY_free(params);
+  } else {
+    EVP_PKEY_CTX_free(key_ctx);
+    EVP_PKEY_free(params);
+    return pkey;
+  }
+
+  // Some legacy-but-valid curves still fail through OpenSSL's provider-based
+  // EVP keygen path with "missing OID", while Node successfully generates
+  // them. Fall back to direct EC_KEY generation in that case and preserve the
+  // requested parameter encoding on the key.
+  EC_KEY* ec = EC_KEY_new_by_curve_name(nid);
+  if (ec == nullptr) {
     *error_code = "ERR_CRYPTO_OPERATION_FAILED";
     *error_message = "EC key generation failed";
     return nullptr;
   }
-  EVP_PKEY_CTX_free(ctx);
+  EC_KEY_set_asn1_flag(ec, param_encoding);
+  if (EC_KEY_generate_key(ec) != 1 || EC_KEY_check_key(ec) != 1) {
+    EC_KEY_free(ec);
+    *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+    *error_message = "EC key generation failed";
+    return nullptr;
+  }
+
+  pkey = EVP_PKEY_new();
+  if (pkey == nullptr || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+    if (pkey != nullptr) EVP_PKEY_free(pkey);
+    else EC_KEY_free(ec);
+    *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+    *error_message = "EC key generation failed";
+    return nullptr;
+  }
   return pkey;
 }
 
@@ -3738,6 +5618,255 @@ napi_value NidKeyPairGenJobRun(napi_env env, napi_callback_info info) {
   return FinalizeJobRunResult(env, this_arg, wrap, result);
 }
 
+napi_value SecretKeyGenJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.empty()) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid secret keygen arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  uint32_t bits = 0;
+  napi_value bits_value = GetRefValue(env, wrap->args[0]);
+  if (bits_value == nullptr || napi_get_value_uint32(env, bits_value, &bits) != napi_ok) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid secret keygen arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const size_t length = static_cast<size_t>(bits / CHAR_BIT);
+  std::vector<uint8_t> key(length);
+  if (length > 0 && !ncrypto::CSPRNG(key.data(), length)) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Secret key generation failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value value = CreateKeyObjectHandleValue(env, kKeyTypeSecret, key);
+  if (value == nullptr || IsUndefined(env, value)) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Secret key generation failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, value));
+}
+
+napi_value RandomPrimeJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 2) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid random prime arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int32_t bits = GetInt32Value(env, GetRefValue(env, wrap->args[0]), 0);
+  bool safe = false;
+  napi_value safe_v = GetRefValue(env, wrap->args[1]);
+  if (safe_v != nullptr) napi_get_value_bool(env, safe_v, &safe);
+
+  ncrypto::BignumPointer add;
+  ncrypto::BignumPointer rem;
+  if (wrap->args.size() >= 3) {
+    napi_value add_v = GetRefValue(env, wrap->args[2]);
+    if (!IsNullOrUndefinedValue(env, add_v)) {
+      const std::vector<uint8_t> add_bytes = ValueToBytes(env, add_v);
+      add.reset(add_bytes.data(), add_bytes.size());
+      if (!add) {
+        napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "could not generate prime");
+        return FinalizeJobRunResult(env, this_arg, wrap, result);
+      }
+    }
+  }
+  if (wrap->args.size() >= 4) {
+    napi_value rem_v = GetRefValue(env, wrap->args[3]);
+    if (!IsNullOrUndefinedValue(env, rem_v)) {
+      const std::vector<uint8_t> rem_bytes = ValueToBytes(env, rem_v);
+      rem.reset(rem_bytes.data(), rem_bytes.size());
+      if (!rem) {
+        napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "could not generate prime");
+        return FinalizeJobRunResult(env, this_arg, wrap, result);
+      }
+    }
+  }
+
+  if (bits <= 0) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid random prime arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  if (add && ncrypto::BignumPointer::GetBitCount(add.get()) > bits) {
+    napi_value result = BuildJobErrorResult(env, "ERR_OUT_OF_RANGE", "invalid options.add");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  if (add && rem && BN_cmp(add.get(), rem.get()) <= 0) {
+    napi_value result = BuildJobErrorResult(env, "ERR_OUT_OF_RANGE", "invalid options.rem");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  ncrypto::BignumPointer prime = ncrypto::BignumPointer::NewSecure();
+  if (!prime) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "could not generate prime");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  if (!prime.generate({.bits = bits, .safe = safe, .add = add, .rem = rem})) {
+    napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "could not generate prime");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  std::vector<uint8_t> prime_bytes(prime.byteLength());
+  if (!prime_bytes.empty()) prime.encodeInto(prime_bytes.data());
+  napi_value value = CreateArrayBufferCopy(env, prime_bytes);
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, value));
+}
+
+napi_value CheckPrimeJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 2) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid check prime arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const napi_value candidate_v = GetRefValue(env, wrap->args[0]);
+  const uint8_t* candidate_bytes = nullptr;
+  size_t candidate_len = 0;
+  if (!GetByteSpan(env, candidate_v, &candidate_bytes, &candidate_len)) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid check prime arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  ncrypto::BignumPointer candidate(candidate_bytes, candidate_len);
+  if (!candidate) {
+    napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "BignumPointer");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int32_t checks = GetInt32Value(env, GetRefValue(env, wrap->args[1]), 0);
+  const int ret = candidate.isPrime(checks);
+  if (ret < 0) {
+    napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "check prime failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value result_bool = nullptr;
+  napi_get_boolean(env, ret != 0, &result_bool);
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, result_bool));
+}
+
+napi_value DeriveBitsJobRun(napi_env env,
+                            napi_value this_arg,
+                            JobWrap* wrap,
+                            const char* invalid_message,
+                            const char* failure_message) {
+  if (wrap == nullptr || wrap->args.size() < 2) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", invalid_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  KeyObjectWrap* public_wrap = UnwrapKeyObject(env, GetRefValue(env, wrap->args[0]));
+  KeyObjectWrap* private_wrap = UnwrapKeyObject(env, GetRefValue(env, wrap->args[1]));
+  if (public_wrap == nullptr || private_wrap == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", invalid_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  EVP_PKEY* public_pkey = ParseKeyObjectAsymmetricKey(public_wrap);
+  EVP_PKEY* private_pkey = ParseKeyObjectAsymmetricKey(private_wrap);
+  if (public_pkey == nullptr || private_pkey == nullptr) {
+    if (public_pkey != nullptr) EVP_PKEY_free(public_pkey);
+    if (private_pkey != nullptr) EVP_PKEY_free(private_pkey);
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", failure_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int public_key_type = EVP_PKEY_base_id(public_pkey);
+  const int private_key_type = EVP_PKEY_base_id(private_pkey);
+  const bool xdh_derive =
+      public_key_type == EVP_PKEY_X25519 ||
+      public_key_type == EVP_PKEY_X448 ||
+      private_key_type == EVP_PKEY_X25519 ||
+      private_key_type == EVP_PKEY_X448;
+  EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(private_pkey, nullptr);
+  bool ok = ctx != nullptr && EVP_PKEY_derive_init(ctx) == 1 && EVP_PKEY_derive_set_peer(ctx, public_pkey) == 1;
+  size_t secret_len = 0;
+  if (ok) ok = EVP_PKEY_derive(ctx, nullptr, &secret_len) == 1;
+  const int key_type = private_pkey != nullptr ? EVP_PKEY_base_id(private_pkey) : EVP_PKEY_NONE;
+  size_t padded_secret_len = secret_len;
+  if (key_type == EVP_PKEY_DH || key_type == EVP_PKEY_DHX) {
+    const int pkey_size = private_pkey != nullptr ? EVP_PKEY_size(private_pkey) : 0;
+    if (pkey_size > 0 && static_cast<size_t>(pkey_size) > padded_secret_len) {
+      padded_secret_len = static_cast<size_t>(pkey_size);
+    }
+  }
+
+  std::vector<uint8_t> secret;
+  if (ok) {
+    secret.resize(secret_len);
+    ok = EVP_PKEY_derive(ctx, secret.data(), &secret_len) == 1;
+    if (ok) {
+      secret.resize(secret_len);
+      if (padded_secret_len > secret_len) {
+        std::vector<uint8_t> padded(padded_secret_len, 0);
+        std::memcpy(padded.data() + (padded_secret_len - secret_len), secret.data(), secret_len);
+        secret = std::move(padded);
+      }
+    }
+  }
+
+  if (ctx != nullptr) EVP_PKEY_CTX_free(ctx);
+  EVP_PKEY_free(public_pkey);
+  EVP_PKEY_free(private_pkey);
+
+  if (!ok) {
+    const unsigned long err = ConsumePreferredOpenSslError();
+    const char* reason = err != 0 ? ERR_reason_error_string(err) : nullptr;
+    napi_value result = nullptr;
+    if (xdh_derive &&
+        reason != nullptr &&
+        (std::strcmp(reason, "unsupported") == 0 ||
+         std::strcmp(reason, "failed during derivation") == 0)) {
+      napi_value error =
+          CreateErrorWithCode(env, "ERR_OSSL_FAILED_DURING_DERIVATION", "failed during derivation");
+      SetErrorStringProperty(env, error, "library", "Provider routines");
+      SetErrorStringProperty(env, error, "reason", "failed during derivation");
+      result = BuildJobResult(env, error, Undefined(env));
+    } else {
+      napi_value error = err != 0 ? CreateOpenSslError(env, MapOpenSslErrorCode(err), err, failure_message)
+                                  : CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", failure_message);
+      result = BuildJobResult(env, error, Undefined(env));
+    }
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value value = nullptr;
+  void* raw = nullptr;
+  if (napi_create_arraybuffer(env, secret.size(), &raw, &value) != napi_ok || value == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", failure_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  if (raw != nullptr && !secret.empty()) std::memcpy(raw, secret.data(), secret.size());
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, value));
+}
+
+napi_value DHBitsJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  return DeriveBitsJobRun(env, this_arg, wrap, "Invalid DH bits arguments", "DH bits generation failed");
+}
+
+napi_value ECDHBitsJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  return DeriveBitsJobRun(env, this_arg, wrap, "Invalid ECDH bits arguments", "ECDH bits generation failed");
+}
+
 napi_value RandomBytesJobRun(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
@@ -3956,6 +6085,106 @@ napi_value SignJobRun(napi_env env, napi_callback_info info) {
   return result;
 }
 
+napi_value RSACipherJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 5) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid RSA cipher arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int32_t mode = GetInt32Value(env, GetRefValue(env, wrap->args[0]), 0);
+  KeyObjectWrap* key_wrap = UnwrapKeyObject(env, GetRefValue(env, wrap->args[1]));
+  if (key_wrap == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key object");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const std::vector<uint8_t> data = ValueToBytes(env, GetRefValue(env, wrap->args[2]));
+  const int32_t variant = GetInt32Value(env, GetRefValue(env, wrap->args[3]), kKeyVariantRSA_OAEP);
+  const std::string oaep_hash = GetStringValue(env, GetRefValue(env, wrap->args[4]));
+  const napi_value label_v = wrap->args.size() >= 6 ? GetRefValue(env, wrap->args[5]) : Undefined(env);
+  const bool has_label = !IsNullOrUndefinedValue(env, label_v);
+  const std::vector<uint8_t> label = has_label ? ValueToBytes(env, label_v) : std::vector<uint8_t>{};
+
+  if (variant != kKeyVariantRSA_OAEP) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Unsupported RSA cipher variant");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(key_wrap);
+  if (pkey == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid key object");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+  const bool encrypt = (mode == 0);
+  if (ctx == nullptr ||
+      (encrypt ? EVP_PKEY_encrypt_init(ctx) : EVP_PKEY_decrypt_init(ctx)) != 1 ||
+      EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) != 1) {
+    if (ctx != nullptr) EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    napi_value result =
+        BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "RSA cipher initialization failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const EVP_MD* md = EVP_get_digestbyname(oaep_hash.empty() ? "sha1" : oaep_hash.c_str());
+  if (md == nullptr ||
+      EVP_PKEY_CTX_set_rsa_oaep_md(ctx, md) != 1 ||
+      EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md) != 1) {
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_DIGEST", "Invalid OAEP digest");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  if (has_label && !label.empty()) {
+    unsigned char* copied = reinterpret_cast<unsigned char*>(OPENSSL_malloc(label.size()));
+    if (copied == nullptr) {
+      EVP_PKEY_CTX_free(ctx);
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to allocate OAEP label");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    std::memcpy(copied, label.data(), label.size());
+    if (EVP_PKEY_CTX_set0_rsa_oaep_label(ctx, copied, static_cast<int>(label.size())) != 1) {
+      OPENSSL_free(copied);
+      EVP_PKEY_CTX_free(ctx);
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to set OAEP label");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+  }
+
+  const unsigned char* input = data.empty() ? nullptr : data.data();
+  size_t out_len = 0;
+  const int first_ok = encrypt ? EVP_PKEY_encrypt(ctx, nullptr, &out_len, input, data.size())
+                               : EVP_PKEY_decrypt(ctx, nullptr, &out_len, input, data.size());
+  if (first_ok != 1) {
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "RSA cipher failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  std::vector<uint8_t> out(out_len);
+  const int second_ok = encrypt ? EVP_PKEY_encrypt(ctx, out.data(), &out_len, input, data.size())
+                                : EVP_PKEY_decrypt(ctx, out.data(), &out_len, input, data.size());
+  EVP_PKEY_CTX_free(ctx);
+  EVP_PKEY_free(pkey);
+  if (second_ok != 1) {
+    napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "RSA cipher failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value value = CreateArrayBufferCopy(env, out.data(), out_len);
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, value));
+}
+
 napi_value CryptoOneShotDigest(napi_env env, napi_callback_info info) {
   size_t argc = 7;
   napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -3978,6 +6207,39 @@ napi_value CryptoOneShotDigest(napi_env env, napi_callback_info info) {
   }
   napi_value as_buffer = EnsureBufferValue(env, out);
   return MaybeToEncodedOutput(env, as_buffer, argc >= 5 ? argv[4] : nullptr);
+}
+
+napi_value CryptoBindingPassthrough(napi_env env,
+                                    napi_callback_info info,
+                                    const char* method_name,
+                                    size_t expected_argv) {
+  std::vector<napi_value> argv(expected_argv, nullptr);
+  size_t argc = expected_argv;
+  napi_get_cb_info(env, info, &argc, argv.data(), nullptr, nullptr);
+  napi_value binding = GetBinding(env);
+  if (binding == nullptr) return Undefined(env);
+
+  napi_value out = nullptr;
+  if (CallBindingMethod(env, binding, method_name, argc, argv.data(), &out)) {
+    return out != nullptr ? out : Undefined(env);
+  }
+  return nullptr;
+}
+
+napi_value CryptoPublicEncryptBridge(napi_env env, napi_callback_info info) {
+  return CryptoBindingPassthrough(env, info, "publicEncrypt", 8);
+}
+
+napi_value CryptoPrivateDecryptBridge(napi_env env, napi_callback_info info) {
+  return CryptoBindingPassthrough(env, info, "privateDecrypt", 8);
+}
+
+napi_value CryptoPrivateEncryptBridge(napi_env env, napi_callback_info info) {
+  return CryptoBindingPassthrough(env, info, "privateEncrypt", 8);
+}
+
+napi_value CryptoPublicDecryptBridge(napi_env env, napi_callback_info info) {
+  return CryptoBindingPassthrough(env, info, "publicDecrypt", 8);
 }
 
 napi_value CryptoTimingSafeEqual(napi_env env, napi_callback_info info) {
@@ -4340,12 +6602,15 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
   EnsurePropertyMethod(env, out, "resetRootCertStore", CryptoNoop);
   EnsurePropertyMethod(env, out, "startLoadingCertificatesOffThread", CryptoNoop);
   EnsurePropertyMethod(env, out, "createNativeKeyObjectClass", CryptoCreateNativeKeyObjectClass);
+  EnsurePropertyMethod(env, out, "ECDHConvertKey", EcdhConvertKey);
   EnsureStubMethod(env, out, "setEngine");
-  EnsureStubMethod(env, out, "privateEncrypt");
-  EnsureStubMethod(env, out, "publicDecrypt");
-  EnsureStubMethod(env, out, "certExportChallenge");
-  EnsureStubMethod(env, out, "certExportPublicKey");
-  EnsureStubMethod(env, out, "certVerifySpkac");
+  EnsurePropertyMethod(env, out, "publicEncrypt", CryptoPublicEncryptBridge);
+  EnsurePropertyMethod(env, out, "privateDecrypt", CryptoPrivateDecryptBridge);
+  EnsurePropertyMethod(env, out, "privateEncrypt", CryptoPrivateEncryptBridge);
+  EnsurePropertyMethod(env, out, "publicDecrypt", CryptoPublicDecryptBridge);
+  EnsurePropertyMethod(env, out, "certExportChallenge", CertExportChallenge);
+  EnsurePropertyMethod(env, out, "certExportPublicKey", CertExportPublicKey);
+  EnsurePropertyMethod(env, out, "certVerifySpkac", CertVerifySpkac);
   EnsurePropertyMethod(env, out, "parseX509", CryptoParseX509);
   EnsurePropertyMethod(env, out, "getSSLCiphers", CryptoGetSSLCiphers);
 
@@ -4445,9 +6710,15 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               KeyObjectCtor,
               {
                   {"init", nullptr, KeyObjectInit, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"initJwk", nullptr, KeyObjectInitJwk, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"exportJwk", nullptr, KeyObjectExportJwk, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"export", nullptr, KeyObjectExport, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"getAsymmetricKeyType", nullptr, KeyObjectGetAsymmetricKeyType, nullptr, nullptr, nullptr,
                    napi_default, nullptr},
+                  {"checkEcKeyData", nullptr, KeyObjectCheckEcKeyData, nullptr, nullptr, nullptr, napi_default,
+                   nullptr},
+                  {"initECRaw", nullptr, KeyObjectInitECRaw, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"initEDRaw", nullptr, KeyObjectInitEDRaw, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"keyDetail", nullptr, KeyObjectGetAsymmetricKeyDetails, nullptr, nullptr, nullptr, napi_default,
                    nullptr},
                   {"getSymmetricKeySize", nullptr, KeyObjectGetSymmetricKeySize, nullptr, nullptr, nullptr, napi_default,
@@ -4546,10 +6817,31 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               });
   EnsureClass(env,
               out,
+              "RandomPrimeJob",
+              JobCtor,
+              {
+                  {"run", nullptr, RandomPrimeJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "CheckPrimeJob",
+              CheckPrimeJobCtor,
+              {
+                  {"run", nullptr, CheckPrimeJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
               "SignJob",
               JobCtor,
               {
                   {"run", nullptr, SignJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "RSACipherJob",
+              JobCtor,
+              {
+                  {"run", nullptr, RSACipherJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
               });
   EnsureClass(env,
               out,
@@ -4586,14 +6878,33 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               {
                   {"run", nullptr, NidKeyPairGenJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
               });
+  EnsureClass(env,
+              out,
+              "SecretKeyGenJob",
+              JobCtor,
+              {
+                  {"run", nullptr, SecretKeyGenJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "DHBitsJob",
+              JobCtor,
+              {
+                  {"run", nullptr, DHBitsJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "ECDHBitsJob",
+              JobCtor,
+              {
+                  {"run", nullptr, ECDHBitsJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
 
   const char* stub_classes[] = {
-      "AESCipherJob",      "Argon2Job",          "ChaCha20Poly1305CipherJob", "CheckPrimeJob",
-      "DHBitsJob",         "DHKeyExportJob",     "ECDHBitsJob",
-      "ECDHConvertKey",
+      "AESCipherJob",      "Argon2Job",          "ChaCha20Poly1305CipherJob",
+      "DHKeyExportJob",
       "ECKeyExportJob",    "HmacJob",            "KEMDecapsulateJob",         "KEMEncapsulateJob",
-      "KmacJob",           "RSACipherJob",       "RSAKeyExportJob",           "RandomPrimeJob",
-      "SecretKeyGenJob",
+      "KmacJob",           "RSAKeyExportJob",
   };
   for (const char* cls : stub_classes) EnsureStubClass(env, out, cls);
 
