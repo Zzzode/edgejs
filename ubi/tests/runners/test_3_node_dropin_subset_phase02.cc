@@ -1469,6 +1469,9 @@ DEFINE_RAW_NODE_TEST(RawUrlParseQueryFromNodeTest, "test-url-parse-query.js")
 DEFINE_RAW_NODE_TEST(RawUrlPathtofileurlFromNodeTest, "test-url-pathtofileurl.js")
 DEFINE_RAW_NODE_TEST(RawUrlRelativeFromNodeTest, "test-url-relative.js")
 DEFINE_RAW_NODE_TEST(RawUrlUrltooptionsFromNodeTest, "test-url-urltooptions.js")
+DEFINE_RAW_NODE_TEST(RawUrlPatternFromNodeTest, "test-urlpattern.js")
+DEFINE_RAW_NODE_TEST(RawUrlPatternInvalidThisFromNodeTest, "test-urlpattern-invalidthis.js")
+DEFINE_RAW_NODE_TEST(RawUrlPatternTypesFromNodeTest, "test-urlpattern-types.js")
 
 // Raw Node string_decoder tests
 DEFINE_RAW_NODE_TEST(RawStringDecoderFromNodeTest, "test-string-decoder.js")

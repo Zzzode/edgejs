@@ -219,6 +219,7 @@ add_library(ubi_simdjson STATIC
 add_library(ubi_ada STATIC
   "${PROJECT_ROOT}/deps/ada/ada.cpp"
 )
+target_compile_definitions(ubi_ada PUBLIC ADA_USE_UNSAFE_STD_REGEX_PROVIDER)
 target_include_directories(ubi_ada
   PUBLIC
     "${PROJECT_ROOT}/deps/ada"
@@ -338,6 +339,7 @@ add_library(ubi_runtime STATIC
   src/ubi_cares_wrap.cc
   src/ubi_udp_wrap.cc
   src/ubi_url.cc
+  src/ubi_url_pattern.cc
   src/ubi_util.cc
   src/ubi_worker_env.cc
   src/ubi_spawn_sync.cc

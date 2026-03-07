@@ -1063,7 +1063,7 @@ static bool IsPerContextBuiltinId(const std::string& id) {
 }
 
 static bool ShouldCacheInternalBinding(const std::string& name) {
-  return name != "encoding_binding";
+  return name != "encoding_binding" && name != "url" && name != "url_pattern";
 }
 
 static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state) {
