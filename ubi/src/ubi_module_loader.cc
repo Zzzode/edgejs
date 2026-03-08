@@ -3958,6 +3958,20 @@ void UbiSetPerIsolateSymbols(napi_env env, napi_value per_isolate_symbols) {
   ResetStateRef(env, &it->second.per_isolate_symbols_ref, per_isolate_symbols);
 }
 
+napi_value UbiGetPrivateSymbols(napi_env env) {
+  if (env == nullptr) return nullptr;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return nullptr;
+  return GetRefValue(env, it->second.private_symbols_ref);
+}
+
+napi_value UbiGetPerIsolateSymbols(napi_env env) {
+  if (env == nullptr) return nullptr;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return nullptr;
+  return GetRefValue(env, it->second.per_isolate_symbols_ref);
+}
+
 napi_value UbiGetRequireFunction(napi_env env) {
   if (env == nullptr) return nullptr;
   auto it = g_loader_states.find(env);

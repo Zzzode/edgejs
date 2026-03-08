@@ -149,6 +149,7 @@ assert.ok(utilBinding && typeof utilBinding === 'object');
 assert.strictEqual(utilBinding.constants.kPending, 0);
 assert.strictEqual(utilBinding.constants.kFulfilled, 1);
 assert.strictEqual(utilBinding.constants.kRejected, 2);
+assert.strictEqual(utilBinding.constants.kCloneable, 2);
 assert.strictEqual(typeof utilBinding.getCallerLocation, 'function');
 const loc = utilBinding.getCallerLocation();
 assert.ok(loc === undefined || (Array.isArray(loc) && loc.length === 3));
@@ -191,6 +192,13 @@ if (callSites.length > 0) {
   assert.strictEqual(typeof callSites[0].scriptId, 'string');
   assert.ok(!String(callSites[0].scriptName).includes('node:util'));
 }
+
+const messagingBinding = internalBinding('messaging');
+assert.ok(messagingBinding && typeof messagingBinding === 'object');
+const domException = new messagingBinding.DOMException('boom');
+assert.strictEqual(domException[utilBinding.privateSymbols.transfer_mode_private_symbol], utilBinding.constants.kCloneable);
+assert.strictEqual(typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_clone_symbol], 'function');
+assert.strictEqual(typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_deserialize_symbol], 'function');
 
 const proxyTarget = { a: 1 };
 const proxyHandler = {
@@ -720,6 +728,31 @@ assert.strictEqual(typeof jsUdpHandle.getProviderType, 'function');
 globalThis.__ubi_internal_binding_parity_ok = 1;
 )JS";
 
+constexpr const char* kSymbolBootstrapParityScript = R"JS(
+const assert = require('assert');
+
+const utilBinding = internalBinding('util');
+const symbolsBinding = internalBinding('symbols');
+const messagingBinding = internalBinding('messaging');
+
+const domException = new messagingBinding.DOMException('boom');
+
+assert.strictEqual(
+  domException[utilBinding.privateSymbols.transfer_mode_private_symbol],
+  utilBinding.constants.kCloneable,
+);
+assert.strictEqual(
+  typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_clone_symbol],
+  'function',
+);
+assert.strictEqual(
+  typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_deserialize_symbol],
+  'function',
+);
+
+globalThis.__ubi_symbol_bootstrap_parity_ok = 1;
+)JS";
+
 }  // namespace
 
 TEST_F(Test5InternalBindingParityPhase03, WaveOneAndTwoBindingsHaveCriticalParitySurface) {
@@ -735,6 +768,25 @@ TEST_F(Test5InternalBindingParityPhase03, WaveOneAndTwoBindingsHaveCriticalParit
 
   napi_value ok_value = nullptr;
   ASSERT_EQ(napi_get_named_property(s.env, global, "__ubi_internal_binding_parity_ok", &ok_value), napi_ok);
+
+  int32_t ok = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, ok_value, &ok), napi_ok);
+  EXPECT_EQ(ok, 1);
+}
+
+TEST_F(Test5InternalBindingParityPhase03, BootstrapSymbolsShareStateAcrossBindings) {
+  EnvScope s(runtime_.get());
+
+  std::string error;
+  const int exit_code = UbiRunScriptSource(s.env, kSymbolBootstrapParityScript, &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty());
+
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+
+  napi_value ok_value = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, global, "__ubi_symbol_bootstrap_parity_ok", &ok_value), napi_ok);
 
   int32_t ok = 0;
   ASSERT_EQ(napi_get_value_int32(s.env, ok_value, &ok), napi_ok);

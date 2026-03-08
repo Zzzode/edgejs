@@ -32,6 +32,53 @@ constexpr int32_t kExitInfoKExiting = 0;
 constexpr int32_t kExitInfoKExitCode = 1;
 constexpr int32_t kExitInfoKHasExitCode = 2;
 
+constexpr std::array<std::pair<const char*, const char*>, 20> kPrivateSymbolNames = {{
+    {"arrow_message_private_symbol", "node:arrowMessage"},
+    {"contextify_context_private_symbol", "node:contextify:context"},
+    {"decorated_private_symbol", "node:decorated"},
+    {"transfer_mode_private_symbol", "node:transfer_mode"},
+    {"host_defined_option_symbol", "node:host_defined_option_symbol"},
+    {"js_transferable_wrapper_private_symbol", "node:js_transferable_wrapper"},
+    {"entry_point_module_private_symbol", "node:entry_point_module"},
+    {"entry_point_promise_private_symbol", "node:entry_point_promise"},
+    {"module_source_private_symbol", "node:module_source"},
+    {"module_export_names_private_symbol", "node:module_export_names"},
+    {"module_circular_visited_private_symbol", "node:module_circular_visited"},
+    {"module_export_private_symbol", "node:module_export"},
+    {"module_first_parent_private_symbol", "node:module_first_parent"},
+    {"module_last_parent_private_symbol", "node:module_last_parent"},
+    {"napi_type_tag", "node:napi:type_tag"},
+    {"napi_wrapper", "node:napi:wrapper"},
+    {"untransferable_object_private_symbol", "node:untransferableObject"},
+    {"exit_info_private_symbol", "node:exit_info_private_symbol"},
+    {"promise_trace_id", "node:promise_trace_id"},
+    {"source_map_data_private_symbol", "node:source_map_data_private_symbol"},
+}};
+
+constexpr std::array<std::pair<const char*, const char*>, 21> kPerIsolateSymbolNames = {{
+    {"fs_use_promises_symbol", "fs_use_promises_symbol"},
+    {"async_id_symbol", "async_id_symbol"},
+    {"constructor_key_symbol", "constructor_key_symbol"},
+    {"handle_onclose_symbol", "handle_onclose"},
+    {"no_message_symbol", "no_message_symbol"},
+    {"messaging_deserialize_symbol", "messaging_deserialize_symbol"},
+    {"imported_cjs_symbol", "imported_cjs_symbol"},
+    {"messaging_transfer_symbol", "messaging_transfer_symbol"},
+    {"messaging_clone_symbol", "messaging_clone_symbol"},
+    {"messaging_transfer_list_symbol", "messaging_transfer_list_symbol"},
+    {"oninit_symbol", "oninit"},
+    {"owner_symbol", "owner_symbol"},
+    {"onpskexchange_symbol", "onpskexchange"},
+    {"resource_symbol", "resource_symbol"},
+    {"trigger_async_id_symbol", "trigger_async_id_symbol"},
+    {"source_text_module_default_hdo", "source_text_module_default_hdo"},
+    {"vm_context_no_contextify", "vm_context_no_contextify"},
+    {"vm_dynamic_import_default_internal", "vm_dynamic_import_default_internal"},
+    {"vm_dynamic_import_main_context_default", "vm_dynamic_import_main_context_default"},
+    {"vm_dynamic_import_missing_flag", "vm_dynamic_import_missing_flag"},
+    {"vm_dynamic_import_no_callback", "vm_dynamic_import_no_callback"},
+}};
+
 struct LazyPropertyData {
   std::string module_id;
   std::string key;
@@ -78,6 +125,30 @@ bool SetString(napi_env env, napi_value target, const char* key, const char* val
   napi_value v = nullptr;
   return napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &v) == napi_ok && v != nullptr &&
          SetNamedProperty(env, target, key, v);
+}
+
+bool CreateNullPrototypeObject(napi_env env, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (napi_create_object(env, out) != napi_ok || *out == nullptr) return false;
+  return node_api_set_prototype(env, *out, Null(env)) == napi_ok;
+}
+
+template <size_t N, typename CreateFn>
+napi_value CreateSymbolObject(napi_env env,
+                              const std::array<std::pair<const char*, const char*>, N>& entries,
+                              CreateFn&& create_symbol) {
+  napi_value out = nullptr;
+  if (!CreateNullPrototypeObject(env, &out)) return nullptr;
+
+  for (const auto& [key, description] : entries) {
+    napi_value sym = nullptr;
+    if (!create_symbol(description, &sym) || sym == nullptr || !SetNamedProperty(env, out, key, sym)) {
+      return nullptr;
+    }
+  }
+
+  return out;
 }
 
 napi_value GetNamedProperty(napi_env env, napi_value obj, const char* key) {
@@ -971,40 +1042,33 @@ bool DefineMethod(napi_env env, napi_value target, const char* name, napi_callba
   return SetNamedProperty(env, target, name, fn);
 }
 
+napi_value CreatePrivateSymbolsObject(napi_env env) {
+  return CreateSymbolObject(
+      env,
+      kPrivateSymbolNames,
+      [&](const char* description, napi_value* out) {
+        return unofficial_napi_create_private_symbol(env, description, NAPI_AUTO_LENGTH, out) == napi_ok;
+      });
+}
+
+napi_value CreatePerIsolateSymbolsObject(napi_env env) {
+  return CreateSymbolObject(
+      env,
+      kPerIsolateSymbolNames,
+      [&](const char* description, napi_value* out) {
+        napi_value desc = nullptr;
+        return napi_create_string_utf8(env, description, NAPI_AUTO_LENGTH, &desc) == napi_ok &&
+               desc != nullptr &&
+               napi_create_symbol(env, desc, out) == napi_ok;
+      });
+}
+
 bool InstallPrivateSymbols(napi_env env, napi_value binding) {
-  napi_value private_symbols = nullptr;
-  if (napi_create_object(env, &private_symbols) != napi_ok || private_symbols == nullptr) return false;
-
-  const std::array<std::pair<const char*, const char*>, 20> symbol_names = {{
-      {"arrow_message_private_symbol", "node:arrowMessage"},
-      {"contextify_context_private_symbol", "node:contextify:context"},
-      {"decorated_private_symbol", "node:decorated"},
-      {"transfer_mode_private_symbol", "node:transfer_mode"},
-      {"host_defined_option_symbol", "node:host_defined_option_symbol"},
-      {"js_transferable_wrapper_private_symbol", "node:js_transferable_wrapper"},
-      {"entry_point_module_private_symbol", "node:entry_point_module"},
-      {"entry_point_promise_private_symbol", "node:entry_point_promise"},
-      {"module_source_private_symbol", "node:module_source"},
-      {"module_export_names_private_symbol", "node:module_export_names"},
-      {"module_circular_visited_private_symbol", "node:module_circular_visited"},
-      {"module_export_private_symbol", "node:module_export"},
-      {"module_first_parent_private_symbol", "node:module_first_parent"},
-      {"module_last_parent_private_symbol", "node:module_last_parent"},
-      {"napi_type_tag", "node:napi:type_tag"},
-      {"napi_wrapper", "node:napi:wrapper"},
-      {"untransferable_object_private_symbol", "node:untransferableObject"},
-      {"exit_info_private_symbol", "node:exit_info_private_symbol"},
-      {"promise_trace_id", "node:promise_trace_id"},
-      {"source_map_data_private_symbol", "node:source_map_data_private_symbol"},
-  }};
-
-  for (const auto& [key, description] : symbol_names) {
-    napi_value sym = nullptr;
-    if (unofficial_napi_create_private_symbol(env, description, NAPI_AUTO_LENGTH, &sym) != napi_ok ||
-        sym == nullptr) {
-      return false;
-    }
-    if (!SetNamedProperty(env, private_symbols, key, sym)) return false;
+  napi_value private_symbols = UbiGetPrivateSymbols(env);
+  if (private_symbols == nullptr) {
+    private_symbols = CreatePrivateSymbolsObject(env);
+    if (private_symbols == nullptr) return false;
+    UbiSetPrivateSymbols(env, private_symbols);
   }
 
   return SetNamedProperty(env, binding, "privateSymbols", private_symbols);
@@ -1230,6 +1294,14 @@ bool InstallTypesBinding(napi_env env) {
 }
 
 }  // namespace
+
+napi_value UbiCreatePrivateSymbolsObject(napi_env env) {
+  return CreatePrivateSymbolsObject(env);
+}
+
+napi_value UbiCreatePerIsolateSymbolsObject(napi_env env) {
+  return CreatePerIsolateSymbolsObject(env);
+}
 
 napi_value UbiInstallUtilBinding(napi_env env) {
   napi_value binding = nullptr;

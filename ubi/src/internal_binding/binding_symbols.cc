@@ -3,6 +3,8 @@
 #include <unordered_map>
 
 #include "internal_binding/helpers.h"
+#include "ubi_module_loader.h"
+#include "ubi_util.h"
 
 namespace internal_binding {
 
@@ -18,6 +20,17 @@ napi_value GetCachedSymbols(napi_env env) {
   return out;
 }
 
+napi_value GetPerIsolateSymbolSource(napi_env env) {
+  napi_value source = UbiGetPerIsolateSymbols(env);
+  if (source != nullptr && !IsUndefined(env, source)) return source;
+
+  source = UbiCreatePerIsolateSymbolsObject(env);
+  if (source != nullptr && !IsUndefined(env, source)) {
+    UbiSetPerIsolateSymbols(env, source);
+  }
+  return source;
+}
+
 }  // namespace
 
 napi_value ResolveSymbols(napi_env env, const ResolveOptions& /*options*/) {
@@ -25,17 +38,16 @@ napi_value ResolveSymbols(napi_env env, const ResolveOptions& /*options*/) {
   napi_value existing = GetCachedSymbols(env);
   if (existing != nullptr) return existing;
 
+  napi_value source = GetPerIsolateSymbolSource(env);
+  if (source == nullptr || IsUndefined(env, source)) return undefined;
+
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
 
-  auto set_symbol = [&](const char* key, const char* description) {
-    napi_value desc = nullptr;
+  auto set_symbol = [&](const char* target_key, const char* source_key) {
     napi_value sym = nullptr;
-    if (napi_create_string_utf8(env, description, NAPI_AUTO_LENGTH, &desc) == napi_ok &&
-        desc != nullptr &&
-        napi_create_symbol(env, desc, &sym) == napi_ok &&
-        sym != nullptr) {
-      napi_set_named_property(env, out, key, sym);
+    if (napi_get_named_property(env, source, source_key, &sym) == napi_ok && sym != nullptr) {
+      napi_set_named_property(env, out, target_key, sym);
     }
   };
 
@@ -47,13 +59,13 @@ napi_value ResolveSymbols(napi_env env, const ResolveOptions& /*options*/) {
   set_symbol("source_text_module_default_hdo", "source_text_module_default_hdo");
   set_symbol("constructor_key_symbol", "constructor_key_symbol");
   set_symbol("fs_use_promises_symbol", "fs_use_promises_symbol");
-  set_symbol("handle_onclose", "handle_onclose");
+  set_symbol("handle_onclose", "handle_onclose_symbol");
   set_symbol("resource_symbol", "resource_symbol");
   set_symbol("owner_symbol", "owner_symbol");
   set_symbol("async_id_symbol", "async_id_symbol");
   set_symbol("trigger_async_id_symbol", "trigger_async_id_symbol");
-  set_symbol("oninit", "oninit");
-  set_symbol("onpskexchange", "onpskexchange");
+  set_symbol("oninit", "oninit_symbol");
+  set_symbol("onpskexchange", "onpskexchange_symbol");
   set_symbol("messaging_deserialize_symbol", "messaging_deserialize_symbol");
   set_symbol("messaging_transfer_symbol", "messaging_transfer_symbol");
   set_symbol("messaging_clone_symbol", "messaging_clone_symbol");

@@ -1679,28 +1679,28 @@ int RunScriptWithGlobals(napi_env env,
     return 1;
   }
   {
-    napi_value util_name = nullptr;
-    napi_value symbols_name = nullptr;
-    napi_value util_binding = nullptr;
-    napi_value symbols_binding = nullptr;
-    if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) == napi_ok &&
-        util_name != nullptr &&
-        napi_call_function(env, global, native_internal_binding, 1, &util_name, &util_binding) == napi_ok &&
-        util_binding != nullptr &&
-        !IsUndefinedValue(env, util_binding)) {
-      napi_value private_symbols = nullptr;
-      if (GetNamedProperty(env, util_binding, "privateSymbols", &private_symbols) &&
-          private_symbols != nullptr &&
-          !IsUndefinedValue(env, private_symbols)) {
-        UbiSetPrivateSymbols(env, private_symbols);
+    napi_value private_symbols = UbiGetPrivateSymbols(env);
+    if (private_symbols == nullptr || IsUndefinedValue(env, private_symbols)) {
+      private_symbols = UbiCreatePrivateSymbolsObject(env);
+      if (private_symbols == nullptr) {
+        if (error_out != nullptr) {
+          *error_out = "Failed to initialize bootstrap privateSymbols";
+        }
+        return 1;
       }
+      UbiSetPrivateSymbols(env, private_symbols);
     }
-    if (napi_create_string_utf8(env, "symbols", NAPI_AUTO_LENGTH, &symbols_name) == napi_ok &&
-        symbols_name != nullptr &&
-        napi_call_function(env, global, native_internal_binding, 1, &symbols_name, &symbols_binding) == napi_ok &&
-        symbols_binding != nullptr &&
-        !IsUndefinedValue(env, symbols_binding)) {
-      UbiSetPerIsolateSymbols(env, symbols_binding);
+
+    napi_value per_isolate_symbols = UbiGetPerIsolateSymbols(env);
+    if (per_isolate_symbols == nullptr || IsUndefinedValue(env, per_isolate_symbols)) {
+      per_isolate_symbols = UbiCreatePerIsolateSymbolsObject(env);
+      if (per_isolate_symbols == nullptr) {
+        if (error_out != nullptr) {
+          *error_out = "Failed to initialize bootstrap perIsolateSymbols";
+        }
+        return 1;
+      }
+      UbiSetPerIsolateSymbols(env, per_isolate_symbols);
     }
   }
   napi_value get_linked_binding = nullptr;
@@ -1755,6 +1755,10 @@ int RunScriptWithGlobals(napi_env env,
   // internal/bootstrap/node runs. Mirror that setup so process._exiting and
   // process.exitCode accessors have backing storage.
   {
+    constexpr uint32_t kExitInfoExitingIndex = 0;
+    constexpr uint32_t kExitInfoExitCodeIndex = 1;
+    constexpr uint32_t kExitInfoHasExitCodeIndex = 2;
+
     napi_value process_obj = nullptr;
     if (!GetNamedProperty(env, global, "process", &process_obj)) {
       if (error_out != nullptr) {
@@ -1763,36 +1767,10 @@ int RunScriptWithGlobals(napi_env env,
       return 1;
     }
 
-    napi_value util_name = nullptr;
-    if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) != napi_ok || util_name == nullptr) {
+    napi_value private_symbols = UbiGetPrivateSymbols(env);
+    if (private_symbols == nullptr || IsUndefinedValue(env, private_symbols)) {
       if (error_out != nullptr) {
-        *error_out = "Failed to create util binding key";
-      }
-      return 1;
-    }
-
-    napi_value util_binding = nullptr;
-    if (!CallFunction(env, global, internal_binding, 1, &util_name, &util_binding) || util_binding == nullptr) {
-      if (error_out != nullptr) {
-        std::string msg = "Failed to resolve internalBinding('util') during bootstrap";
-        bool is_exit = false;
-        int exit_code = 0;
-        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
-        if (!exc.empty()) {
-          msg += ": ";
-          msg += exc;
-        }
-        *error_out = msg;
-      }
-      return 1;
-    }
-
-    napi_value constants = nullptr;
-    napi_value private_symbols = nullptr;
-    if (!GetNamedProperty(env, util_binding, "constants", &constants) ||
-        !GetNamedProperty(env, util_binding, "privateSymbols", &private_symbols)) {
-      if (error_out != nullptr) {
-        *error_out = "util binding missing constants/privateSymbols for exit info setup";
+        *error_out = "Bootstrap privateSymbols state missing during exit info setup";
       }
       return 1;
     }
@@ -1811,20 +1789,6 @@ int RunScriptWithGlobals(napi_env env,
         !IsUndefinedValue(env, existing_exit_info)) {
       // Already initialized.
     } else {
-      auto read_index = [&](const char* key, uint32_t fallback) -> uint32_t {
-        napi_value value = nullptr;
-        int32_t out = static_cast<int32_t>(fallback);
-        if (GetNamedProperty(env, constants, key, &value) && value != nullptr) {
-          napi_get_value_int32(env, value, &out);
-        }
-        if (out < 0) return fallback;
-        return static_cast<uint32_t>(out);
-      };
-
-      const uint32_t k_exit_code = read_index("kExitCode", 0);
-      const uint32_t k_exiting = read_index("kExiting", 1);
-      const uint32_t k_has_exit_code = read_index("kHasExitCode", 2);
-
       napi_value fields = nullptr;
       if (napi_create_object(env, &fields) != napi_ok || fields == nullptr) {
         if (error_out != nullptr) {
@@ -1839,9 +1803,9 @@ int RunScriptWithGlobals(napi_env env,
         }
         return 1;
       }
-      napi_set_element(env, fields, k_exit_code, zero);
-      napi_set_element(env, fields, k_exiting, zero);
-      napi_set_element(env, fields, k_has_exit_code, zero);
+      napi_set_element(env, fields, kExitInfoExitCodeIndex, zero);
+      napi_set_element(env, fields, kExitInfoExitingIndex, zero);
+      napi_set_element(env, fields, kExitInfoHasExitCodeIndex, zero);
       if (napi_set_property(env, process_obj, exit_info_symbol, fields) != napi_ok) {
         if (error_out != nullptr) {
           *error_out = "Failed to attach process exit info fields";
