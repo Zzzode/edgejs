@@ -1,10 +1,17 @@
 #include "internal_binding/dispatch.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
+#include <functional>
+#include <limits>
+#include <sstream>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include <uv.h>
@@ -99,6 +106,38 @@ bool ValueToUtf8(napi_env env, napi_value value, std::string* out) {
   return true;
 }
 
+bool ValueToPathString(napi_env env, napi_value value, std::string* out) {
+  if (value == nullptr || out == nullptr) return false;
+  if (ValueToUtf8(env, value, out)) return true;
+
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
+    void* data = nullptr;
+    size_t length = 0;
+    if (napi_get_buffer_info(env, value, &data, &length) != napi_ok || data == nullptr) return false;
+    *out = std::string(static_cast<const char*>(data), length);
+    return true;
+  }
+
+  bool is_typed_array = false;
+  if (napi_is_typedarray(env, value, &is_typed_array) == napi_ok && is_typed_array) {
+    napi_typedarray_type type = napi_uint8_array;
+    size_t length = 0;
+    void* data = nullptr;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_typedarray_info(env, value, &type, &length, &data, &arraybuffer, &byte_offset) != napi_ok ||
+        data == nullptr) {
+      return false;
+    }
+    if (type != napi_uint8_array && type != napi_uint8_clamped_array) return false;
+    *out = std::string(static_cast<const char*>(data), length);
+    return true;
+  }
+
+  return false;
+}
+
 size_t TypedArrayElementSize(napi_typedarray_type type) {
   switch (type) {
     case napi_int8_array:
@@ -107,6 +146,7 @@ size_t TypedArrayElementSize(napi_typedarray_type type) {
       return 1;
     case napi_int16_array:
     case napi_uint16_array:
+    case napi_float16_array:
       return 2;
     case napi_int32_array:
     case napi_uint32_array:
@@ -380,8 +420,20 @@ size_t ByteLengthOfValue(napi_env env, napi_value value) {
   return 0;
 }
 
-napi_value ConvertNameArrayToEncoding(napi_env env, napi_value names, bool as_buffer) {
-  if (!as_buffer || names == nullptr || IsUndefined(env, names)) return names;
+napi_value ConvertNameArrayToEncoding(napi_env env, napi_value names, napi_value encoding_value) {
+  napi_valuetype encoding_type = napi_undefined;
+  if (names == nullptr ||
+      IsUndefined(env, names) ||
+      encoding_value == nullptr ||
+      napi_typeof(env, encoding_value, &encoding_type) != napi_ok ||
+      encoding_type == napi_undefined ||
+      encoding_type == napi_null) {
+    return names;
+  }
+  std::string encoding;
+  if (!ValueToUtf8(env, encoding_value, &encoding) || encoding.empty() || encoding == "utf8" || encoding == "utf-8") {
+    return names;
+  }
   uint32_t len = 0;
   bool is_array = false;
   if (napi_is_array(env, names, &is_array) != napi_ok || !is_array ||
@@ -393,7 +445,26 @@ napi_value ConvertNameArrayToEncoding(napi_env env, napi_value names, bool as_bu
   for (uint32_t i = 0; i < len; ++i) {
     napi_value item = nullptr;
     if (napi_get_element(env, names, i, &item) != napi_ok || item == nullptr) continue;
-    napi_value converted = BufferFromValue(env, item, "utf8");
+    napi_value converted = item;
+    if (encoding == "buffer") {
+      converted = BufferFromValue(env, item, "utf8");
+    } else {
+      napi_value buffer = BufferFromValue(env, item, "utf8");
+      napi_value to_string = nullptr;
+      napi_value encoding_arg = nullptr;
+      if (buffer != nullptr &&
+          !IsUndefined(env, buffer) &&
+          napi_get_named_property(env, buffer, "toString", &to_string) == napi_ok &&
+          to_string != nullptr &&
+          napi_create_string_utf8(env, encoding.c_str(), encoding.size(), &encoding_arg) == napi_ok &&
+          encoding_arg != nullptr) {
+        napi_value argv[1] = {encoding_arg};
+        napi_value encoded = nullptr;
+        if (napi_call_function(env, buffer, to_string, 1, argv, &encoded) == napi_ok && encoded != nullptr) {
+          converted = encoded;
+        }
+      }
+    }
     if (converted == nullptr || IsUndefined(env, converted)) converted = item;
     napi_set_element(env, out, i, converted);
   }
@@ -428,6 +499,15 @@ struct DeferredReqCompletion {
   napi_ref oncomplete_ref = nullptr;
   napi_ref err_ref = nullptr;
   napi_ref value_ref = nullptr;
+  napi_ref extra_ref = nullptr;
+};
+
+struct DeferredPromiseSettlement {
+  napi_env env = nullptr;
+  napi_deferred deferred = nullptr;
+  napi_ref value_ref = nullptr;
+  napi_ref err_ref = nullptr;
+  bool reject = false;
 };
 
 void TrackActiveRequest(napi_env env, napi_value req) {
@@ -448,8 +528,19 @@ void DestroyDeferredReqCompletion(DeferredReqCompletion* completion) {
     ResetRef(env, &completion->oncomplete_ref);
     ResetRef(env, &completion->err_ref);
     ResetRef(env, &completion->value_ref);
+    ResetRef(env, &completion->extra_ref);
   }
   delete completion;
+}
+
+void DestroyDeferredPromiseSettlement(DeferredPromiseSettlement* settlement) {
+  if (settlement == nullptr) return;
+  napi_env env = settlement->env;
+  if (env != nullptr) {
+    ResetRef(env, &settlement->value_ref);
+    ResetRef(env, &settlement->err_ref);
+  }
+  delete settlement;
 }
 
 void InvokeDeferredReqCompletion(napi_env env, DeferredReqCompletion* completion) {
@@ -458,6 +549,7 @@ void InvokeDeferredReqCompletion(napi_env env, DeferredReqCompletion* completion
   napi_value oncomplete = GetRefValue(env, completion->oncomplete_ref);
   napi_value err = GetRefValue(env, completion->err_ref);
   napi_value value = GetRefValue(env, completion->value_ref);
+  napi_value extra = GetRefValue(env, completion->extra_ref);
   if (req != nullptr) UntrackActiveRequest(env, req);
 
   if (req == nullptr || oncomplete == nullptr) {
@@ -470,11 +562,16 @@ void InvokeDeferredReqCompletion(napi_env env, DeferredReqCompletion* completion
     napi_value ignored = nullptr;
     napi_call_function(env, req, oncomplete, 1, argv, &ignored);
   } else if (value != nullptr && !IsUndefined(env, value)) {
-    napi_value argv[2] = {Undefined(env), value};
+    napi_value null_value = nullptr;
+    napi_get_null(env, &null_value);
+    napi_value argv[3] = {null_value != nullptr ? null_value : Undefined(env), value, extra};
     napi_value ignored = nullptr;
-    napi_call_function(env, req, oncomplete, 2, argv, &ignored);
+    const size_t argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
+    napi_call_function(env, req, oncomplete, argc, argv, &ignored);
   } else {
-    napi_value argv[1] = {Undefined(env)};
+    napi_value null_value = nullptr;
+    napi_get_null(env, &null_value);
+    napi_value argv[1] = {null_value != nullptr ? null_value : Undefined(env)};
     napi_value ignored = nullptr;
     napi_call_function(env, req, oncomplete, 1, argv, &ignored);
   }
@@ -490,11 +587,32 @@ napi_value DeferredReqCompletionCallback(napi_env env, napi_callback_info info) 
   return Undefined(env);
 }
 
+napi_value DeferredPromiseSettlementCallback(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, nullptr, &data);
+  auto* settlement = static_cast<DeferredPromiseSettlement*>(data);
+  if (settlement == nullptr || env == nullptr) return Undefined(env);
+
+  napi_value value = GetRefValue(env, settlement->value_ref);
+  napi_value err = GetRefValue(env, settlement->err_ref);
+  if (settlement->deferred != nullptr) {
+    if (settlement->reject) {
+      (void)napi_reject_deferred(env, settlement->deferred, err != nullptr ? err : Undefined(env));
+    } else {
+      (void)napi_resolve_deferred(env, settlement->deferred, value != nullptr ? value : Undefined(env));
+    }
+  }
+  DestroyDeferredPromiseSettlement(settlement);
+  return Undefined(env);
+}
+
 bool ScheduleDeferredReqCompletion(napi_env env,
                                    napi_value req,
                                    napi_value oncomplete,
                                    napi_value err,
-                                   napi_value value) {
+                                   napi_value value,
+                                   napi_value extra = nullptr) {
   if (env == nullptr || req == nullptr || oncomplete == nullptr) return false;
   auto* completion = new DeferredReqCompletion();
   completion->env = env;
@@ -503,7 +621,9 @@ bool ScheduleDeferredReqCompletion(napi_env env,
       (err != nullptr && !IsUndefined(env, err) &&
        napi_create_reference(env, err, 1, &completion->err_ref) != napi_ok) ||
       (value != nullptr && !IsUndefined(env, value) &&
-       napi_create_reference(env, value, 1, &completion->value_ref) != napi_ok)) {
+       napi_create_reference(env, value, 1, &completion->value_ref) != napi_ok) ||
+      (extra != nullptr && !IsUndefined(env, extra) &&
+       napi_create_reference(env, extra, 1, &completion->extra_ref) != napi_ok)) {
     DestroyDeferredReqCompletion(completion);
     return false;
   }
@@ -550,6 +670,83 @@ bool ScheduleDeferredReqCompletion(napi_env env,
   return true;
 }
 
+bool ScheduleDeferredPromiseSettlement(napi_env env,
+                                      napi_deferred deferred,
+                                      napi_value value,
+                                      napi_value err,
+                                      bool reject) {
+  if (env == nullptr || deferred == nullptr) return false;
+  auto* settlement = new DeferredPromiseSettlement();
+  settlement->env = env;
+  settlement->deferred = deferred;
+  settlement->reject = reject;
+
+  if ((value != nullptr && !IsUndefined(env, value) &&
+       napi_create_reference(env, value, 1, &settlement->value_ref) != napi_ok) ||
+      (err != nullptr && !IsUndefined(env, err) &&
+       napi_create_reference(env, err, 1, &settlement->err_ref) != napi_ok)) {
+    DestroyDeferredPromiseSettlement(settlement);
+    return false;
+  }
+
+  napi_value callback = nullptr;
+  if (napi_create_function(env,
+                           "__ubiFsDeferredPromiseSettlement",
+                           NAPI_AUTO_LENGTH,
+                           DeferredPromiseSettlementCallback,
+                           settlement,
+                           &callback) != napi_ok ||
+      callback == nullptr) {
+    DestroyDeferredPromiseSettlement(settlement);
+    return false;
+  }
+
+  napi_value global = GetGlobal(env);
+  napi_value set_immediate = nullptr;
+  napi_valuetype set_immediate_type = napi_undefined;
+  if (global == nullptr ||
+      napi_get_named_property(env, global, "setImmediate", &set_immediate) != napi_ok ||
+      set_immediate == nullptr ||
+      napi_typeof(env, set_immediate, &set_immediate_type) != napi_ok ||
+      set_immediate_type != napi_function) {
+    DestroyDeferredPromiseSettlement(settlement);
+    return false;
+  }
+
+  napi_value argv[1] = {callback};
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, global, set_immediate, 1, argv, &ignored) != napi_ok) {
+    DestroyDeferredPromiseSettlement(settlement);
+    return false;
+  }
+
+  return true;
+}
+
+napi_value MakeDeferredResolvedPromise(napi_env env, napi_value value) {
+  napi_deferred deferred = nullptr;
+  napi_value promise = nullptr;
+  if (napi_create_promise(env, &deferred, &promise) != napi_ok || promise == nullptr) {
+    return Undefined(env);
+  }
+  if (!ScheduleDeferredPromiseSettlement(env, deferred, value, nullptr, false)) {
+    napi_resolve_deferred(env, deferred, value != nullptr ? value : Undefined(env));
+  }
+  return promise;
+}
+
+napi_value MakeDeferredRejectedPromise(napi_env env, napi_value err) {
+  napi_deferred deferred = nullptr;
+  napi_value promise = nullptr;
+  if (napi_create_promise(env, &deferred, &promise) != napi_ok || promise == nullptr) {
+    return Undefined(env);
+  }
+  if (!ScheduleDeferredPromiseSettlement(env, deferred, nullptr, err, true)) {
+    napi_reject_deferred(env, deferred, err != nullptr ? err : Undefined(env));
+  }
+  return promise;
+}
+
 ReqKind ParseReq(napi_env env, napi_value candidate, napi_value* oncomplete) {
   if (oncomplete != nullptr) *oncomplete = nullptr;
   if (candidate == nullptr || IsUndefined(env, candidate)) return ReqKind::kNone;
@@ -584,13 +781,44 @@ void CompleteReq(napi_env env, ReqKind kind, napi_value req, napi_value oncomple
     napi_call_function(env, req, oncomplete, 1, argv, &ignored);
     return;
   }
+  napi_value null_value = nullptr;
+  napi_get_null(env, &null_value);
   if (value != nullptr && !IsUndefined(env, value)) {
-    napi_value argv[2] = {Undefined(env), value};
+    napi_value argv[2] = {null_value != nullptr ? null_value : Undefined(env), value};
     napi_value ignored = nullptr;
     napi_call_function(env, req, oncomplete, 2, argv, &ignored);
     return;
   }
-  napi_value argv[1] = {Undefined(env)};
+  napi_value argv[1] = {null_value != nullptr ? null_value : Undefined(env)};
+  napi_value ignored = nullptr;
+  napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+}
+
+void CompleteReqWithExtra(napi_env env,
+                          ReqKind kind,
+                          napi_value req,
+                          napi_value oncomplete,
+                          napi_value err,
+                          napi_value value,
+                          napi_value extra) {
+  if (kind != ReqKind::kCallback || req == nullptr || oncomplete == nullptr) return;
+  if (ScheduleDeferredReqCompletion(env, req, oncomplete, err, value, extra)) return;
+  if (err != nullptr && !IsUndefined(env, err)) {
+    napi_value argv[1] = {err};
+    napi_value ignored = nullptr;
+    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+    return;
+  }
+  napi_value null_value = nullptr;
+  napi_get_null(env, &null_value);
+  if (value != nullptr && !IsUndefined(env, value)) {
+    napi_value argv[3] = {null_value != nullptr ? null_value : Undefined(env), value, extra};
+    napi_value ignored = nullptr;
+    const size_t argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
+    napi_call_function(env, req, oncomplete, argc, argv, &ignored);
+    return;
+  }
+  napi_value argv[1] = {null_value != nullptr ? null_value : Undefined(env)};
   napi_value ignored = nullptr;
   napi_call_function(env, req, oncomplete, 1, argv, &ignored);
 }
@@ -654,6 +882,7 @@ struct AsyncFsReq {
   ReqKind req_kind = ReqKind::kNone;
   napi_ref req_ref = nullptr;
   napi_ref oncomplete_ref = nullptr;
+  napi_ref extra_ref = nullptr;
   napi_deferred deferred = nullptr;
   uv_fs_t req{};
   AsyncFsResultKind result_kind = AsyncFsResultKind::kUndefined;
@@ -678,6 +907,7 @@ void ReleaseFileHandleRef(FileHandleWrap* wrap) {
 }
 
 napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall);
+napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall, const char* path);
 
 void DestroyAsyncFsReq(AsyncFsReq* async_req) {
   if (async_req == nullptr) return;
@@ -685,6 +915,7 @@ void DestroyAsyncFsReq(AsyncFsReq* async_req) {
   if (env != nullptr) {
     ResetRef(env, &async_req->req_ref);
     ResetRef(env, &async_req->oncomplete_ref);
+    ResetRef(env, &async_req->extra_ref);
     if (async_req->hold_refs != nullptr) {
       for (size_t i = 0; i < async_req->hold_ref_count; ++i) {
         ResetRef(env, &async_req->hold_refs[i]);
@@ -715,30 +946,177 @@ void ThrowFdOutOfRange(napi_env env, int32_t value) {
   napi_throw_range_error(env, "ERR_OUT_OF_RANGE", message.c_str());
 }
 
+std::string ValueToDisplayString(napi_env env, napi_value value) {
+  if (value == nullptr) return {};
+  napi_value string_value = nullptr;
+  if (napi_coerce_to_string(env, value, &string_value) != napi_ok || string_value == nullptr) return {};
+  size_t len = 0;
+  if (napi_get_value_string_utf8(env, string_value, nullptr, 0, &len) != napi_ok) return {};
+  std::string out(len + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, string_value, out.data(), out.size(), &copied) != napi_ok) return {};
+  out.resize(copied);
+  return out;
+}
+
+std::string DescribeReceivedValue(napi_env env, napi_value value) {
+  if (value == nullptr) return "undefined";
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok) return "undefined";
+
+  switch (type) {
+    case napi_undefined:
+      return "undefined";
+    case napi_null:
+      return "null";
+    case napi_boolean:
+      return "type boolean (" + ValueToDisplayString(env, value) + ")";
+    case napi_string:
+      return "type string ('" + ValueToDisplayString(env, value) + "')";
+    case napi_number:
+      return "type number (" + ValueToDisplayString(env, value) + ")";
+    case napi_object: {
+      bool is_array = false;
+      if (napi_is_array(env, value, &is_array) == napi_ok && is_array) {
+        return "an instance of Array";
+      }
+      return "an instance of Object";
+    }
+    case napi_function:
+      return "an instance of Function";
+    case napi_symbol:
+      return "type symbol";
+    case napi_bigint:
+      return "type bigint (" + ValueToDisplayString(env, value) + ")";
+    default:
+      return ValueToDisplayString(env, value);
+  }
+}
+
+void ThrowInvalidNumberArgType(napi_env env, const char* name, napi_value value) {
+  std::string message = "The \"";
+  message += (name != nullptr ? name : "value");
+  message += "\" argument must be of type number. Received ";
+  message += DescribeReceivedValue(env, value);
+  napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", message.c_str());
+}
+
+void ThrowOutOfRangeIntegerArg(napi_env env, const char* name, napi_value value) {
+  std::string message = "The value of \"";
+  message += (name != nullptr ? name : "value");
+  message += "\" is out of range. It must be an integer. Received ";
+  message += ValueToDisplayString(env, value);
+  napi_throw_range_error(env, "ERR_OUT_OF_RANGE", message.c_str());
+}
+
+void ThrowOutOfRangeBoundedArg(napi_env env,
+                               const char* name,
+                               int64_t min_value,
+                               uint64_t max_value,
+                               napi_value value) {
+  std::ostringstream message;
+  message << "The value of \"" << (name != nullptr ? name : "value")
+          << "\" is out of range. It must be >= " << min_value << " && <= " << max_value
+          << ". Received " << ValueToDisplayString(env, value);
+  napi_throw_range_error(env, "ERR_OUT_OF_RANGE", message.str().c_str());
+}
+
 bool ValidateFdArg(napi_env env, napi_value value, int32_t* fd_out) {
   if (fd_out == nullptr) return false;
   *fd_out = -1;
   if (value == nullptr) {
-    ThrowInvalidFdType(env);
+    ThrowInvalidNumberArgType(env, "fd", value);
     return false;
   }
-  int32_t fd = 0;
-  if (napi_get_value_int32(env, value, &fd) != napi_ok) {
-    ThrowInvalidFdType(env);
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) {
+    ThrowInvalidNumberArgType(env, "fd", value);
     return false;
   }
-  if (fd < 0) {
-    ThrowFdOutOfRange(env, fd);
+  double number = 0;
+  if (napi_get_value_double(env, value, &number) != napi_ok) {
+    ThrowInvalidNumberArgType(env, "fd", value);
     return false;
   }
-  *fd_out = fd;
+  if (!std::isfinite(number) || std::floor(number) != number) {
+    ThrowOutOfRangeIntegerArg(env, "fd", value);
+    return false;
+  }
+  if (number < 0 || number > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+    ThrowOutOfRangeBoundedArg(env, "fd", 0, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()), value);
+    return false;
+  }
+  *fd_out = static_cast<int32_t>(number);
+  return true;
+}
+
+bool ValidateCopyFileModeArg(napi_env env, napi_value value, int32_t* mode_out) {
+  if (mode_out == nullptr) return false;
+  *mode_out = 0;
+  if (value == nullptr) {
+    ThrowInvalidNumberArgType(env, "mode", value);
+    return false;
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) {
+    ThrowInvalidNumberArgType(env, "mode", value);
+    return false;
+  }
+  double number = 0;
+  if (napi_get_value_double(env, value, &number) != napi_ok) {
+    ThrowInvalidNumberArgType(env, "mode", value);
+    return false;
+  }
+  if (!std::isfinite(number) || std::floor(number) != number) {
+    ThrowOutOfRangeIntegerArg(env, "mode", value);
+    return false;
+  }
+  constexpr uint64_t kMaxCopyFileMode =
+      UV_FS_COPYFILE_EXCL | UV_FS_COPYFILE_FICLONE | UV_FS_COPYFILE_FICLONE_FORCE;
+  if (number < 0 || number > static_cast<double>(kMaxCopyFileMode)) {
+    ThrowOutOfRangeBoundedArg(env, "mode", 0, kMaxCopyFileMode, value);
+    return false;
+  }
+  *mode_out = static_cast<int32_t>(number);
+  return true;
+}
+
+bool ValidateAccessModeArg(napi_env env, napi_value value, int32_t* mode_out) {
+  if (mode_out == nullptr) return false;
+  *mode_out = 0;
+  if (value == nullptr) {
+    ThrowInvalidNumberArgType(env, "mode", value);
+    return false;
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) {
+    ThrowInvalidNumberArgType(env, "mode", value);
+    return false;
+  }
+  double number = 0;
+  if (napi_get_value_double(env, value, &number) != napi_ok) {
+    ThrowInvalidNumberArgType(env, "mode", value);
+    return false;
+  }
+  if (!std::isfinite(number) || std::floor(number) != number) {
+    ThrowOutOfRangeIntegerArg(env, "mode", value);
+    return false;
+  }
+  constexpr uint64_t kMaxAccessMode = F_OK | R_OK | W_OK | X_OK;
+  if (number < 0 || number > static_cast<double>(kMaxAccessMode)) {
+    ThrowOutOfRangeBoundedArg(env, "mode", 0, kMaxAccessMode, value);
+    return false;
+  }
+  *mode_out = static_cast<int32_t>(number);
   return true;
 }
 
 int64_t GetInt64OrDefault(napi_env env, napi_value value, int64_t fallback) {
   if (IsNullOrUndefined(env, value)) return fallback;
   int64_t out = fallback;
-  if (napi_get_value_int64(env, value, &out) != napi_ok) return fallback;
+  if (napi_get_value_int64(env, value, &out) == napi_ok) return out;
+  bool lossless = false;
+  if (napi_get_value_bigint_int64(env, value, &out, &lossless) == napi_ok) return out;
   return out;
 }
 
@@ -826,7 +1204,14 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
   napi_value err = nullptr;
   napi_value value = Undefined(env);
   if (result < 0) {
-    err = CreateUvExceptionValue(env, result, async_req->syscall != nullptr ? async_req->syscall : "");
+    if (!async_req->path_storage.empty()) {
+      err = CreateUvExceptionValue(env,
+                                   result,
+                                   async_req->syscall != nullptr ? async_req->syscall : "",
+                                   async_req->path_storage.c_str());
+    } else {
+      err = CreateUvExceptionValue(env, result, async_req->syscall != nullptr ? async_req->syscall : "");
+    }
   } else {
     value = MakeAsyncFsResultValue(async_req, result);
   }
@@ -845,15 +1230,18 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
   if (async_req->req_kind == ReqKind::kCallback) {
     napi_value req = GetRefValue(env, async_req->req_ref);
     napi_value oncomplete = GetRefValue(env, async_req->oncomplete_ref);
+    napi_value extra = GetRefValue(env, async_req->extra_ref);
     if (req != nullptr) UntrackActiveRequest(env, req);
     if (req != nullptr && oncomplete != nullptr) {
-      napi_value argv[2] = {Undefined(env), Undefined(env)};
+      napi_value null_value = nullptr;
+      napi_get_null(env, &null_value);
+      napi_value argv[3] = {null_value != nullptr ? null_value : Undefined(env), Undefined(env), extra};
       size_t argc = 1;
       if (result < 0) {
         argv[0] = err != nullptr ? err : Undefined(env);
       } else if (value != nullptr && !IsUndefined(env, value)) {
         argv[1] = value;
-        argc = 2;
+        argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
       }
       napi_value ignored = nullptr;
       (void)UbiMakeCallback(env, req, oncomplete, argc, argv, &ignored);
@@ -901,15 +1289,69 @@ AsyncFsReq* CreateAsyncFsReq(napi_env env,
   return nullptr;
 }
 
+void SetSyncCtxUvError(napi_env env, napi_value ctx, int errorno, const char* syscall) {
+  if (ctx == nullptr || IsUndefined(env, ctx)) return;
+
+  napi_value errno_value = nullptr;
+  if (napi_create_int32(env, errorno, &errno_value) == napi_ok && errno_value != nullptr) {
+    napi_set_named_property(env, ctx, "errno", errno_value);
+  }
+
+  napi_value code_value = nullptr;
+  if (napi_create_string_utf8(env, uv_err_name(errorno), NAPI_AUTO_LENGTH, &code_value) == napi_ok &&
+      code_value != nullptr) {
+    napi_set_named_property(env, ctx, "code", code_value);
+  }
+
+  if (syscall != nullptr) {
+    napi_value syscall_value = nullptr;
+    if (napi_create_string_utf8(env, syscall, NAPI_AUTO_LENGTH, &syscall_value) == napi_ok &&
+        syscall_value != nullptr) {
+      napi_set_named_property(env, ctx, "syscall", syscall_value);
+    }
+  }
+}
+
+bool SyncWriteWithUv(napi_env env,
+                     int32_t fd,
+                     uv_buf_t* bufs,
+                     size_t nbufs,
+                     int64_t position,
+                     napi_value ctx,
+                     napi_value* out) {
+  if (out != nullptr) *out = nullptr;
+
+  uv_fs_t req;
+  const int rc = uv_fs_write(nullptr, &req, fd, bufs, nbufs, position, nullptr);
+  const int result = rc < 0 ? rc : static_cast<int>(req.result);
+  uv_fs_req_cleanup(&req);
+
+  if (result < 0) {
+    if (ctx != nullptr && !IsUndefined(env, ctx)) {
+      SetSyncCtxUvError(env, ctx, result, "write");
+      return false;
+    }
+    napi_throw(env, CreateUvExceptionValue(env, result, "write"));
+    return false;
+  }
+
+  if (out != nullptr) napi_create_int64(env, result, out);
+  return true;
+}
+
 napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall) {
   const char* code = uv_err_name(errorno);
   const char* message = uv_strerror(errorno);
   std::string full_message;
-  if (syscall != nullptr && *syscall != '\0') {
-    full_message.append(syscall);
-    full_message.push_back(' ');
+  if (code != nullptr && *code != '\0') {
+    full_message.append(code);
+    full_message.append(": ");
   }
   full_message.append(message != nullptr ? message : "Unknown system error");
+  if (syscall != nullptr && *syscall != '\0') {
+    full_message.append(", ");
+    full_message.append(syscall);
+  }
 
   napi_value message_value = nullptr;
   napi_value error = nullptr;
@@ -929,6 +1371,35 @@ napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall
     napi_value syscall_value = nullptr;
     napi_create_string_utf8(env, syscall, NAPI_AUTO_LENGTH, &syscall_value);
     napi_set_named_property(env, error, "syscall", syscall_value);
+  }
+
+  return error;
+}
+
+napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall, const char* path) {
+  napi_value error = CreateUvExceptionValue(env, errorno, syscall);
+  if (error == nullptr || IsUndefined(env, error)) return error;
+
+  std::string message;
+  napi_value message_value = nullptr;
+  if (path != nullptr && *path != '\0' &&
+      napi_get_named_property(env, error, "message", &message_value) == napi_ok &&
+      ValueToUtf8(env, message_value, &message)) {
+    message.append(" '");
+    message.append(path);
+    message.push_back('\'');
+    napi_value updated_message = nullptr;
+    if (napi_create_string_utf8(env, message.c_str(), message.size(), &updated_message) == napi_ok &&
+        updated_message != nullptr) {
+      napi_set_named_property(env, error, "message", updated_message);
+    }
+  }
+
+  if (path != nullptr && *path != '\0') {
+    napi_value path_value = nullptr;
+    if (napi_create_string_utf8(env, path, NAPI_AUTO_LENGTH, &path_value) == napi_ok && path_value != nullptr) {
+      napi_set_named_property(env, error, "path", path_value);
+    }
   }
 
   return error;
@@ -1447,8 +1918,16 @@ napi_value FsAccess(napi_env env, napi_callback_info info) {
   napi_value req = argc >= 3 ? argv[2] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  int32_t validated_mode = 0;
+  if (argc >= 2 && argv[1] != nullptr && !ValidateAccessModeArg(env, argv[1], &validated_mode)) return nullptr;
 
-  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env)};
+  napi_value mode_value = nullptr;
+  if (argc >= 2 && argv[1] != nullptr) napi_create_int32(env, validated_mode, &mode_value);
+
+  napi_value call_argv[2] = {
+      argc >= 1 ? argv[0] : Undefined(env),
+      mode_value != nullptr ? mode_value : (argc >= 2 ? argv[1] : Undefined(env)),
+  };
   napi_value ignored = nullptr;
   napi_value err = nullptr;
   if (!CallRaw(env, "accessSync", 2, call_argv, &ignored, &err)) {
@@ -1507,11 +1986,11 @@ napi_value FsStatCommon(napi_env env,
   if (!CallRaw(env, raw_name, 1, call_argv, &raw_out, &err)) {
     if (!throw_if_no_entry &&
         (ErrorCodeEquals(env, err, "ENOENT") || ErrorCodeEquals(env, err, "ENOTDIR"))) {
-      if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, Undefined(env));
+      if (req_kind == ReqKind::kPromise) return MakeDeferredResolvedPromise(env, Undefined(env));
       CompleteReq(env, req_kind, req, oncomplete, nullptr, Undefined(env));
       return Undefined(env);
     }
-    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    if (req_kind == ReqKind::kPromise) return MakeDeferredRejectedPromise(env, err);
     CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
     if (req_kind == ReqKind::kCallback) return Undefined(env);
     if (err != nullptr) {
@@ -1522,7 +2001,7 @@ napi_value FsStatCommon(napi_env env,
   }
 
   napi_value typed = CreateTypedStatsArray(env, stats_len, use_bigint, raw_out);
-  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, typed);
+  if (req_kind == ReqKind::kPromise) return MakeDeferredResolvedPromise(env, typed);
   CompleteReq(env, req_kind, req, oncomplete, nullptr, typed);
   return typed;
 }
@@ -1576,7 +2055,6 @@ napi_value FsReaddir(napi_env env, napi_callback_info info) {
   napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
 
-  const bool as_buffer = argc >= 2 && argv[1] != nullptr && IsBufferEncoding(env, argv[1]);
   bool with_file_types = false;
   if (argc >= 3 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &with_file_types);
   napi_value req = argc >= 4 ? argv[3] : nullptr;
@@ -1585,8 +2063,10 @@ napi_value FsReaddir(napi_env env, napi_callback_info info) {
 
   napi_value with_file_types_value = nullptr;
   napi_get_boolean(env, with_file_types, &with_file_types_value);
-  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env),
-                             with_file_types_value != nullptr ? with_file_types_value : Undefined(env)};
+  napi_value call_argv[2] = {
+      argc >= 1 ? argv[0] : Undefined(env),
+      with_file_types_value != nullptr ? with_file_types_value : Undefined(env),
+  };
   napi_value raw_out = nullptr;
   napi_value err = nullptr;
   if (!CallRaw(env, "readdir", 2, call_argv, &raw_out, &err)) {
@@ -1606,7 +2086,7 @@ napi_value FsReaddir(napi_env env, napi_callback_info info) {
     if (raw_out != nullptr &&
         napi_get_element(env, raw_out, 0, &names) == napi_ok &&
         napi_get_element(env, raw_out, 1, &types) == napi_ok) {
-      napi_value encoded_names = ConvertNameArrayToEncoding(env, names, as_buffer);
+      napi_value encoded_names = ConvertNameArrayToEncoding(env, names, argc >= 2 ? argv[1] : nullptr);
       napi_value pair = nullptr;
       if (napi_create_array_with_length(env, 2, &pair) == napi_ok && pair != nullptr) {
         napi_set_element(env, pair, 0, encoded_names != nullptr ? encoded_names : names);
@@ -1615,7 +2095,7 @@ napi_value FsReaddir(napi_env env, napi_callback_info info) {
       }
     }
   } else {
-    out = ConvertNameArrayToEncoding(env, raw_out, as_buffer);
+    out = ConvertNameArrayToEncoding(env, raw_out, argc >= 2 ? argv[1] : nullptr);
   }
 
   if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
@@ -1661,23 +2141,95 @@ napi_value FsMkdir(napi_env env, napi_callback_info info) {
   napi_value req = argc >= 4 ? argv[3] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
-
-  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
-                             argc >= 2 ? argv[1] : Undefined(env),
-                             argc >= 3 ? argv[2] : Undefined(env)};
-  napi_value out = nullptr;
-  napi_value err = nullptr;
-  if (!CallRaw(env, "mkdir", 3, call_argv, &out, &err)) {
+  std::string path;
+  if (!ValueToPathString(env, argc >= 1 ? argv[0] : nullptr, &path)) {
+    napi_value err = CreateUvExceptionValue(env, UV_EINVAL, "mkdir");
     if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
     CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
     if (req_kind == ReqKind::kCallback) return Undefined(env);
-    if (err != nullptr) {
-      napi_throw(env, err);
-      return nullptr;
-    }
-    return Undefined(env);
+    napi_throw(env, err);
+    return nullptr;
   }
 
+  path = ubi_path::ToNamespacedPath(path);
+  int32_t mode = 0;
+  bool recursive = false;
+  if (argc >= 2 && argv[1] != nullptr) napi_get_value_int32(env, argv[1], &mode);
+  if (argc >= 3 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &recursive);
+
+  int err = 0;
+  std::string first_path;
+  if (recursive) {
+    std::vector<std::string> stack;
+    stack.push_back(path);
+    uv_fs_t uv_req;
+    while (!stack.empty()) {
+      std::string next_path = std::move(stack.back());
+      stack.pop_back();
+
+      err = uv_fs_mkdir(nullptr, &uv_req, next_path.c_str(), mode, nullptr);
+      uv_fs_req_cleanup(&uv_req);
+
+      while (true) {
+        switch (err) {
+          case 0:
+            if (first_path.empty()) first_path = next_path;
+            break;
+          case UV_EACCES:
+          case UV_ENOSPC:
+          case UV_ENOTDIR:
+          case UV_EPERM:
+            break;
+          case UV_ENOENT: {
+            const auto parent = std::filesystem::path(next_path).parent_path();
+            const std::string dirname = parent.empty() ? next_path : parent.string();
+            if (dirname != next_path) {
+              stack.push_back(next_path);
+              stack.push_back(dirname);
+              err = 0;
+            } else if (stack.empty()) {
+              err = UV_EEXIST;
+              continue;
+            }
+            break;
+          }
+          default: {
+            const int orig_err = err;
+            err = uv_fs_stat(nullptr, &uv_req, next_path.c_str(), nullptr);
+            const uv_stat_t statbuf = uv_req.statbuf;
+            uv_fs_req_cleanup(&uv_req);
+            if (err == 0 && !S_ISDIR(statbuf.st_mode)) {
+              err = (orig_err == UV_EEXIST && !stack.empty()) ? UV_ENOTDIR : UV_EEXIST;
+            } else if (err == 0) {
+              err = 0;
+            }
+            break;
+          }
+        }
+        break;
+      }
+
+      if (err < 0) break;
+    }
+  } else {
+    uv_fs_t uv_req;
+    err = uv_fs_mkdir(nullptr, &uv_req, path.c_str(), mode, nullptr);
+    uv_fs_req_cleanup(&uv_req);
+  }
+
+  if (err < 0) {
+    napi_value error = CreateUvExceptionValue(env, err, "mkdir", path.c_str());
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, error);
+    CompleteReq(env, req_kind, req, oncomplete, error, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    napi_throw(env, error);
+    return nullptr;
+  }
+
+  napi_value out = Undefined(env);
+  if (!first_path.empty()) {
+    napi_create_string_utf8(env, first_path.c_str(), first_path.size(), &out);
+  }
   if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out != nullptr ? out : Undefined(env));
   if (req_kind == ReqKind::kCallback) {
     CompleteReq(env, req_kind, req, oncomplete, nullptr, out != nullptr ? out : Undefined(env));
@@ -1704,10 +2256,17 @@ napi_value FsCopyFile(napi_env env, napi_callback_info info) {
   napi_value req = argc >= 4 ? argv[3] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
-  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
-                             argc >= 2 ? argv[1] : Undefined(env),
-                             argc >= 3 ? argv[2] : Undefined(env)};
-  return CompleteVoidRawFsMethod(env, "copyFile", req_kind, req, oncomplete, 3, call_argv);
+  const bool has_mode = argc >= 3 && argv[2] != nullptr && !IsNullOrUndefined(env, argv[2]);
+  int32_t mode = 0;
+  if (has_mode && !ValidateCopyFileModeArg(env, argv[2], &mode)) return nullptr;
+  napi_value mode_value = nullptr;
+  if (has_mode) napi_create_int32(env, mode, &mode_value);
+  napi_value call_argv[3] = {
+      argc >= 1 ? argv[0] : Undefined(env),
+      argc >= 2 ? argv[1] : Undefined(env),
+      has_mode && mode_value != nullptr ? mode_value : Undefined(env),
+  };
+  return CompleteVoidRawFsMethod(env, "copyFile", req_kind, req, oncomplete, has_mode ? 3 : 2, call_argv);
 }
 
 napi_value FsReadlink(napi_env env, napi_callback_info info) {
@@ -1755,10 +2314,49 @@ napi_value FsSymlink(napi_env env, napi_callback_info info) {
   napi_value req = argc >= 4 ? argv[3] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
-  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
-                             argc >= 2 ? argv[1] : Undefined(env),
-                             argc >= 3 ? argv[2] : Undefined(env)};
-  return CompleteVoidRawFsMethod(env, "symlink", req_kind, req, oncomplete, 3, call_argv);
+  std::string target;
+  std::string path;
+  if (!ValueToPathString(env, argc >= 1 ? argv[0] : nullptr, &target) ||
+      !ValueToPathString(env, argc >= 2 ? argv[1] : nullptr, &path)) {
+    napi_value err = CreateUvExceptionValue(env, UV_EINVAL, "symlink");
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    napi_throw(env, err);
+    return nullptr;
+  }
+
+  path = ubi_path::ToNamespacedPath(path);
+  int32_t flags = 0;
+  if (argc >= 3 && argv[2] != nullptr) napi_get_value_int32(env, argv[2], &flags);
+
+  int err = 0;
+#if defined(_WIN32)
+  uv_fs_t uv_req;
+  err = uv_fs_symlink(nullptr, &uv_req, target.c_str(), path.c_str(), flags, nullptr);
+  uv_fs_req_cleanup(&uv_req);
+#else
+  (void)flags;
+  if (::symlink(target.c_str(), path.c_str()) != 0) {
+    err = uv_translate_sys_error(errno);
+  }
+#endif
+
+  if (err < 0) {
+    napi_value error = CreateUvExceptionValue(env, err, "symlink", path.c_str());
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, error);
+    CompleteReq(env, req_kind, req, oncomplete, error, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    napi_throw(env, error);
+    return nullptr;
+  }
+
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, Undefined(env));
+  if (req_kind == ReqKind::kCallback) {
+    CompleteReq(env, req_kind, req, oncomplete, nullptr, Undefined(env));
+    return Undefined(env);
+  }
+  return Undefined(env);
 }
 
 napi_value FsUnlink(napi_env env, napi_callback_info info) {
@@ -1883,25 +2481,92 @@ napi_value FsRead(napi_env env, napi_callback_info info) {
   napi_value req = argc >= 6 ? argv[5] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
-
-  napi_value call_argv[5] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env),
-                             argc >= 3 ? argv[2] : Undefined(env), argc >= 4 ? argv[3] : Undefined(env),
-                             argc >= 5 ? argv[4] : Undefined(env)};
-  napi_value out = nullptr;
-  napi_value err = nullptr;
-  if (!CallRaw(env, "readSync", 5, call_argv, &out, &err)) {
-    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
-    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
-    if (req_kind == ReqKind::kCallback) return Undefined(env);
-    if (err != nullptr) {
-      napi_throw(env, err);
-      return nullptr;
-    }
-    return Undefined(env);
+  size_t offset = 0;
+  if (argc >= 3 && argv[2] != nullptr) {
+    uint32_t offset_u32 = 0;
+    napi_get_value_uint32(env, argv[2], &offset_u32);
+    offset = offset_u32;
   }
-  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
-  CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
-  return out;
+  size_t length = ByteLengthOfValue(env, argc >= 2 ? argv[1] : nullptr);
+  if (argc >= 4 && argv[3] != nullptr) {
+    uint32_t length_u32 = 0;
+    napi_get_value_uint32(env, argv[3], &length_u32);
+    length = length_u32;
+  } else if (length >= offset) {
+    length -= offset;
+  }
+  const int64_t position = GetInt64OrDefault(env, argc >= 5 ? argv[4] : nullptr, -1);
+
+  if (req_kind != ReqKind::kNone) {
+    if (length == 0) {
+      napi_value zero = nullptr;
+      napi_create_int64(env, 0, &zero);
+      if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, zero);
+      CompleteReqWithExtra(env, req_kind, req, oncomplete, nullptr, zero, argc >= 2 ? argv[1] : nullptr);
+      return req_kind == ReqKind::kCallback ? Undefined(env) : zero;
+    }
+
+    napi_value promise = nullptr;
+    AsyncFsReq* async_req = CreateAsyncFsReq(env, req_kind, req, oncomplete, &promise);
+    if (async_req != nullptr) {
+      async_req->syscall = "read";
+      async_req->result_kind = AsyncFsResultKind::kInt64;
+      async_req->hold_refs = new napi_ref[1]();
+      async_req->hold_ref_count = 1;
+      async_req->bufs = new uv_buf_t[1];
+      async_req->nbufs = 1;
+
+      napi_value hold_value = nullptr;
+      const bool extra_ok = req_kind != ReqKind::kCallback ||
+                            argv[1] == nullptr ||
+                            napi_create_reference(env, argv[1], 1, &async_req->extra_ref) == napi_ok;
+      if (ExtractByteSpanForAsyncIo(env, argc >= 2 ? argv[1] : nullptr, offset, length, &hold_value, &async_req->bufs[0]) &&
+          extra_ok &&
+          hold_value != nullptr &&
+          napi_create_reference(env, hold_value, 1, &async_req->hold_refs[0]) == napi_ok) {
+        uv_loop_t* loop = UbiGetEnvLoop(env);
+        const int rc = loop != nullptr
+                           ? uv_fs_read(loop,
+                                        &async_req->req,
+                                        fd,
+                                        async_req->bufs,
+                                        1,
+                                        position,
+                                        AfterAsyncFsReq)
+                           : UV_EINVAL;
+        if (rc < 0) FinishAsyncFsReq(async_req, rc);
+        return req_kind == ReqKind::kPromise ? promise : Undefined(env);
+      }
+
+      FinishAsyncFsReq(async_req, UV_EINVAL);
+      return req_kind == ReqKind::kPromise ? promise : Undefined(env);
+    }
+  }
+
+  if (length == 0) {
+    napi_value zero = nullptr;
+    napi_create_int64(env, 0, &zero);
+    return zero != nullptr ? zero : Undefined(env);
+  }
+
+  napi_value hold_value = nullptr;
+  uv_buf_t buf = uv_buf_init(nullptr, 0);
+  if (!ExtractByteSpanForAsyncIo(env, argc >= 2 ? argv[1] : nullptr, offset, length, &hold_value, &buf)) {
+    napi_throw(env, CreateUvExceptionValue(env, UV_EINVAL, "read"));
+    return nullptr;
+  }
+
+  uv_fs_t uv_req{};
+  const int result = uv_fs_read(nullptr, &uv_req, fd, &buf, 1, position, nullptr);
+  uv_fs_req_cleanup(&uv_req);
+  if (result < 0) {
+    napi_throw(env, CreateUvExceptionValue(env, result, "read"));
+    return nullptr;
+  }
+
+  napi_value out = nullptr;
+  napi_create_int64(env, result, &out);
+  return out != nullptr ? out : Undefined(env);
 }
 
 napi_value FsOpen(napi_env env, napi_callback_info info) {
@@ -1912,6 +2577,41 @@ napi_value FsOpen(napi_env env, napi_callback_info info) {
   napi_value req = argc >= 4 ? argv[3] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  if (req_kind != ReqKind::kNone) {
+    std::string path;
+    if (!ValueToPathString(env, argc >= 1 ? argv[0] : nullptr, &path)) {
+      napi_value err = CreateUvExceptionValue(env, UV_EINVAL, "open");
+      if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+      CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+      return Undefined(env);
+    }
+
+    int32_t flags = 0;
+    int32_t mode = 0;
+    if (argc >= 2 && argv[1] != nullptr) napi_get_value_int32(env, argv[1], &flags);
+    if (argc >= 3 && argv[2] != nullptr) napi_get_value_int32(env, argv[2], &mode);
+
+    napi_value promise = nullptr;
+    AsyncFsReq* async_req = CreateAsyncFsReq(env, req_kind, req, oncomplete, &promise);
+    if (async_req != nullptr) {
+      async_req->syscall = "open";
+      async_req->result_kind = AsyncFsResultKind::kInt64;
+      async_req->path_storage = std::move(path);
+
+      uv_loop_t* loop = UbiGetEnvLoop(env);
+      const int rc = loop != nullptr
+                         ? uv_fs_open(loop,
+                                      &async_req->req,
+                                      async_req->path_storage.c_str(),
+                                      flags,
+                                      mode,
+                                      AfterAsyncFsReq)
+                         : UV_EINVAL;
+      if (rc < 0) FinishAsyncFsReq(async_req, rc);
+      return req_kind == ReqKind::kPromise ? promise : Undefined(env);
+    }
+  }
 
   napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
                              argc >= 2 ? argv[1] : Undefined(env),
@@ -1977,6 +2677,8 @@ napi_value FsClose(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  int32_t fd = -1;
+  if (!ValidateFdArg(env, argc >= 1 ? argv[0] : nullptr, &fd)) return nullptr;
 
   napi_value req = argc >= 2 ? argv[1] : nullptr;
   napi_value oncomplete = nullptr;
@@ -2061,12 +2763,13 @@ napi_value FsReadBuffers(napi_env env, napi_callback_info info) {
 }
 
 napi_value FsWriteBuffer(napi_env env, napi_callback_info info) {
-  size_t argc = 6;
-  napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  size_t argc = 7;
+  napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   int32_t validated_fd = -1;
   if (!ValidateFdArg(env, argc >= 1 ? argv[0] : nullptr, &validated_fd)) return nullptr;
   napi_value req = argc >= 6 ? argv[5] : nullptr;
+  napi_value ctx = argc >= 7 ? argv[6] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
 
@@ -2087,6 +2790,13 @@ napi_value FsWriteBuffer(napi_env env, napi_callback_info info) {
       length -= offset;
     }
     const int64_t position = GetInt64OrDefault(env, argc >= 5 ? argv[4] : nullptr, -1);
+    if (length == 0) {
+      napi_value zero = nullptr;
+      napi_create_int64(env, 0, &zero);
+      if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, zero);
+      CompleteReqWithExtra(env, req_kind, req, oncomplete, nullptr, zero, argc >= 2 ? argv[1] : nullptr);
+      return req_kind == ReqKind::kCallback ? Undefined(env) : zero;
+    }
 
     napi_value promise = nullptr;
     AsyncFsReq* async_req = CreateAsyncFsReq(env, req_kind, req, oncomplete, &promise);
@@ -2099,7 +2809,11 @@ napi_value FsWriteBuffer(napi_env env, napi_callback_info info) {
       async_req->nbufs = 1;
 
       napi_value hold_value = nullptr;
+      const bool extra_ok = req_kind != ReqKind::kCallback ||
+                            argv[1] == nullptr ||
+                            napi_create_reference(env, argv[1], 1, &async_req->extra_ref) == napi_ok;
       if (ExtractByteSpanForAsyncIo(env, argc >= 2 ? argv[1] : nullptr, offset, length, &hold_value, &async_req->bufs[0]) &&
+          extra_ok &&
           hold_value != nullptr &&
           napi_create_reference(env, hold_value, 1, &async_req->hold_refs[0]) == napi_ok) {
         uv_loop_t* loop = UbiGetEnvLoop(env);
@@ -2121,33 +2835,47 @@ napi_value FsWriteBuffer(napi_env env, napi_callback_info info) {
     }
   }
 
-  napi_value call_argv[5] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env),
-                             argc >= 3 ? argv[2] : Undefined(env), argc >= 4 ? argv[3] : Undefined(env),
-                             argc >= 5 ? argv[4] : Undefined(env)};
   napi_value out = nullptr;
-  napi_value err = nullptr;
-  if (!CallRaw(env, "writeSync", 5, call_argv, &out, &err)) {
-    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
-    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
-    if (req_kind == ReqKind::kCallback) return Undefined(env);
-    if (err != nullptr) {
-      napi_throw(env, err);
-      return nullptr;
-    }
-    return Undefined(env);
+  napi_value hold_value = nullptr;
+  uv_buf_t buf = uv_buf_init(nullptr, 0);
+  size_t offset = 0;
+  if (argc >= 3 && argv[2] != nullptr) {
+    uint32_t offset_u32 = 0;
+    napi_get_value_uint32(env, argv[2], &offset_u32);
+    offset = offset_u32;
   }
-  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
-  CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
+  size_t length = ByteLengthOfValue(env, argc >= 2 ? argv[1] : nullptr);
+  if (argc >= 4 && argv[3] != nullptr) {
+    uint32_t length_u32 = 0;
+    napi_get_value_uint32(env, argv[3], &length_u32);
+    length = length_u32;
+  } else if (length >= offset) {
+    length -= offset;
+  }
+  const int64_t position = GetInt64OrDefault(env, argc >= 5 ? argv[4] : nullptr, -1);
+  if (length == 0) {
+    napi_value zero = nullptr;
+    napi_create_int64(env, 0, &zero);
+    return zero != nullptr ? zero : Undefined(env);
+  }
+  if (!ExtractByteSpanForAsyncIo(env, argc >= 2 ? argv[1] : nullptr, offset, length, &hold_value, &buf)) {
+    napi_throw(env, CreateUvExceptionValue(env, UV_EINVAL, "write"));
+    return nullptr;
+  }
+  if (!SyncWriteWithUv(env, validated_fd, &buf, 1, position, ctx, &out)) {
+    return (ctx != nullptr && !IsUndefined(env, ctx)) ? Undefined(env) : nullptr;
+  }
   return out;
 }
 
 napi_value FsWriteString(napi_env env, napi_callback_info info) {
-  size_t argc = 5;
-  napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  size_t argc = 6;
+  napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   int32_t validated_fd = -1;
   if (!ValidateFdArg(env, argc >= 1 ? argv[0] : nullptr, &validated_fd)) return nullptr;
   napi_value req = argc >= 5 ? argv[4] : nullptr;
+  napi_value ctx = argc >= 6 ? argv[5] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
 
@@ -2158,6 +2886,13 @@ napi_value FsWriteString(napi_env env, napi_callback_info info) {
   if (req_kind != ReqKind::kNone) {
     const int32_t fd = validated_fd;
     const int64_t position = GetInt64OrDefault(env, argc >= 3 ? argv[2] : nullptr, -1);
+    if (byte_length == 0) {
+      napi_value zero = nullptr;
+      napi_create_int64(env, 0, &zero);
+      if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, zero);
+      CompleteReqWithExtra(env, req_kind, req, oncomplete, nullptr, zero, argc >= 2 ? argv[1] : nullptr);
+      return req_kind == ReqKind::kCallback ? Undefined(env) : zero;
+    }
 
     napi_value promise = nullptr;
     AsyncFsReq* async_req = CreateAsyncFsReq(env, req_kind, req, oncomplete, &promise);
@@ -2170,7 +2905,11 @@ napi_value FsWriteString(napi_env env, napi_callback_info info) {
       async_req->nbufs = 1;
 
       napi_value hold_value = nullptr;
+      const bool extra_ok = req_kind != ReqKind::kCallback ||
+                            argv[1] == nullptr ||
+                            napi_create_reference(env, argv[1], 1, &async_req->extra_ref) == napi_ok;
       if (ExtractByteSpanForAsyncIo(env, buffer, 0, byte_length, &hold_value, &async_req->bufs[0]) &&
+          extra_ok &&
           hold_value != nullptr &&
           napi_create_reference(env, hold_value, 1, &async_req->hold_refs[0]) == napi_ok) {
         uv_loop_t* loop = UbiGetEnvLoop(env);
@@ -2192,36 +2931,21 @@ napi_value FsWriteString(napi_env env, napi_callback_info info) {
     }
   }
 
-  napi_value zero = nullptr;
-  napi_create_uint32(env, 0, &zero);
-  napi_value length = nullptr;
-  napi_create_uint32(env, static_cast<uint32_t>(byte_length), &length);
-
-  napi_value position = argc >= 3 ? argv[2] : Undefined(env);
-  if (position == nullptr || IsUndefined(env, position)) {
-    napi_create_int64(env, -1, &position);
-  } else {
-    napi_valuetype pt = napi_undefined;
-    if (napi_typeof(env, position, &pt) == napi_ok && pt == napi_null) {
-      napi_create_int64(env, -1, &position);
-    }
-  }
-
-  napi_value call_argv[5] = {argc >= 1 ? argv[0] : Undefined(env), buffer, zero, length, position};
   napi_value out = nullptr;
-  napi_value err = nullptr;
-  if (!CallRaw(env, "writeSync", 5, call_argv, &out, &err)) {
-    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
-    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
-    if (req_kind == ReqKind::kCallback) return Undefined(env);
-    if (err != nullptr) {
-      napi_throw(env, err);
-      return nullptr;
-    }
-    return Undefined(env);
+  if (byte_length == 0) {
+    napi_create_int64(env, 0, &out);
+    return out != nullptr ? out : Undefined(env);
   }
-  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
-  CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
+  napi_value hold_value = nullptr;
+  uv_buf_t buf = uv_buf_init(nullptr, 0);
+  if (!ExtractByteSpanForAsyncIo(env, buffer, 0, byte_length, &hold_value, &buf)) {
+    napi_throw(env, CreateUvExceptionValue(env, UV_EINVAL, "write"));
+    return nullptr;
+  }
+  const int64_t position = GetInt64OrDefault(env, argc >= 3 ? argv[2] : nullptr, -1);
+  if (!SyncWriteWithUv(env, validated_fd, &buf, 1, position, ctx, &out)) {
+    return (ctx != nullptr && !IsUndefined(env, ctx)) ? Undefined(env) : nullptr;
+  }
   return out;
 }
 
@@ -2245,6 +2969,36 @@ napi_value FsWriteBuffers(napi_env env, napi_callback_info info) {
     return Undefined(env);
   }
 
+  bool all_chunks_empty = true;
+  for (uint32_t i = 0; i < len; ++i) {
+    napi_value chunk = nullptr;
+    if (napi_get_element(env, argv[1], i, &chunk) != napi_ok || chunk == nullptr) {
+      all_chunks_empty = false;
+      break;
+    }
+    if (ByteLengthOfValue(env, chunk) != 0) {
+      all_chunks_empty = false;
+      break;
+    }
+  }
+
+  if (len == 0 || all_chunks_empty) {
+    napi_value zero = nullptr;
+    napi_create_int64(env, 0, &zero);
+    if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, zero);
+    if (req_kind == ReqKind::kCallback) {
+      CompleteReqWithExtra(env,
+                           req_kind,
+                           req,
+                           oncomplete,
+                           nullptr,
+                           zero != nullptr ? zero : Undefined(env),
+                           argc >= 2 ? argv[1] : nullptr);
+      return Undefined(env);
+    }
+    return zero != nullptr ? zero : Undefined(env);
+  }
+
   if (req_kind != ReqKind::kNone) {
     const int32_t fd = validated_fd;
 
@@ -2258,6 +3012,9 @@ napi_value FsWriteBuffers(napi_env env, napi_callback_info info) {
       async_req->bufs = new uv_buf_t[len];
       async_req->nbufs = len;
 
+      const bool extra_ok = req_kind != ReqKind::kCallback ||
+                            argv[1] == nullptr ||
+                            napi_create_reference(env, argv[1], 1, &async_req->extra_ref) == napi_ok;
       bool ok = true;
       for (uint32_t i = 0; i < len; ++i) {
         napi_value chunk = nullptr;
@@ -2275,7 +3032,7 @@ napi_value FsWriteBuffers(napi_env env, napi_callback_info info) {
         }
       }
 
-      if (ok) {
+      if (ok && extra_ok) {
         uv_loop_t* loop = UbiGetEnvLoop(env);
         const int rc = loop != nullptr
                            ? uv_fs_write(loop,
@@ -2295,41 +3052,25 @@ napi_value FsWriteBuffers(napi_env env, napi_callback_info info) {
     }
   }
 
-  int64_t total = 0;
+  std::vector<napi_value> hold_values(len);
+  std::vector<uv_buf_t> bufs(len);
   for (uint32_t i = 0; i < len; ++i) {
     napi_value chunk = nullptr;
-    if (napi_get_element(env, argv[1], i, &chunk) != napi_ok || chunk == nullptr) continue;
-    napi_value buffer = BufferFromValue(env, chunk, nullptr);
-    const size_t chunk_len = ByteLengthOfValue(env, buffer);
-    napi_value zero = nullptr;
-    napi_value length = nullptr;
-    napi_value pos = nullptr;
-    napi_create_uint32(env, 0, &zero);
-    napi_create_uint32(env, static_cast<uint32_t>(chunk_len), &length);
-    napi_create_int64(env, position, &pos);
-    napi_value call_argv[5] = {argv[0], buffer, zero, length, pos};
-    napi_value chunk_out = nullptr;
-    napi_value err = nullptr;
-    if (!CallRaw(env, "writeSync", 5, call_argv, &chunk_out, &err)) {
-      if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
-      CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
-      if (req_kind == ReqKind::kCallback) return Undefined(env);
-      if (err != nullptr) {
-        napi_throw(env, err);
-        return nullptr;
-      }
-      return Undefined(env);
+    if (napi_get_element(env, argv[1], i, &chunk) != napi_ok || chunk == nullptr) {
+      napi_throw(env, CreateUvExceptionValue(env, UV_EINVAL, "write"));
+      return nullptr;
     }
-    int64_t written = 0;
-    napi_get_value_int64(env, chunk_out, &written);
-    total += written;
-    if (position >= 0 && written > 0) position += written;
+    const size_t chunk_len = ByteLengthOfValue(env, chunk);
+    if (!ExtractByteSpanForAsyncIo(env, chunk, 0, chunk_len, &hold_values[i], &bufs[i])) {
+      napi_throw(env, CreateUvExceptionValue(env, UV_EINVAL, "write"));
+      return nullptr;
+    }
   }
 
   napi_value out = nullptr;
-  napi_create_int64(env, total, &out);
-  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
-  CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
+  if (!SyncWriteWithUv(env, validated_fd, bufs.data(), bufs.size(), position, nullptr, &out)) {
+    return nullptr;
+  }
   return out;
 }
 
@@ -2401,6 +3142,56 @@ napi_value FsOpenFileHandle(napi_env env, napi_callback_info info) {
   if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, handle);
   CompleteReq(env, req_kind, req, oncomplete, nullptr, handle);
   return handle;
+}
+
+napi_value FsReadFileUtf8(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  int32_t fd = -1;
+  bool is_fd = false;
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_number) {
+      is_fd = ValidateFdArg(env, argv[0], &fd);
+      if (!is_fd) return nullptr;
+    }
+  }
+
+  if (is_fd) {
+    std::string content;
+    std::vector<char> chunk(8192);
+    while (true) {
+      uv_buf_t buf = uv_buf_init(chunk.data(), static_cast<unsigned int>(chunk.size()));
+      uv_fs_t req;
+      const int rc = uv_fs_read(nullptr, &req, fd, &buf, 1, -1, nullptr);
+      const int result = rc < 0 ? rc : static_cast<int>(req.result);
+      uv_fs_req_cleanup(&req);
+      if (result < 0) {
+        napi_throw(env, CreateUvExceptionValue(env, result, "read"));
+        return nullptr;
+      }
+      if (result == 0) break;
+      content.append(chunk.data(), static_cast<size_t>(result));
+    }
+
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, content.c_str(), content.size(), &out);
+    return out != nullptr ? out : Undefined(env);
+  }
+
+  napi_value out = nullptr;
+  napi_value err = nullptr;
+  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env)};
+  if (!CallRaw(env, "readFileUtf8", 2, call_argv, &out, &err)) {
+    if (err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+  return out != nullptr ? out : Undefined(env);
 }
 
 napi_value FsInternalModuleStat(napi_env env, napi_callback_info info) {
@@ -2481,6 +3272,83 @@ napi_value FsLegacyMainResolve(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+bool ThrowCpError(napi_env env, const char* code, const std::string& message) {
+  napi_throw_error(env, code, message.c_str());
+  return false;
+}
+
+int ErrnoFromStdError(const std::error_code& error_code) {
+#ifdef _WIN32
+  return uv_translate_sys_error(error_code.value());
+#else
+  return error_code.value() > 0 ? -error_code.value() : error_code.value();
+#endif
+}
+
+bool ThrowStdFsError(napi_env env,
+                     const std::error_code& error_code,
+                     const char* syscall,
+                     const std::string& path = std::string()) {
+  napi_value err = CreateUvExceptionValue(env, ErrnoFromStdError(error_code), syscall);
+  if (err == nullptr) {
+    napi_throw_error(env, nullptr, error_code.message().c_str());
+    return false;
+  }
+  if (!path.empty()) {
+    napi_value path_value = nullptr;
+    if (napi_create_string_utf8(env, path.c_str(), path.size(), &path_value) == napi_ok && path_value != nullptr) {
+      napi_set_named_property(env, err, "path", path_value);
+    }
+  }
+  napi_throw(env, err);
+  return false;
+}
+
+std::string FsPathToString(const std::filesystem::path& path) {
+  return path.lexically_normal().string();
+}
+
+bool CopyUtimesForCp(napi_env env, const std::filesystem::path& src, const std::filesystem::path& dest) {
+  uv_fs_t req;
+  const std::string src_path = FsPathToString(src);
+  int result = uv_fs_stat(nullptr, &req, src_path.c_str(), nullptr);
+  if (result < 0) {
+    uv_fs_req_cleanup(&req);
+    napi_throw(env, CreateUvExceptionValue(env, result, "stat"));
+    return false;
+  }
+
+  const uv_stat_t* stat = static_cast<const uv_stat_t*>(req.ptr);
+  const double source_atime = stat->st_atim.tv_sec + stat->st_atim.tv_nsec / 1e9;
+  const double source_mtime = stat->st_mtim.tv_sec + stat->st_mtim.tv_nsec / 1e9;
+  uv_fs_req_cleanup(&req);
+
+  const std::string dest_path = FsPathToString(dest);
+  result = uv_fs_utime(nullptr, &req, dest_path.c_str(), source_atime, source_mtime, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (result < 0) {
+    napi_throw(env, CreateUvExceptionValue(env, result, "utime"));
+    return false;
+  }
+  return true;
+}
+
+std::vector<std::string> NormalizePathToArray(const std::filesystem::path& path) {
+  std::vector<std::string> parts;
+  std::filesystem::path abs = std::filesystem::absolute(path);
+  for (const auto& part : abs) {
+    if (!part.empty()) parts.push_back(part.string());
+  }
+  return parts;
+}
+
+bool IsInsideDir(const std::filesystem::path& src, const std::filesystem::path& dest) {
+  const auto src_parts = NormalizePathToArray(src);
+  const auto dest_parts = NormalizePathToArray(dest);
+  if (src_parts.size() > dest_parts.size()) return false;
+  return std::equal(src_parts.begin(), src_parts.end(), dest_parts.begin());
+}
+
 napi_value FsCpSyncCheckPaths(napi_env env, napi_callback_info info) {
   size_t argc = 4;
   napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -2488,42 +3356,139 @@ napi_value FsCpSyncCheckPaths(napi_env env, napi_callback_info info) {
   std::string src;
   std::string dest;
   if (argc < 2 || !ValueToUtf8(env, argv[0], &src) || !ValueToUtf8(env, argv[1], &dest)) return Undefined(env);
+  const std::filesystem::path src_path(src);
+  const std::filesystem::path dest_path(dest);
+  bool dereference = false;
   bool recursive = false;
+  if (argc >= 3 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &dereference);
   if (argc >= 4 && argv[3] != nullptr) napi_get_value_bool(env, argv[3], &recursive);
 
-  auto normalize = [](std::string value) {
-    std::replace(value.begin(), value.end(), '\\', '/');
-    while (!value.empty() && value.back() == '/') value.pop_back();
-    return value;
-  };
-  const std::string src_norm = normalize(src);
-  const std::string dest_norm = normalize(dest);
-  if (src_norm == dest_norm) {
-    napi_throw_error(env, "EINVAL", "EINVAL: src and dest cannot be the same");
+  std::error_code ec;
+  const auto src_status = dereference ? std::filesystem::status(src_path, ec)
+                                      : std::filesystem::symlink_status(src_path, ec);
+  if (ec) {
+    napi_throw(env,
+               CreateUvExceptionValue(env, ErrnoFromStdError(ec), dereference ? "stat" : "lstat"));
     return nullptr;
   }
-  if (recursive && dest_norm.rfind(src_norm + "/", 0) == 0) {
-    napi_throw_error(env, "EINVAL", "EINVAL: cannot copy to a subdirectory of itself");
+
+  ec.clear();
+  const auto dest_status = dereference ? std::filesystem::status(dest_path, ec)
+                                       : std::filesystem::symlink_status(dest_path, ec);
+  const bool dest_exists = !ec && dest_status.type() != std::filesystem::file_type::not_found;
+  const bool src_is_dir = src_status.type() == std::filesystem::file_type::directory;
+
+  const std::string src_path_str = FsPathToString(src_path);
+  const std::string dest_path_str = FsPathToString(dest_path);
+
+  if (!ec) {
+    std::error_code equivalent_error;
+    if (std::filesystem::equivalent(src_path, dest_path, equivalent_error)) {
+      ThrowCpError(env, "ERR_FS_CP_EINVAL", "src and dest cannot be the same " + dest_path_str);
+      return nullptr;
+    }
+
+    const bool dest_is_dir = dest_status.type() == std::filesystem::file_type::directory;
+    if (src_is_dir && !dest_is_dir) {
+      ThrowCpError(env,
+                   "ERR_FS_CP_DIR_TO_NON_DIR",
+                   "Cannot overwrite non-directory " + dest_path_str + " with directory " + src_path_str);
+      return nullptr;
+    }
+    if (!src_is_dir && dest_is_dir) {
+      ThrowCpError(env,
+                   "ERR_FS_CP_NON_DIR_TO_DIR",
+                   "Cannot overwrite directory " + dest_path_str + " with non-directory " + src_path_str);
+      return nullptr;
+    }
+  } else {
+    ec.clear();
+  }
+
+  if (src_is_dir && IsInsideDir(src_path, dest_path) && src_path != dest_path) {
+    ThrowCpError(env,
+                 "ERR_FS_CP_EINVAL",
+                 "Cannot copy " + src_path_str + " to a subdirectory of self " + dest_path_str);
     return nullptr;
+  }
+
+  auto dest_parent = dest_path.parent_path();
+  while (src_path.parent_path() != dest_parent &&
+         dest_parent.has_parent_path() &&
+         dest_parent.parent_path() != dest_parent) {
+    std::error_code equivalent_error;
+    if (std::filesystem::equivalent(src_path, dest_parent, equivalent_error)) {
+      ThrowCpError(env,
+                   "ERR_FS_CP_EINVAL",
+                   "Cannot copy " + src_path_str + " to a subdirectory of self " + dest_path_str);
+      return nullptr;
+    }
+    if (equivalent_error) break;
+    dest_parent = dest_parent.parent_path();
+  }
+
+  if (src_is_dir && !recursive) {
+    ThrowCpError(env,
+                 "ERR_FS_EISDIR",
+                 "Recursive option not enabled, cannot copy a directory: " + src_path_str);
+    return nullptr;
+  }
+
+  switch (src_status.type()) {
+    case std::filesystem::file_type::socket:
+      ThrowCpError(env, "ERR_FS_CP_SOCKET", "Cannot copy a socket file: " + dest_path_str);
+      return nullptr;
+    case std::filesystem::file_type::fifo:
+      ThrowCpError(env, "ERR_FS_CP_FIFO_PIPE", "Cannot copy a FIFO pipe: " + dest_path_str);
+      return nullptr;
+    case std::filesystem::file_type::unknown:
+      ThrowCpError(env, "ERR_FS_CP_UNKNOWN", "Cannot copy an unknown file type: " + dest_path_str);
+      return nullptr;
+    default:
+      break;
+  }
+
+  const auto parent_path = dest_path.parent_path();
+  if ((!dest_exists || !std::filesystem::exists(parent_path)) && !parent_path.empty()) {
+    std::filesystem::create_directories(parent_path, ec);
+    if (ec) return ThrowStdFsError(env, ec, "cp", FsPathToString(parent_path)), nullptr;
   }
   return Undefined(env);
 }
 
 napi_value FsCpSyncOverrideFile(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   std::string src;
   std::string dest;
   if (argc < 2 || !ValueToUtf8(env, argv[0], &src) || !ValueToUtf8(env, argv[1], &dest)) return Undefined(env);
+  int32_t mode = 0;
+  if (argc >= 3 && argv[2] != nullptr && !ValidateCopyFileModeArg(env, argv[2], &mode)) return nullptr;
+  bool preserve_timestamps = false;
+  if (argc >= 4 && argv[3] != nullptr) napi_get_value_bool(env, argv[3], &preserve_timestamps);
+
+  const std::filesystem::path src_path(src);
+  const std::filesystem::path dest_path(dest);
   std::error_code ec;
-  std::filesystem::remove(dest, ec);
-  ec.clear();
-  std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing, ec);
-  if (ec) {
-    napi_throw_error(env, "ERR_SYSTEM_ERROR", ec.message().c_str());
-    return nullptr;
+  if (!std::filesystem::remove(dest_path, ec) && ec) return ThrowStdFsError(env, ec, "unlink", dest), nullptr;
+
+  if (mode == 0) {
+    ec.clear();
+    if (!std::filesystem::copy_file(src_path, dest_path, ec)) {
+      if (ec) return ThrowStdFsError(env, ec, "cp", dest), nullptr;
+    }
+  } else {
+    uv_fs_t req;
+    const int result = uv_fs_copyfile(nullptr, &req, src.c_str(), dest.c_str(), mode, nullptr);
+    uv_fs_req_cleanup(&req);
+    if (result < 0) {
+      napi_throw(env, CreateUvExceptionValue(env, result, "cp"));
+      return nullptr;
+    }
   }
+
+  if (preserve_timestamps && !CopyUtimesForCp(env, src_path, dest_path)) return nullptr;
   return Undefined(env);
 }
 
@@ -2534,43 +3499,110 @@ napi_value FsCpSyncCopyDir(napi_env env, napi_callback_info info) {
   std::string src;
   std::string dest;
   if (argc < 2 || !ValueToUtf8(env, argv[0], &src) || !ValueToUtf8(env, argv[1], &dest)) return Undefined(env);
+  const std::filesystem::path src_path(src);
+  const std::filesystem::path dest_path(dest);
   bool force = false;
+  bool dereference = false;
   bool error_on_exist = false;
+  bool verbatim_symlinks = false;
+  bool preserve_timestamps = false;
   if (argc >= 3 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &force);
+  if (argc >= 4 && argv[3] != nullptr) napi_get_value_bool(env, argv[3], &dereference);
   if (argc >= 5 && argv[4] != nullptr) napi_get_value_bool(env, argv[4], &error_on_exist);
+  if (argc >= 6 && argv[5] != nullptr) napi_get_value_bool(env, argv[5], &verbatim_symlinks);
+  if (argc >= 7 && argv[6] != nullptr) napi_get_value_bool(env, argv[6], &preserve_timestamps);
 
   std::error_code ec;
-  std::filesystem::create_directories(dest, ec);
-  if (ec) {
-    napi_throw_error(env, "ERR_SYSTEM_ERROR", ec.message().c_str());
-    return nullptr;
-  }
+  std::filesystem::create_directories(dest_path, ec);
+  if (ec) return ThrowStdFsError(env, ec, "cp", dest), nullptr;
 
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(src, ec)) {
-    if (ec) break;
-    const auto relative = std::filesystem::relative(entry.path(), src, ec);
-    if (ec) break;
-    const auto target = std::filesystem::path(dest) / relative;
-    if (entry.is_directory()) {
-      std::filesystem::create_directories(target, ec);
-      if (ec) break;
-      continue;
+  auto file_copy_opts = std::filesystem::copy_options::none;
+  if (force) file_copy_opts = std::filesystem::copy_options::overwrite_existing;
+  else if (!error_on_exist) file_copy_opts = std::filesystem::copy_options::skip_existing;
+
+  std::function<bool(const std::filesystem::path&, const std::filesystem::path&)> copy_dir_contents;
+  copy_dir_contents = [&](const std::filesystem::path& current_src, const std::filesystem::path& current_dest) {
+    std::error_code iter_error;
+    for (const auto& entry : std::filesystem::directory_iterator(current_src, iter_error)) {
+      if (iter_error) return ThrowStdFsError(env, iter_error, "cp", FsPathToString(current_dest));
+      const auto dest_file_path = current_dest / entry.path().filename();
+      const std::string dest_str = FsPathToString(current_dest);
+
+      if (entry.is_symlink()) {
+        if (verbatim_symlinks) {
+          std::filesystem::copy_symlink(entry.path(), dest_file_path, iter_error);
+          if (iter_error) return ThrowStdFsError(env, iter_error, "cp", dest_str);
+        } else {
+          auto symlink_target = std::filesystem::read_symlink(entry.path(), iter_error);
+          if (iter_error) return ThrowStdFsError(env, iter_error, "cp", dest_str);
+
+          if (std::filesystem::exists(dest_file_path)) {
+            if (std::filesystem::is_symlink(dest_file_path)) {
+              auto current_dest_symlink_target = std::filesystem::read_symlink(dest_file_path, iter_error);
+              if (iter_error) return ThrowStdFsError(env, iter_error, "cp", dest_str);
+
+              if (!dereference &&
+                  std::filesystem::is_directory(symlink_target) &&
+                  IsInsideDir(symlink_target, current_dest_symlink_target)) {
+                return ThrowCpError(env,
+                                    "ERR_FS_CP_EINVAL",
+                                    "Cannot copy " + FsPathToString(symlink_target) +
+                                        " to a subdirectory of self " +
+                                        FsPathToString(current_dest_symlink_target));
+              }
+
+              if (std::filesystem::is_directory(dest_file_path) &&
+                  IsInsideDir(current_dest_symlink_target, symlink_target)) {
+                return ThrowCpError(env,
+                                    "ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY",
+                                    "cannot overwrite " + FsPathToString(current_dest_symlink_target) +
+                                        " with " + FsPathToString(symlink_target));
+              }
+
+              std::filesystem::remove(dest_file_path, iter_error);
+              if (iter_error) return ThrowStdFsError(env, iter_error, "cp", dest_str);
+            } else if (std::filesystem::is_regular_file(dest_file_path)) {
+              if (!dereference || (!force && error_on_exist)) {
+                return ThrowCpError(env,
+                                    "EEXIST",
+                                    "EEXIST: file already exists, cp '" + FsPathToString(dest_file_path) + "'");
+              }
+            }
+          }
+
+          std::filesystem::path target_path = symlink_target;
+          if (!target_path.is_absolute()) {
+            target_path = std::filesystem::weakly_canonical(entry.path().parent_path() / target_path);
+          }
+          if (entry.is_directory()) {
+            std::filesystem::create_directory_symlink(target_path, dest_file_path, iter_error);
+          } else {
+            std::filesystem::create_symlink(target_path, dest_file_path, iter_error);
+          }
+          if (iter_error) return ThrowStdFsError(env, iter_error, "cp", dest_str);
+        }
+      } else if (entry.is_directory()) {
+        std::filesystem::create_directory(dest_file_path, iter_error);
+        if (iter_error) return ThrowStdFsError(env, iter_error, "cp", dest_str);
+        if (!copy_dir_contents(entry.path(), dest_file_path)) return false;
+      } else if (entry.is_regular_file()) {
+        std::filesystem::copy_file(entry.path(), dest_file_path, file_copy_opts, iter_error);
+        if (iter_error) {
+          if (iter_error.value() == EEXIST) {
+            return ThrowCpError(env,
+                                "ERR_FS_CP_EEXIST",
+                                "[ERR_FS_CP_EEXIST]: Target already exists: cp returned EEXIST (" +
+                                    FsPathToString(dest_file_path) + " already exists)");
+          }
+          return ThrowStdFsError(env, iter_error, "cp", dest_str);
+        }
+        if (preserve_timestamps && !CopyUtimesForCp(env, entry.path(), dest_file_path)) return false;
+      }
     }
-    std::filesystem::create_directories(target.parent_path(), ec);
-    if (ec) break;
-    auto options = std::filesystem::copy_options::none;
-    if (force && !error_on_exist) options = std::filesystem::copy_options::overwrite_existing;
-    std::filesystem::copy_file(entry.path(), target, options, ec);
-    if (ec && force) {
-      ec.clear();
-      std::filesystem::copy_file(entry.path(), target, std::filesystem::copy_options::overwrite_existing, ec);
-    }
-    if (ec) break;
-  }
-  if (ec) {
-    napi_throw_error(env, "ERR_SYSTEM_ERROR", ec.message().c_str());
-    return nullptr;
-  }
+    return true;
+  };
+
+  if (!copy_dir_contents(src_path, dest_path)) return nullptr;
   return Undefined(env);
 }
 
@@ -2831,6 +3863,7 @@ napi_value ResolveFs(napi_env env, const ResolveOptions& options) {
   SetNamedMethod(env, binding, "writeBuffer", FsWriteBuffer);
   SetNamedMethod(env, binding, "writeString", FsWriteString);
   SetNamedMethod(env, binding, "writeBuffers", FsWriteBuffers);
+  SetNamedMethod(env, binding, "readFileUtf8", FsReadFileUtf8);
   SetNamedMethod(env, binding, "openFileHandle", FsOpenFileHandle);
   SetNamedMethod(env, binding, "internalModuleStat", FsInternalModuleStat);
   SetNamedMethod(env, binding, "legacyMainResolve", FsLegacyMainResolve);

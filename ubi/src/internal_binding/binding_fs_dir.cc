@@ -42,6 +42,8 @@ struct DirReq {
   napi_ref req_ref = nullptr;
   napi_ref oncomplete_ref = nullptr;
   std::string encoding = "utf8";
+  std::string path;
+  bool req_cleaned = false;
   uv_fs_t req{};
 };
 
@@ -153,15 +155,22 @@ void ReleaseDirHandleRef(DirHandleWrap* wrap) {
   (void)napi_reference_unref(wrap->env, wrap->wrapper_ref, &ref_count);
 }
 
-napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall) {
+napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall, const char* path = nullptr) {
   const char* code = uv_err_name(errorno);
   const char* message = uv_strerror(errorno);
   std::string full_message;
-  if (syscall != nullptr && *syscall != '\0') {
-    full_message.append(syscall);
-    full_message.push_back(' ');
-  }
+  full_message.append(code != nullptr ? code : "UV_UNKNOWN");
+  full_message.append(": ");
   full_message.append(message != nullptr ? message : "Unknown system error");
+  if (syscall != nullptr && *syscall != '\0') {
+    full_message.append(", ");
+    full_message.append(syscall);
+    if (path != nullptr && *path != '\0') {
+      full_message.append(" '");
+      full_message.append(path);
+      full_message.push_back('\'');
+    }
+  }
 
   napi_value message_value = nullptr;
   napi_value error = nullptr;
@@ -181,6 +190,12 @@ napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall
     napi_value syscall_value = nullptr;
     napi_create_string_utf8(env, syscall, NAPI_AUTO_LENGTH, &syscall_value);
     napi_set_named_property(env, error, "syscall", syscall_value);
+  }
+
+  if (path != nullptr && *path != '\0') {
+    napi_value path_value = nullptr;
+    napi_create_string_utf8(env, path, NAPI_AUTO_LENGTH, &path_value);
+    napi_set_named_property(env, error, "path", path_value);
   }
 
   return error;
@@ -295,7 +310,10 @@ void CompleteReq(DirReq* req, napi_value err, napi_value value) {
 void DeleteReq(DirReq* req) {
   if (req == nullptr) return;
   if (req->handle != nullptr) ReleaseDirHandleRef(req->handle);
-  uv_fs_req_cleanup(&req->req);
+  if (!req->req_cleaned) {
+    uv_fs_req_cleanup(&req->req);
+    req->req_cleaned = true;
+  }
   ResetRef(req->env, &req->req_ref);
   ResetRef(req->env, &req->oncomplete_ref);
   delete req;
@@ -321,12 +339,14 @@ void AfterOpenDir(uv_fs_t* uv_req) {
   napi_value err = nullptr;
   napi_value value = Undefined(req->env);
   if (uv_req->result < 0) {
-    err = CreateUvExceptionValue(req->env, static_cast<int>(uv_req->result), "opendir");
+    err = CreateUvExceptionValue(req->env, static_cast<int>(uv_req->result), "opendir", req->path.c_str());
   } else {
     uv_dir_t* dir = static_cast<uv_dir_t*>(uv_req->ptr);
     value = CreateDirHandle(req->env, dir);
   }
 
+  uv_fs_req_cleanup(&req->req);
+  req->req_cleaned = true;
   CompleteReq(req, err, value);
   DeleteReq(req);
 }
@@ -345,6 +365,8 @@ void AfterReadDir(uv_fs_t* uv_req) {
     value = CreateDirentArray(req->env, req->handle->dir, static_cast<int>(uv_req->result), req->encoding);
   }
 
+  uv_fs_req_cleanup(&req->req);
+  req->req_cleaned = true;
   CompleteReq(req, err, value);
   DeleteReq(req);
 }
@@ -358,6 +380,8 @@ void AfterCloseDir(uv_fs_t* uv_req) {
     err = CreateUvExceptionValue(req->env, static_cast<int>(uv_req->result), "closedir");
   }
 
+  uv_fs_req_cleanup(&req->req);
+  req->req_cleaned = true;
   CompleteReq(req, err, Undefined(req->env));
   DeleteReq(req);
 }
@@ -382,9 +406,9 @@ napi_value DirHandleRead(napi_env env, napi_callback_info info) {
   if (argc >= 2 && argv[1] != nullptr) napi_get_value_uint32(env, argv[1], &buffer_size);
   if (buffer_size != wrap->dirents.size()) {
     wrap->dirents.resize(buffer_size);
+    wrap->dir->nentries = static_cast<unsigned int>(wrap->dirents.size());
+    wrap->dir->dirents = wrap->dirents.empty() ? nullptr : wrap->dirents.data();
   }
-  wrap->dir->nentries = static_cast<unsigned int>(wrap->dirents.size());
-  wrap->dir->dirents = wrap->dirents.empty() ? nullptr : wrap->dirents.data();
 
   if (argc >= 3 && argv[2] != nullptr && !IsUndefined(env, argv[2])) {
     auto* req = new DirReq();
@@ -480,6 +504,7 @@ napi_value FsDirOpendir(napi_env env, napi_callback_info info) {
     auto* req = new DirReq();
     req->kind = DirReqKind::kOpen;
     req->encoding = argc >= 2 ? GetEncoding(env, argv[1]) : "utf8";
+    req->path = path;
     if (!InitAsyncReq(env, argv[2], req)) {
       delete req;
       return Undefined(env);
@@ -498,7 +523,7 @@ napi_value FsDirOpendir(napi_env env, napi_callback_info info) {
   const int rc = uv_fs_opendir(nullptr, &req, path.c_str(), nullptr);
   if (rc < 0) {
     uv_fs_req_cleanup(&req);
-    napi_throw(env, CreateUvExceptionValue(env, rc, "opendir"));
+    napi_throw(env, CreateUvExceptionValue(env, rc, "opendir", path.c_str()));
     return nullptr;
   }
 
@@ -520,7 +545,7 @@ napi_value FsDirOpendirSync(napi_env env, napi_callback_info info) {
   const int rc = uv_fs_opendir(nullptr, &req, path.c_str(), nullptr);
   if (rc < 0) {
     uv_fs_req_cleanup(&req);
-    napi_throw(env, CreateUvExceptionValue(env, rc, "opendir"));
+    napi_throw(env, CreateUvExceptionValue(env, rc, "opendir", path.c_str()));
     return nullptr;
   }
 

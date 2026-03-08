@@ -15,18 +15,13 @@ namespace internal_binding {
 
 namespace {
 
-enum class FsEventEncoding {
-  kUtf8,
-  kBuffer,
-};
-
 struct FsEventWrap {
   UbiHandleWrap handle_wrap{};
   napi_ref owner_ref = nullptr;
   uv_fs_event_t handle{};
   bool referenced = true;
   int64_t async_id = 0;
-  FsEventEncoding encoding = FsEventEncoding::kUtf8;
+  std::string encoding = "utf8";
 };
 
 int64_t g_next_async_id = 500000;
@@ -90,12 +85,43 @@ napi_value CreateFilenameValue(FsEventWrap* wrap, const char* filename) {
   }
 
   napi_value out = nullptr;
-  if (wrap->encoding == FsEventEncoding::kBuffer) {
+  if (wrap->encoding == "buffer") {
     napi_create_buffer_copy(wrap->handle_wrap.env, std::strlen(filename), filename, nullptr, &out);
-  } else {
-    napi_create_string_utf8(wrap->handle_wrap.env, filename, NAPI_AUTO_LENGTH, &out);
+    return out != nullptr ? out : Undefined(wrap->handle_wrap.env);
   }
-  return out != nullptr ? out : Undefined(wrap->handle_wrap.env);
+
+  napi_value buffer = nullptr;
+  if (napi_create_buffer_copy(wrap->handle_wrap.env,
+                              std::strlen(filename),
+                              filename,
+                              nullptr,
+                              &buffer) != napi_ok ||
+      buffer == nullptr) {
+    return Undefined(wrap->handle_wrap.env);
+  }
+
+  napi_value to_string = nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_get_named_property(wrap->handle_wrap.env, buffer, "toString", &to_string) != napi_ok ||
+      to_string == nullptr ||
+      napi_typeof(wrap->handle_wrap.env, to_string, &type) != napi_ok ||
+      type != napi_function) {
+    return buffer;
+  }
+
+  napi_value encoding_value = nullptr;
+  if (napi_create_string_utf8(wrap->handle_wrap.env,
+                              wrap->encoding.c_str(),
+                              NAPI_AUTO_LENGTH,
+                              &encoding_value) != napi_ok ||
+      encoding_value == nullptr ||
+      napi_call_function(
+          wrap->handle_wrap.env, buffer, to_string, 1, &encoding_value, &out) != napi_ok ||
+      out == nullptr) {
+    return buffer;
+  }
+
+  return out;
 }
 
 void OnClosed(uv_handle_t* handle) {
@@ -213,7 +239,7 @@ napi_value FsEventStart(napi_env env, napi_callback_info info) {
   if (argc >= 4 && argv[3] != nullptr) {
     ValueToUtf8(env, argv[3], &encoding);
   }
-  wrap->encoding = (encoding == "buffer") ? FsEventEncoding::kBuffer : FsEventEncoding::kUtf8;
+  wrap->encoding = std::move(encoding);
 
   int flags = 0;
   if (recursive) flags |= UV_FS_EVENT_RECURSIVE;

@@ -1,5 +1,9 @@
 #include "internal_binding/dispatch.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <unordered_map>
 
 #include <openssl/ec.h>
@@ -157,12 +161,198 @@ napi_value CreateTraceConstants(napi_env env) {
 }
 
 napi_value CreateDefaultFsConstants(napi_env env) {
-  napi_value fs_obj = CreatePlainObject(env);
+  napi_value fs_obj = CreateBestEffortNullProtoObject(env);
   if (!IsObjectLike(env, fs_obj)) return Undefined(env);
-  SetInt32(env, fs_obj, "F_OK", 0);
-  SetInt32(env, fs_obj, "R_OK", 4);
-  SetInt32(env, fs_obj, "W_OK", 2);
-  SetInt32(env, fs_obj, "X_OK", 1);
+#ifdef UV_FS_SYMLINK_DIR
+  SetInt32(env, fs_obj, "UV_FS_SYMLINK_DIR", UV_FS_SYMLINK_DIR);
+#endif
+#ifdef UV_FS_SYMLINK_JUNCTION
+  SetInt32(env, fs_obj, "UV_FS_SYMLINK_JUNCTION", UV_FS_SYMLINK_JUNCTION);
+#endif
+#ifdef O_RDONLY
+  SetInt32(env, fs_obj, "O_RDONLY", O_RDONLY);
+#endif
+#ifdef O_WRONLY
+  SetInt32(env, fs_obj, "O_WRONLY", O_WRONLY);
+#endif
+#ifdef O_RDWR
+  SetInt32(env, fs_obj, "O_RDWR", O_RDWR);
+#endif
+#ifdef UV_DIRENT_UNKNOWN
+  SetInt32(env, fs_obj, "UV_DIRENT_UNKNOWN", UV_DIRENT_UNKNOWN);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_UNKNOWN", 0);
+#endif
+#ifdef UV_DIRENT_FILE
+  SetInt32(env, fs_obj, "UV_DIRENT_FILE", UV_DIRENT_FILE);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_FILE", 1);
+#endif
+#ifdef UV_DIRENT_DIR
+  SetInt32(env, fs_obj, "UV_DIRENT_DIR", UV_DIRENT_DIR);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_DIR", 2);
+#endif
+#ifdef UV_DIRENT_LINK
+  SetInt32(env, fs_obj, "UV_DIRENT_LINK", UV_DIRENT_LINK);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_LINK", 3);
+#endif
+#ifdef UV_DIRENT_FIFO
+  SetInt32(env, fs_obj, "UV_DIRENT_FIFO", UV_DIRENT_FIFO);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_FIFO", 4);
+#endif
+#ifdef UV_DIRENT_SOCKET
+  SetInt32(env, fs_obj, "UV_DIRENT_SOCKET", UV_DIRENT_SOCKET);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_SOCKET", 5);
+#endif
+#ifdef UV_DIRENT_CHAR
+  SetInt32(env, fs_obj, "UV_DIRENT_CHAR", UV_DIRENT_CHAR);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_CHAR", 6);
+#endif
+#ifdef UV_DIRENT_BLOCK
+  SetInt32(env, fs_obj, "UV_DIRENT_BLOCK", UV_DIRENT_BLOCK);
+#else
+  SetInt32(env, fs_obj, "UV_DIRENT_BLOCK", 7);
+#endif
+#ifdef S_IFMT
+  SetInt32(env, fs_obj, "S_IFMT", S_IFMT);
+#endif
+#ifdef S_IFREG
+  SetInt32(env, fs_obj, "S_IFREG", S_IFREG);
+#endif
+#ifdef S_IFDIR
+  SetInt32(env, fs_obj, "S_IFDIR", S_IFDIR);
+#endif
+#ifdef S_IFCHR
+  SetInt32(env, fs_obj, "S_IFCHR", S_IFCHR);
+#endif
+#ifdef S_IFBLK
+  SetInt32(env, fs_obj, "S_IFBLK", S_IFBLK);
+#endif
+#ifdef S_IFIFO
+  SetInt32(env, fs_obj, "S_IFIFO", S_IFIFO);
+#endif
+#ifdef S_IFLNK
+  SetInt32(env, fs_obj, "S_IFLNK", S_IFLNK);
+#endif
+#ifdef S_IFSOCK
+  SetInt32(env, fs_obj, "S_IFSOCK", S_IFSOCK);
+#endif
+#ifdef O_CREAT
+  SetInt32(env, fs_obj, "O_CREAT", O_CREAT);
+#endif
+#ifdef O_EXCL
+  SetInt32(env, fs_obj, "O_EXCL", O_EXCL);
+#endif
+#ifdef UV_FS_O_FILEMAP
+  SetInt32(env, fs_obj, "UV_FS_O_FILEMAP", UV_FS_O_FILEMAP);
+#endif
+#ifdef O_NOCTTY
+  SetInt32(env, fs_obj, "O_NOCTTY", O_NOCTTY);
+#endif
+#ifdef O_TRUNC
+  SetInt32(env, fs_obj, "O_TRUNC", O_TRUNC);
+#endif
+#ifdef O_APPEND
+  SetInt32(env, fs_obj, "O_APPEND", O_APPEND);
+#endif
+#ifdef O_DIRECTORY
+  SetInt32(env, fs_obj, "O_DIRECTORY", O_DIRECTORY);
+#endif
+#ifdef O_NOATIME
+  SetInt32(env, fs_obj, "O_NOATIME", O_NOATIME);
+#endif
+#ifdef O_NOFOLLOW
+  SetInt32(env, fs_obj, "O_NOFOLLOW", O_NOFOLLOW);
+#endif
+#ifdef O_SYNC
+  SetInt32(env, fs_obj, "O_SYNC", O_SYNC);
+#endif
+#ifdef O_DSYNC
+  SetInt32(env, fs_obj, "O_DSYNC", O_DSYNC);
+#endif
+#ifdef O_SYMLINK
+  SetInt32(env, fs_obj, "O_SYMLINK", O_SYMLINK);
+#endif
+#ifdef O_DIRECT
+  SetInt32(env, fs_obj, "O_DIRECT", O_DIRECT);
+#endif
+#ifdef O_NONBLOCK
+  SetInt32(env, fs_obj, "O_NONBLOCK", O_NONBLOCK);
+#endif
+#ifdef S_IRWXU
+  SetInt32(env, fs_obj, "S_IRWXU", S_IRWXU);
+#endif
+#ifdef S_IRUSR
+  SetInt32(env, fs_obj, "S_IRUSR", S_IRUSR);
+#endif
+#ifdef S_IWUSR
+  SetInt32(env, fs_obj, "S_IWUSR", S_IWUSR);
+#endif
+#ifdef S_IXUSR
+  SetInt32(env, fs_obj, "S_IXUSR", S_IXUSR);
+#endif
+#ifdef S_IRWXG
+  SetInt32(env, fs_obj, "S_IRWXG", S_IRWXG);
+#endif
+#ifdef S_IRGRP
+  SetInt32(env, fs_obj, "S_IRGRP", S_IRGRP);
+#endif
+#ifdef S_IWGRP
+  SetInt32(env, fs_obj, "S_IWGRP", S_IWGRP);
+#endif
+#ifdef S_IXGRP
+  SetInt32(env, fs_obj, "S_IXGRP", S_IXGRP);
+#endif
+#ifdef S_IRWXO
+  SetInt32(env, fs_obj, "S_IRWXO", S_IRWXO);
+#endif
+#ifdef S_IROTH
+  SetInt32(env, fs_obj, "S_IROTH", S_IROTH);
+#endif
+#ifdef S_IWOTH
+  SetInt32(env, fs_obj, "S_IWOTH", S_IWOTH);
+#endif
+#ifdef S_IXOTH
+  SetInt32(env, fs_obj, "S_IXOTH", S_IXOTH);
+#endif
+#ifdef F_OK
+  SetInt32(env, fs_obj, "F_OK", F_OK);
+#endif
+#ifdef R_OK
+  SetInt32(env, fs_obj, "R_OK", R_OK);
+#endif
+#ifdef W_OK
+  SetInt32(env, fs_obj, "W_OK", W_OK);
+#endif
+#ifdef X_OK
+  SetInt32(env, fs_obj, "X_OK", X_OK);
+#endif
+#ifdef UV_FS_COPYFILE_EXCL
+  SetInt32(env, fs_obj, "UV_FS_COPYFILE_EXCL", UV_FS_COPYFILE_EXCL);
+  SetInt32(env, fs_obj, "COPYFILE_EXCL", UV_FS_COPYFILE_EXCL);
+#else
+  SetInt32(env, fs_obj, "UV_FS_COPYFILE_EXCL", 1);
+  SetInt32(env, fs_obj, "COPYFILE_EXCL", 1);
+#endif
+#ifdef UV_FS_COPYFILE_FICLONE
+  SetInt32(env, fs_obj, "UV_FS_COPYFILE_FICLONE", UV_FS_COPYFILE_FICLONE);
+  SetInt32(env, fs_obj, "COPYFILE_FICLONE", UV_FS_COPYFILE_FICLONE);
+#else
+  SetInt32(env, fs_obj, "UV_FS_COPYFILE_FICLONE", 2);
+  SetInt32(env, fs_obj, "COPYFILE_FICLONE", 2);
+#endif
+#ifdef UV_FS_COPYFILE_FICLONE_FORCE
+  SetInt32(env, fs_obj, "UV_FS_COPYFILE_FICLONE_FORCE", UV_FS_COPYFILE_FICLONE_FORCE);
+  SetInt32(env, fs_obj, "COPYFILE_FICLONE_FORCE", UV_FS_COPYFILE_FICLONE_FORCE);
+#else
+  SetInt32(env, fs_obj, "UV_FS_COPYFILE_FICLONE_FORCE", 4);
+  SetInt32(env, fs_obj, "COPYFILE_FICLONE_FORCE", 4);
+#endif
   return fs_obj;
 }
 
@@ -351,18 +541,6 @@ napi_value ResolveConstants(napi_env env, const ResolveOptions& options) {
     os_constants = options.callbacks.resolve_binding(env, options.state, "os_constants");
   }
   SetNamedObjectIfValid(env, out, "os", os_constants);
-
-  napi_value fs_binding = nullptr;
-  if (options.callbacks.resolve_binding != nullptr) {
-    fs_binding = options.callbacks.resolve_binding(env, options.state, "fs");
-  }
-  if (!IsUndefined(env, fs_binding) && IsObjectLike(env, fs_binding)) {
-    napi_value fs_constants_obj = nullptr;
-    if (napi_create_object(env, &fs_constants_obj) == napi_ok && fs_constants_obj != nullptr) {
-      CopyNumericOwnProperties(env, fs_binding, fs_constants_obj);
-      SetNamedObjectIfValid(env, out, "fs", fs_constants_obj);
-    }
-  }
 
   // Derive crypto constants from the native crypto binding surface to avoid
   // requiring JS modules while constants are initializing.
