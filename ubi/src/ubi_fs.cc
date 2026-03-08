@@ -132,6 +132,8 @@ bool ValueToDouble(napi_env env, napi_value value, double* out) {
   return false;
 }
 
+static bool IsNullOrUndefined(napi_env env, napi_value value);
+
 std::string PathFromValueUnchecked(napi_env env, napi_value value) {
   size_t length = 0;
   if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) {
@@ -950,8 +952,9 @@ napi_value BindingAccessSync(napi_env env, napi_callback_info info) {
   }
   std::string path = PathFromValue(env, argv[0]);
   if (path.empty()) return nullptr;
-  int32_t mode = 0;
-  if (argc >= 2 && napi_get_value_int32(env, argv[1], &mode) != napi_ok) {
+  int32_t mode = F_OK;
+  if (argc >= 2 && argv[1] != nullptr && !IsNullOrUndefined(env, argv[1]) &&
+      napi_get_value_int32(env, argv[1], &mode) != napi_ok) {
     return nullptr;
   }
   uv_fs_t req;
@@ -1719,8 +1722,11 @@ napi_value BindingAccess(napi_env env, napi_callback_info info) {
   }
   std::string path = PathFromValue(env, argv[0]);
   if (path.empty()) return nullptr;
-  int32_t mode = 0;
-  if (napi_get_value_int32(env, argv[1], &mode) != napi_ok) return nullptr;
+  int32_t mode = F_OK;
+  if (argv[1] != nullptr && !IsNullOrUndefined(env, argv[1]) &&
+      napi_get_value_int32(env, argv[1], &mode) != napi_ok) {
+    return nullptr;
+  }
   uv_fs_t req;
   int err = uv_fs_access(nullptr, &req, path.c_str(), mode, nullptr);
   uv_fs_req_cleanup(&req);

@@ -25,6 +25,7 @@
 #include "ubi_udp_wrap.h"
 #include "ubi_url.h"
 #include "ubi_util.h"
+#include "ubi_option_helpers.h"
 #include "internal_binding/dispatch.h"
 #include "builtin_catalog.h"
 
@@ -754,7 +755,12 @@ static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state)
 static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state);
 
 static const std::vector<std::string>& CollectRuntimeBuiltinIds() {
-  return builtin_catalog::AllBuiltinIds();
+  static const std::vector<std::string> ids = []() {
+    std::vector<std::string> out = builtin_catalog::AllBuiltinIds();
+    out.erase(std::remove(out.begin(), out.end(), "http2"), out.end());
+    return out;
+  }();
+  return ids;
 }
 
 static napi_value NoopCallback(napi_env env, napi_callback_info /*info*/) {
@@ -1340,6 +1346,121 @@ bool UseEnvProxyEnabledByEnvironment() {
   return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+static std::vector<std::string> GetEffectiveCliTokens(napi_env env) {
+  napi_value process = GetGlobalNamedProperty(env, "process");
+  std::vector<std::string> raw_exec_argv = GetStringArrayProperty(env, process, "execArgv");
+  const ubi_options::EffectiveCliState state = ubi_options::BuildEffectiveCliState(raw_exec_argv);
+  return state.ok ? state.effective_tokens : raw_exec_argv;
+}
+
+static bool LooksLikeCliOptionToken(const std::string& token) {
+  if (token == "--" || token == "-") return true;
+  if (token == "-c" || token == "--check" ||
+      token == "-e" || token == "--eval" ||
+      token == "-i" || token == "--interactive" ||
+      token == "-p" || token == "--print" ||
+      token == "-pe" || token == "-ep" ||
+      token == "-r" || token == "--require" ||
+      token == "--run") {
+    return true;
+  }
+  if (token.rfind("--no-", 0) == 0) return true;
+  if (token.rfind("--env-file=", 0) == 0 ||
+      token.rfind("--env-file-if-exists=", 0) == 0 ||
+      token.rfind("--experimental-config-file=", 0) == 0 ||
+      token.rfind("--input-type=", 0) == 0) {
+    return true;
+  }
+  const size_t eq = token.find('=');
+  const std::string key = eq == std::string::npos ? token : token.substr(0, eq);
+  static const std::unordered_set<std::string> kKnownOptions = {
+      "--allow-addons",
+      "--allow-child-process",
+      "--allow-fs-read",
+      "--allow-fs-write",
+      "--allow-inspector",
+      "--allow-wasi",
+      "--allow-worker",
+      "--check",
+      "--debug-port",
+      "--diagnostic-dir",
+      "--disable-warning",
+      "--dns-result-order",
+      "--entry-url",
+      "--env-file",
+      "--env-file-if-exists",
+      "--es-module-specifier-resolution",
+      "--eval",
+      "--experimental-config-file",
+      "--experimental-fetch",
+      "--experimental-global-customevent",
+      "--experimental-global-webcrypto",
+      "--experimental-import-meta-resolve",
+      "--experimental-loader",
+      "--experimental-report",
+      "--experimental-transform-types",
+      "--experimental-wasm-modules",
+      "--experimental-worker",
+      "--expose-internals",
+      "--heapsnapshot-signal",
+      "--icu-data-dir",
+      "--import",
+      "--input-type",
+      "--inspect-brk",
+      "--inspect-port",
+      "--interactive",
+      "--loader",
+      "--max-http-header-size",
+      "--network-family-autoselection",
+      "--no-deprecation",
+      "--no-node-snapshot",
+      "--node-snapshot",
+      "--openssl-config",
+      "--openssl-legacy-provider",
+      "--openssl-shared-config",
+      "--pending-deprecation",
+      "--permission",
+      "--preserve-symlinks",
+      "--preserve-symlinks-main",
+      "--print",
+      "--redirect-warnings",
+      "--report-on-signal",
+      "--require",
+      "--run",
+      "--secure-heap",
+      "--secure-heap-min",
+      "--stack-trace-limit",
+      "--test",
+      "--test-force-exit",
+      "--test-global-setup",
+      "--test-isolation",
+      "--test-only",
+      "--test-rerun-failures",
+      "--test-shard",
+      "--test-update-snapshots",
+      "--throw-deprecation",
+      "--tls-cipher-list",
+      "--tls-keylog",
+      "--trace-deprecation",
+      "--trace-require-module",
+      "--trace-sigint",
+      "--trace-tls",
+      "--trace-warnings",
+      "--unhandled-rejections",
+      "--use-bundled-ca",
+      "--use-env-proxy",
+      "--use-openssl-ca",
+      "--use-system-ca",
+      "--verify-base-objects",
+      "--warnings",
+      "--watch",
+      "--watch-kill-signal",
+      "--watch-path",
+      "--watch-preserve-output",
+  };
+  return kKnownOptions.find(key) != kKnownOptions.end();
+}
+
 static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback_info /*info*/) {
   napi_value out = CreateNullProtoObject(env);
   if (out == nullptr) {
@@ -1350,10 +1471,15 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
 
   const std::vector<const char*> bool_false = {
       "--abort-on-uncaught-exception",
+      "--allow-addons",
+      "--allow-child-process",
+      "--allow-inspector",
+      "--allow-wasi",
+      "--allow-worker",
+      "--check",
       "--enable-source-maps",
       "--entry-url",
       "--experimental-addon-modules",
-      "--experimental-config-file",
       "--experimental-default-config-file",
       "--experimental-detect-module",
       "--experimental-eventsource",
@@ -1382,6 +1508,7 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       "--frozen-intrinsics",
       "--insecure-http-parser",
       "--inspect-brk",
+      "--interactive",
       "--no-addons",
       "--no-deprecation",
       "--no-experimental-global-navigator",
@@ -1433,12 +1560,14 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       {"--dns-result-order", "verbatim"},
       {"--es-module-specifier-resolution", ""},
       {"--eval", ""},
+      {"--experimental-config-file", ""},
       {"--heapsnapshot-signal", ""},
       {"--icu-data-dir", ""},
       {"--input-type", ""},
       {"--localstorage-file", ""},
       {"--openssl-config", ""},
       {"--redirect-warnings", ""},
+      {"--run", ""},
       {"--test-global-setup", ""},
       {"--test-isolation", "process"},
       {"--test-rerun-failures", ""},
@@ -1462,13 +1591,8 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       {"--test-timeout", 0},
   };
   const std::vector<const char*> array_defaults = {
-      "--allow-addons",
-      "--allow-child-process",
       "--allow-fs-read",
       "--allow-fs-write",
-      "--allow-inspector",
-      "--allow-wasi",
-      "--allow-worker",
       "--conditions",
       "--disable-warning",
       "--env-file",
@@ -1493,13 +1617,8 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
   for (const char* key : array_defaults) SetArrayProperty(env, out, key);
 
   const std::unordered_map<std::string, bool> array_option_set = {
-      {"--allow-addons", true},
-      {"--allow-child-process", true},
       {"--allow-fs-read", true},
       {"--allow-fs-write", true},
-      {"--allow-inspector", true},
-      {"--allow-wasi", true},
-      {"--allow-worker", true},
       {"--conditions", true},
       {"--disable-warning", true},
       {"--env-file", true},
@@ -1519,65 +1638,128 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
   bool_option_set.reserve(bool_false.size() + bool_true.size());
   for (const char* key : bool_false) bool_option_set.emplace(key);
   for (const char* key : bool_true) bool_option_set.emplace(key);
+  std::unordered_set<std::string> string_option_set;
+  string_option_set.reserve(string_defaults.size());
+  for (const auto& [key, _] : string_defaults) string_option_set.emplace(key);
+  std::unordered_set<std::string> number_option_set;
+  number_option_set.reserve(number_defaults.size());
+  for (const auto& [key, _] : number_defaults) number_option_set.emplace(key);
   bool saw_use_env_proxy_cli = false;
 
-  napi_value process = GetGlobalNamedProperty(env, "process");
-  const std::vector<std::vector<std::string>> lists = {
-      GetStringArrayProperty(env, process, "execArgv"),
-      GetStringArrayProperty(env, process, "argv"),
-  };
+  const std::vector<std::string> tokens = GetEffectiveCliTokens(env);
+  for (size_t i = 0; i < tokens.size(); i++) {
+    const std::string& token = tokens[i];
+    if (token.empty() || token[0] != '-') continue;
 
-  for (const auto& list : lists) {
-    for (size_t i = 0; i < list.size(); i++) {
-      const std::string& token = list[i];
-      if (token.empty() || token[0] != '-') continue;
+    if (token == "-pe" || token == "-ep") {
+      SetBoolProperty(env, out, "--print", true);
+      if (i + 1 < tokens.size()) {
+        const std::string value = ubi_options::MaybeUnescapeLeadingDashOptionValue(tokens[i + 1]);
+        SetStringProperty(env, out, "--eval", value.c_str());
+        SetBoolProperty(env, out, "[has_eval_string]", true);
+        i++;
+      }
+      continue;
+    }
+    if (token == "-p" || token == "--print") {
+      SetBoolProperty(env, out, "--print", true);
+      if (i + 1 < tokens.size() && !LooksLikeCliOptionToken(tokens[i + 1])) {
+        const std::string value = ubi_options::MaybeUnescapeLeadingDashOptionValue(tokens[i + 1]);
+        SetStringProperty(env, out, "--eval", value.c_str());
+        SetBoolProperty(env, out, "[has_eval_string]", true);
+        i++;
+      }
+      continue;
+    }
+    if (token == "-e" || token == "--eval") {
+      if (i + 1 < tokens.size()) {
+        const std::string value = ubi_options::MaybeUnescapeLeadingDashOptionValue(tokens[i + 1]);
+        SetStringProperty(env, out, "--eval", value.c_str());
+        SetBoolProperty(env, out, "[has_eval_string]", true);
+        i++;
+      }
+      continue;
+    }
+    if (token == "-c") {
+      SetBoolProperty(env, out, "--check", true);
+      continue;
+    }
+    if (token == "-i") {
+      SetBoolProperty(env, out, "--interactive", true);
+      continue;
+    }
 
-      const size_t eq = token.find('=');
-      std::string key = (eq == std::string::npos) ? token : token.substr(0, eq);
-      const std::string raw = (eq == std::string::npos) ? "true" : token.substr(eq + 1);
+    const size_t eq = token.find('=');
+    std::string key = (eq == std::string::npos) ? token : token.substr(0, eq);
+    const std::string raw = (eq == std::string::npos) ? "" : token.substr(eq + 1);
 
-      if (key == "-r") key = "--require";
-      if (key == "--loader") key = "--experimental-loader";
+    if (key == "-r") key = "--require";
+    if (key == "--loader") key = "--experimental-loader";
 
-      const bool is_array_opt = array_option_set.find(key) != array_option_set.end();
-      if (is_array_opt) {
-        napi_value arr = nullptr;
-        if (napi_get_named_property(env, out, key.c_str(), &arr) != napi_ok || arr == nullptr) continue;
-        if (eq != std::string::npos) {
-          PushArrayString(env, arr, raw);
-        } else if (i + 1 < list.size()) {
-          const std::string& next = list[i + 1];
-          if (!next.empty() && next[0] != '-') {
-            PushArrayString(env, arr, next);
-            i++;
+    if (eq == std::string::npos && key.rfind("--no-", 0) == 0) {
+      if (bool_option_set.find(key) != bool_option_set.end()) {
+        SetBoolProperty(env, out, key.c_str(), true);
+        continue;
+      }
+      const std::string normalized = "--" + key.substr(5);
+      if (bool_option_set.find(normalized) != bool_option_set.end()) {
+        SetBoolProperty(env, out, normalized.c_str(), false);
+        if (normalized == "--use-env-proxy") saw_use_env_proxy_cli = true;
+      }
+      continue;
+    }
+
+    if (array_option_set.find(key) != array_option_set.end()) {
+      napi_value arr = nullptr;
+      if (napi_get_named_property(env, out, key.c_str(), &arr) != napi_ok || arr == nullptr) continue;
+      if (eq != std::string::npos) {
+        PushArrayString(env, arr, raw);
+      } else if (i + 1 < tokens.size()) {
+        PushArrayString(env, arr, ubi_options::MaybeUnescapeLeadingDashOptionValue(tokens[++i]));
+      }
+      continue;
+    }
+
+    if (eq == std::string::npos) {
+      if (bool_option_set.find(key) != bool_option_set.end()) {
+        SetBoolProperty(env, out, key.c_str(), true);
+        if (key == "--use-env-proxy") saw_use_env_proxy_cli = true;
+        continue;
+      }
+      if (string_option_set.find(key) != string_option_set.end()) {
+        if (i + 1 < tokens.size()) {
+          const std::string value = ubi_options::MaybeUnescapeLeadingDashOptionValue(tokens[++i]);
+          SetStringProperty(env, out, key.c_str(), value.c_str());
+        }
+        continue;
+      }
+      if (number_option_set.find(key) != number_option_set.end()) {
+        if (i + 1 < tokens.size()) {
+          double numeric = 0;
+          const std::string value = ubi_options::MaybeUnescapeLeadingDashOptionValue(tokens[++i]);
+          if (TryParseDouble(value, &numeric)) {
+            SetNumberProperty(env, out, key.c_str(), numeric);
           }
         }
         continue;
       }
+      continue;
+    }
 
-      if (eq == std::string::npos) {
-        if (key.rfind("--no-", 0) == 0) {
-          const std::string normalized = "--" + key.substr(5);
-          if (bool_option_set.find(normalized) != bool_option_set.end()) {
-            SetBoolProperty(env, out, normalized.c_str(), false);
-            if (normalized == "--use-env-proxy") saw_use_env_proxy_cli = true;
-            continue;
-          }
-        }
-        SetBoolProperty(env, out, key.c_str(), true);
-        if (key == "--use-env-proxy") saw_use_env_proxy_cli = true;
-      } else {
-        double numeric = 0;
-        if (TryParseDouble(raw, &numeric)) {
-          SetNumberProperty(env, out, key.c_str(), numeric);
-        } else {
-          SetStringProperty(env, out, key.c_str(), raw.c_str());
-        }
+    if (bool_option_set.find(key) != bool_option_set.end()) {
+      SetBoolProperty(env, out, key.c_str(), raw != "false" && raw != "0");
+      if (key == "--use-env-proxy") saw_use_env_proxy_cli = true;
+      continue;
+    }
+    if (number_option_set.find(key) != number_option_set.end()) {
+      double numeric = 0;
+      if (TryParseDouble(raw, &numeric)) {
+        SetNumberProperty(env, out, key.c_str(), numeric);
       }
-
-      if (key == "--eval" || key == "-e") {
-        SetBoolProperty(env, out, "[has_eval_string]", true);
-      }
+      continue;
+    }
+    if (string_option_set.find(key) != string_option_set.end()) {
+      SetStringProperty(env, out, key.c_str(), raw.c_str());
     }
   }
 
@@ -1693,20 +1875,6 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
   add_option("--stack-trace-limit");
   add_option("-r");
 
-  if (!IsTruthyNestedProperty(env, process, {"config", "variables", "v8_enable_i18n_support"})) {
-    seen.erase("--icu-data-dir");
-    // Same rebuild approach for stability.
-    napi_value rebuilt = CreateMapObject(env);
-    if (rebuilt != nullptr) {
-      for (const auto& [name, _] : seen) {
-        napi_value info = nullptr;
-        if (!make_info(&info)) continue;
-        MapSetStringKeyValue(env, rebuilt, name.c_str(), info);
-      }
-      options_map = rebuilt;
-    }
-  }
-
   napi_value require_alias = nullptr;
   if (napi_create_array_with_length(env, 1, &require_alias) == napi_ok && require_alias != nullptr) {
     napi_value require_string = nullptr;
@@ -1725,8 +1893,7 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
 }
 
 static napi_value OptionsGetOptionsAsFlagsCallback(napi_env env, napi_callback_info /*info*/) {
-  napi_value process = GetGlobalNamedProperty(env, "process");
-  std::vector<std::string> exec_argv = GetStringArrayProperty(env, process, "execArgv");
+  std::vector<std::string> exec_argv = GetEffectiveCliTokens(env);
   if (UseEnvProxyEnabledByEnvironment()) {
     const bool has_use_env_proxy =
         std::find(exec_argv.begin(), exec_argv.end(), "--use-env-proxy") != exec_argv.end();
@@ -2026,7 +2193,35 @@ static napi_value ModulesSaveCompileCacheEntryCallback(napi_env env, napi_callba
   return undefined;
 }
 
-static napi_value ModulesSetLazyPathHelpersCallback(napi_env env, napi_callback_info /*info*/) {
+static napi_value ModulesSetLazyPathHelpersCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
+    return UndefinedValue(env);
+  }
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) {
+    return UndefinedValue(env);
+  }
+
+  const std::string url = ValueToUtf8(env, argv[1]);
+  if (url.empty()) return UndefinedValue(env);
+
+  const std::string filename = ubi_path::NormalizeFileURLOrPath(url);
+  if (filename.empty()) return UndefinedValue(env);
+  const std::string dirname = fs::path(filename).parent_path().string();
+
+  napi_value filename_value = nullptr;
+  napi_value dirname_value = nullptr;
+  if (napi_create_string_utf8(env, filename.c_str(), filename.size(), &filename_value) != napi_ok ||
+      filename_value == nullptr ||
+      napi_create_string_utf8(env, dirname.c_str(), dirname.size(), &dirname_value) != napi_ok ||
+      dirname_value == nullptr) {
+    return UndefinedValue(env);
+  }
+
+  napi_set_named_property(env, argv[0], "filename", filename_value);
+  napi_set_named_property(env, argv[0], "dirname", dirname_value);
+
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;

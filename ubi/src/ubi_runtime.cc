@@ -69,6 +69,8 @@ std::string g_ubi_process_title;
 thread_local std::vector<std::string> g_ubi_script_argv;
 const auto g_process_start_time = std::chrono::steady_clock::now();
 std::once_flag g_process_stdio_init_once;
+constexpr int kExitCodeInvalidFatalExceptionMonkeyPatching = 6;
+constexpr int kExitCodeExceptionInFatalExceptionHandler = 7;
 
 enum class UbiBootstrapMode {
   kMainThread,
@@ -240,6 +242,17 @@ std::string FormatUncaughtExceptionForStderr(napi_env env,
                   caret + "\n\n" +
                   stack_message;
     }
+  } else {
+    bool check_syntax_mode = false;
+    for (const auto& arg : g_ubi_cli_exec_argv) {
+      if (arg == "--check" || arg == "-c") {
+        check_syntax_mode = true;
+        break;
+      }
+    }
+    if (check_syntax_mode && !g_ubi_current_script_path.empty()) {
+      formatted = g_ubi_current_script_path + "\n" + stack_message;
+    }
   }
 
   const std::string version = GetProcessVersion(env);
@@ -398,6 +411,42 @@ int GetProcessExitCodeOrZero(napi_env env) {
   return has_exit_code ? exit_code : 0;
 }
 
+bool SetProcessExitCodeIfNeeded(napi_env env, int exit_code, bool only_if_unset) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return false;
+  }
+  bool has_process = false;
+  if (napi_has_named_property(env, global, "process", &has_process) != napi_ok || !has_process) {
+    return false;
+  }
+  napi_value process_obj = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return false;
+  }
+  if (only_if_unset) {
+    bool has_exit_code = false;
+    if (napi_has_named_property(env, process_obj, "exitCode", &has_exit_code) == napi_ok && has_exit_code) {
+      napi_value existing = nullptr;
+      napi_valuetype type = napi_undefined;
+      if (napi_get_named_property(env, process_obj, "exitCode", &existing) == napi_ok &&
+          existing != nullptr &&
+          napi_typeof(env, existing, &type) == napi_ok &&
+          type != napi_undefined &&
+          type != napi_null) {
+        return true;
+      }
+    }
+  }
+
+  napi_value exit_code_value = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(exit_code), &exit_code_value) != napi_ok ||
+      exit_code_value == nullptr) {
+    return false;
+  }
+  return napi_set_named_property(env, process_obj, "exitCode", exit_code_value) == napi_ok;
+}
+
 bool EmitProcessLifecycleEvent(napi_env env, const char* event_name, int exit_code, bool skip_task_queues = false) {
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
@@ -443,8 +492,23 @@ bool EmitProcessLifecycleEvent(napi_env env, const char* event_name, int exit_co
   return UbiMakeCallbackWithFlags(env, process_obj, emit_fn, 2, args, &ignored, callback_flags) == napi_ok;
 }
 
-bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled_out) {
+int EmitProcessExitOnFatalException(napi_env env, int default_exit_code) {
+  (void)SetProcessExitCodeIfNeeded(env, default_exit_code, true);
+  const int exit_code_before_emit = GetProcessExitCodeOrZero(env);
+  (void)EmitProcessLifecycleEvent(env, "exit", exit_code_before_emit, true);
+  bool has_exit_code = false;
+  const int final_exit_code = GetProcessExitCode(env, &has_exit_code);
+  return has_exit_code ? final_exit_code : default_exit_code;
+}
+
+bool DispatchUncaughtException(napi_env env,
+                               napi_value exception,
+                               bool* handled_out,
+                               napi_value* effective_exception_out = nullptr,
+                               int* fatal_exit_code_out = nullptr) {
   if (handled_out != nullptr) *handled_out = false;
+  if (effective_exception_out != nullptr) *effective_exception_out = exception;
+  if (fatal_exit_code_out != nullptr) *fatal_exit_code_out = -1;
   if (exception == nullptr) return false;
   // Worker-thread environments should surface uncaught exceptions back to the
   // parent Worker object instead of running process._fatalException locally.
@@ -466,6 +530,9 @@ bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled
   }
   napi_valuetype fatal_type = napi_undefined;
   if (napi_typeof(env, fatal_exception_fn, &fatal_type) != napi_ok || fatal_type != napi_function) {
+    if (fatal_exit_code_out != nullptr) {
+      *fatal_exit_code_out = kExitCodeInvalidFatalExceptionMonkeyPatching;
+    }
     return false;
   }
 
@@ -482,11 +549,17 @@ bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
       napi_value pending = nullptr;
       if (napi_get_and_clear_last_exception(env, &pending) == napi_ok && pending != nullptr) {
+        if (effective_exception_out != nullptr) {
+          *effective_exception_out = pending;
+        }
         (void)napi_throw(env, pending);
       }
     }
     if (DebugExceptionsEnabled()) {
       std::cerr << "[ubi-exc] process._fatalException threw\n";
+    }
+    if (fatal_exit_code_out != nullptr) {
+      *fatal_exit_code_out = kExitCodeExceptionInFatalExceptionHandler;
     }
     if (handled_out != nullptr) *handled_out = false;
     return true;
@@ -528,7 +601,9 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   }
 
   bool handled = false;
-  (void)DispatchUncaughtException(env, exception, &handled);
+  napi_value effective_exception = exception;
+  int fatal_exit_code = -1;
+  (void)DispatchUncaughtException(env, exception, &handled, &effective_exception, &fatal_exit_code);
   if (handled) {
     if (DebugExceptionsEnabled()) {
       std::cerr << "[ubi-exc] handled async exception, continue loop\n";
@@ -536,14 +611,18 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
     return -1;
   }
 
+  const int exit_code = EmitProcessExitOnFatalException(
+      env,
+      fatal_exit_code >= 0 ? fatal_exit_code : 1);
+
   std::string exception_message;
-  const std::string enhanced_exception = UbiFormatFatalExceptionAfterInspector(env, exception);
+  const std::string enhanced_exception = UbiFormatFatalExceptionAfterInspector(env, effective_exception);
   if (!enhanced_exception.empty()) {
     exception_message = FormatUncaughtExceptionForStderr(env, enhanced_exception);
   }
   napi_value stack_value = nullptr;
   if (exception_message.empty() &&
-      napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok &&
+      napi_get_named_property(env, effective_exception, "stack", &stack_value) == napi_ok &&
       stack_value != nullptr) {
     napi_value stack_string = nullptr;
     if (napi_coerce_to_string(env, stack_value, &stack_string) == napi_ok && stack_string != nullptr) {
@@ -559,7 +638,8 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   }
   if (exception_message.empty()) {
     napi_value exception_string = nullptr;
-    if (napi_coerce_to_string(env, exception, &exception_string) == napi_ok && exception_string != nullptr) {
+    if (napi_coerce_to_string(env, effective_exception, &exception_string) == napi_ok &&
+        exception_string != nullptr) {
       size_t length = 0;
       if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) == napi_ok) {
         std::vector<char> buffer(length + 1, '\0');
@@ -577,7 +657,7 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   if (error_out != nullptr) {
     *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
   }
-  return 1;
+  return exit_code;
 }
 
 // Mirrors Node's native tick dispatch by preferring the task_queue callback
@@ -1066,9 +1146,7 @@ std::string EscapeForSingleQuotedJs(const std::string& in) {
 void ParseNodeStyleFlagsFromSource(const char* source_text) {
   g_ubi_exec_argv.clear();
   for (const auto& arg : g_ubi_cli_exec_argv) {
-    if (!arg.empty() && arg[0] == '-') {
-      g_ubi_exec_argv.push_back(arg);
-    }
+    g_ubi_exec_argv.push_back(arg);
   }
   g_ubi_process_title.clear();
   if (source_text == nullptr) return;
@@ -1264,6 +1342,20 @@ bool ExecArgvHasFlag(const char* flag) {
     if (arg == flag) return true;
   }
   return false;
+}
+
+bool ExecArgvHasAnyFlag(std::initializer_list<const char*> flags) {
+  for (const char* flag : flags) {
+    if (ExecArgvHasFlag(flag)) return true;
+  }
+  return false;
+}
+
+bool CliSourceRunsMainEntry(const char* source_text) {
+  if (source_text == nullptr) return false;
+  return std::strstr(source_text, "require('internal/main/") != nullptr ||
+         std::strstr(source_text, "require(\"internal/main/") != nullptr ||
+         std::strstr(source_text, "__ubi_skip_pre_execution__") != nullptr;
 }
 
 bool ShouldExposeGc() {
@@ -1548,7 +1640,7 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-  if (source_text == nullptr || source_text[0] == '\0') {
+  if (source_text == nullptr) {
     if (error_out != nullptr) {
       *error_out = "Empty script source";
     }
@@ -1837,7 +1929,11 @@ int RunScriptWithGlobals(napi_env env,
   }
 
   napi_value pre_execution_exports = nullptr;
-  if (mode != UbiBootstrapMode::kWorkerThread) {
+  const bool entry_script_bootstraps_main =
+      entry_script_path != nullptr && entry_script_path[0] != '\0';
+  const bool source_bootstraps_main =
+      entry_script_bootstraps_main || CliSourceRunsMainEntry(source_text);
+  if (mode != UbiBootstrapMode::kWorkerThread && !source_bootstraps_main) {
     if (!require_bootstrap_module_exports("internal/process/pre_execution", &pre_execution_exports) ||
         pre_execution_exports == nullptr) {
       if (error_out != nullptr) {
@@ -2064,16 +2160,14 @@ int RunScriptWithGlobals(napi_env env,
   const char* source_to_run = source_text;
   bool source_is_wrapper_factory = false;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
-    const std::string entry_path =
-        ubi_path::FromNamespacedPath(ubi_path::PathResolve({entry_script_path}));
-    const std::string escaped_entry = EscapeForSingleQuotedJs(entry_path);
+    const bool check_syntax_mode = ExecArgvHasAnyFlag({"--check", "-c"});
+    const std::string entry_main_module =
+        check_syntax_mode ? "internal/main/check_syntax" : "internal/main/run_main_module";
     entry_source =
         "(function(require, getInternalBinding, internalBinding){ try {"
-        "var __entry = require('path').resolve('" +
-        escaped_entry +
+        "require('" +
+        entry_main_module +
         "');"
-        "var __runMain = require('internal/modules/run_main');"
-        "__runMain.executeUserEntryPoint(__entry);"
         "var __ib = (typeof getInternalBinding === 'function') ? getInternalBinding : "
         "           ((typeof internalBinding === 'function') ? internalBinding : null);"
         "if (__ib) {"
@@ -2293,14 +2387,15 @@ bool UbiHandlePendingExceptionNow(napi_env env, bool* handled_out) {
   }
 
   bool handled = false;
-  const bool dispatched = DispatchUncaughtException(env, exception, &handled);
+  napi_value effective_exception = exception;
+  const bool dispatched = DispatchUncaughtException(env, exception, &handled, &effective_exception, nullptr);
   if (!dispatched || !handled) {
     bool has_pending = false;
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
       if (handled_out != nullptr) *handled_out = false;
       return true;
     }
-    (void)napi_throw(env, exception);
+    (void)napi_throw(env, effective_exception != nullptr ? effective_exception : exception);
     if (handled_out != nullptr) *handled_out = false;
     return true;
   }
@@ -2392,17 +2487,22 @@ int UbiRunScriptFileWithLoop(napi_env env,
   if (error_out != nullptr) {
     error_out->clear();
   }
-  std::string source;
-  if (!ReadTextFile(script_path, &source)) {
-    if (error_out != nullptr) {
-      std::string details = "Failed to read script file";
-      if (script_path != nullptr && script_path[0] != '\0') {
-        details += ": ";
-        details += script_path;
+  const bool check_syntax_mode =
+      ExecArgvHasFlagIn(g_ubi_cli_exec_argv, "--check") ||
+      ExecArgvHasFlagIn(g_ubi_cli_exec_argv, "-c");
+  std::string source = ";";
+  if (!check_syntax_mode) {
+    if (!ReadTextFile(script_path, &source)) {
+      if (error_out != nullptr) {
+        std::string details = "Failed to read script file";
+        if (script_path != nullptr && script_path[0] != '\0') {
+          details += ": ";
+          details += script_path;
+        }
+        *error_out = std::move(details);
       }
-      *error_out = std::move(details);
+      return 1;
     }
-    return 1;
   }
   g_ubi_current_script_path = script_path;
   std::string restore_cwd;

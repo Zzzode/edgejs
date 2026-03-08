@@ -1112,11 +1112,8 @@ bool ValidateCopyFileModeArg(napi_env env, napi_value value, int32_t* mode_out) 
 
 bool ValidateAccessModeArg(napi_env env, napi_value value, int32_t* mode_out) {
   if (mode_out == nullptr) return false;
-  *mode_out = 0;
-  if (value == nullptr) {
-    ThrowInvalidNumberArgType(env, "mode", value);
-    return false;
-  }
+  *mode_out = F_OK;
+  if (value == nullptr || IsNullOrUndefined(env, value)) return true;
   napi_valuetype type = napi_undefined;
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) {
     ThrowInvalidNumberArgType(env, "mode", value);

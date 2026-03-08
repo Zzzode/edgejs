@@ -42,6 +42,7 @@ napi_value ResolvePipeWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveProcessMethods(napi_env env, const ResolveOptions& options);
 napi_value ResolveProcessWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveReport(napi_env env, const ResolveOptions& options);
+napi_value ResolveSea(napi_env env, const ResolveOptions& options);
 napi_value ResolveSignalWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveSerdes(napi_env env, const ResolveOptions& options);
 napi_value ResolveSpawnSync(napi_env env, const ResolveOptions& options);
@@ -74,7 +75,7 @@ struct BindingResolverEntry {
   ResolverFn resolver;
 };
 
-constexpr std::array<BindingResolverEntry, 57> kResolvers = {{
+constexpr std::array<BindingResolverEntry, 58> kResolvers = {{
     {"async_wrap", ResolveAsyncWrap},
     {"async_context_frame", ResolveAsyncContextFrame},
     {"block_list", ResolveBlockList},
@@ -110,6 +111,7 @@ constexpr std::array<BindingResolverEntry, 57> kResolvers = {{
     {"process_methods", ResolveProcessMethods},
     {"process_wrap", ResolveProcessWrap},
     {"report", ResolveReport},
+    {"sea", ResolveSea},
     {"serdes", ResolveSerdes},
     {"signal_wrap", ResolveSignalWrap},
     {"spawn_sync", ResolveSpawnSync},

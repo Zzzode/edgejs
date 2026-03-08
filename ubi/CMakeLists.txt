@@ -374,6 +374,7 @@ add_library(ubi_runtime STATIC
   src/builtin_catalog.cc
   src/ubi_runtime.cc
   src/ubi_runtime_platform_v8.cc
+  src/ubi_node_compat.cc
   src/ubi_process.cc
   src/ubi_active_resource.cc
   src/ubi_module_loader.cc
@@ -413,6 +414,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_process_methods.cc
   src/internal_binding/binding_process_wrap.cc
   src/internal_binding/binding_report.cc
+  src/internal_binding/binding_sea.cc
   src/internal_binding/binding_serdes.cc
   src/internal_binding/binding_signal_wrap.cc
   src/internal_binding/binding_spawn_sync.cc

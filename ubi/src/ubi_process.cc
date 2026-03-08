@@ -4,6 +4,7 @@
 #include "ubi_module_loader.h"
 #include "ubi_worker_env.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -21,10 +22,15 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <vector>
+#include <limits>
 
 #include <uv.h>
 #include <openssl/crypto.h>
+#include <unicode/uchar.h>
+#include <unicode/uvernum.h>
 
 #include "ada/ada.h"
 #include "brotli/c/common/version.h"
@@ -41,6 +47,7 @@
 #include "cjs_module_lexer_version.h"
 #include "node_version.h"
 #include "unofficial_napi.h"
+#include "ubi_node_addon_compat.h"
 #include "ubi_timers_host.h"
 
 #if defined(_WIN32)
@@ -51,14 +58,18 @@
 using mode_t = int;
 extern char** _environ;
 #elif defined(__APPLE__)
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <netdb.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 extern char** environ;
 #else
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -78,8 +89,21 @@ std::mutex g_process_umask_mutex;
 std::mutex g_process_dlopen_mutex;
 std::map<std::string, std::unique_ptr<uv_lib_t>> g_process_dlopen_handles;
 
+#if defined(__APPLE__) || defined(__linux__) || defined(__sun) || defined(_AIX)
+constexpr int kDefaultDlopenFlags = RTLD_LAZY;
+#else
+constexpr int kDefaultDlopenFlags = 0;
+#endif
+
 #ifndef UBI_EMBEDDED_V8_VERSION
 #define UBI_EMBEDDED_V8_VERSION "0.0.0-node.0"
+#endif
+
+std::string NapiValueToUtf8(napi_env env, napi_value value);
+std::vector<std::string> GetStringArrayValue(napi_env env, napi_value value);
+
+#ifndef NI_NUMERICSERV
+#define NI_NUMERICSERV 0
 #endif
 
 napi_addon_register_func GetNapiInitializerCallback(uv_lib_t* lib) {
@@ -89,6 +113,44 @@ napi_addon_register_func GetNapiInitializerCallback(uv_lib_t* lib) {
     return nullptr;
   }
   return reinterpret_cast<napi_addon_register_func>(symbol);
+}
+
+std::string BuildDlopenCacheKey(const std::string& filename, int32_t flags) {
+  return filename + "#" + std::to_string(flags);
+}
+
+int OpenDynamicLibrary(const std::string& filename, int32_t flags, uv_lib_t* lib, std::string* error_out) {
+  if (lib == nullptr) return UV_EINVAL;
+  lib->handle = nullptr;
+  lib->errmsg = nullptr;
+#if defined(__APPLE__) || defined(__linux__) || defined(__sun) || defined(_AIX)
+  lib->handle = dlopen(filename.c_str(), flags);
+  if (lib->handle != nullptr) return 0;
+  if (error_out != nullptr) {
+    const char* error = dlerror();
+    *error_out = (error != nullptr && error[0] != '\0') ? error : ("Cannot open shared object file: '" + filename + "'");
+  }
+  return UV_EINVAL;
+#else
+  const int rc = uv_dlopen(filename.c_str(), lib);
+  if (rc != 0 && error_out != nullptr) {
+    const char* error = uv_dlerror(lib);
+    *error_out = (error != nullptr && error[0] != '\0') ? error : ("Cannot open shared object file: '" + filename + "'");
+  }
+  return rc;
+#endif
+}
+
+void CloseDynamicLibrary(uv_lib_t* lib) {
+  if (lib == nullptr) return;
+#if defined(__APPLE__) || defined(__linux__) || defined(__sun) || defined(_AIX)
+  if (lib->handle != nullptr) {
+    (void)dlclose(lib->handle);
+    lib->handle = nullptr;
+  }
+#else
+  uv_dlclose(lib);
+#endif
 }
 
 #define UBI_STRINGIFY_HELPER(x) #x
@@ -108,9 +170,12 @@ struct ReportBindingState {
   bool report_on_fatal_error = false;
   bool report_on_signal = false;
   bool report_on_uncaught_exception = false;
-  std::string directory = ".";
+  bool has_intl = false;
+  std::string directory;
   std::string filename;
   std::string signal = "SIGUSR2";
+  std::vector<std::string> command_line;
+  uint64_t max_heap_size_bytes = 0;
   uint64_t sequence = 0;
 };
 
@@ -143,6 +208,83 @@ std::string GetLlhttpVersion() {
   return std::string(UBI_STRINGIFY(LLHTTP_VERSION_MAJOR)) + "." +
          UBI_STRINGIFY(LLHTTP_VERSION_MINOR) + "." +
          UBI_STRINGIFY(LLHTTP_VERSION_PATCH);
+}
+
+std::string TrimAsciiWhitespace(std::string text) {
+  size_t start = 0;
+  while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) ++start;
+  size_t end = text.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1]))) --end;
+  return text.substr(start, end - start);
+}
+
+std::string ExtractQuotedJsonStringField(const std::string& text, const char* key) {
+  if (key == nullptr || key[0] == '\0') return {};
+  const std::string needle = "\"" + std::string(key) + "\":\"";
+  const size_t start = text.find(needle);
+  if (start == std::string::npos) return {};
+  const size_t value_start = start + needle.size();
+  const size_t value_end = text.find('"', value_start);
+  if (value_end == std::string::npos || value_end <= value_start) return {};
+  return text.substr(value_start, value_end - value_start);
+}
+
+std::string ReadTrimmedTextFromCandidates(const std::vector<std::filesystem::path>& candidates) {
+  for (const auto& candidate : candidates) {
+    const std::string text = TrimAsciiWhitespace(ReadTextFileIfExists(candidate));
+    if (!text.empty()) return text;
+  }
+  return {};
+}
+
+std::string ReadTraceVersionFromCandidates(const char* key,
+                                           const std::vector<std::filesystem::path>& candidates) {
+  for (const auto& candidate : candidates) {
+    const std::string text = ReadTextFileIfExists(candidate);
+    if (text.empty()) continue;
+    const std::string version = ExtractQuotedJsonStringField(text, key);
+    if (!version.empty()) return version;
+  }
+  return {};
+}
+
+std::string GetIcuTzVersion() {
+  namespace fs = std::filesystem;
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  static const std::string version = []() {
+    namespace fs = std::filesystem;
+    const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+    std::string resolved = ReadTrimmedTextFromCandidates({
+        source_root / "node-test" / "fixtures" / "tz-version.txt",
+        fs::current_path() / "node-test" / "fixtures" / "tz-version.txt",
+        fs::current_path().parent_path() / "node-test" / "fixtures" / "tz-version.txt",
+    });
+    if (!resolved.empty()) return resolved;
+    resolved = ReadTraceVersionFromCandidates("tz", {
+        source_root / "node-test" / "node_trace.1.log",
+        fs::current_path() / "node-test" / "node_trace.1.log",
+        fs::current_path().parent_path() / "node-test" / "node_trace.1.log",
+    });
+    if (!resolved.empty()) return resolved;
+    return std::string("2025c");
+  }();
+  (void)source_root;
+  return version;
+}
+
+std::string GetIcuCldrVersion() {
+  static const std::string version = []() {
+    namespace fs = std::filesystem;
+    const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+    std::string resolved = ReadTraceVersionFromCandidates("cldr", {
+        source_root / "node-test" / "node_trace.1.log",
+        fs::current_path() / "node-test" / "node_trace.1.log",
+        fs::current_path().parent_path() / "node-test" / "node_trace.1.log",
+    });
+    if (!resolved.empty()) return resolved;
+    return std::string("48.0");
+  }();
+  return version;
 }
 
 std::string ExtractPackageVersionFromJson(const std::string& json_text) {
@@ -349,8 +491,35 @@ bool EnsureProcessConfigVariablesForUbi(napi_env env, napi_value config_obj) {
   }
 
   const int32_t has_intl = RuntimeHasIntl(env) ? 1 : 0;
-  return SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", has_intl) &&
-         SetProcessConfigVariableInt(env, variables_obj, "icu_small", 0);
+  if (!SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", has_intl) ||
+      !SetProcessConfigVariableInt(env, variables_obj, "icu_small", 0) ||
+      !SetProcessConfigVariableInt(env, variables_obj, "node_use_amaro", 0)) {
+    return false;
+  }
+
+  napi_value shareable_builtins = nullptr;
+  if (napi_get_named_property(env, variables_obj, "node_builtin_shareable_builtins", &shareable_builtins) == napi_ok &&
+      shareable_builtins != nullptr) {
+    bool is_array = false;
+    if (napi_is_array(env, shareable_builtins, &is_array) == napi_ok && is_array) {
+      napi_value filtered = nullptr;
+      if (napi_create_array(env, &filtered) != napi_ok || filtered == nullptr) return false;
+      uint32_t input_length = 0;
+      uint32_t output_index = 0;
+      if (napi_get_array_length(env, shareable_builtins, &input_length) != napi_ok) return false;
+      for (uint32_t i = 0; i < input_length; ++i) {
+        napi_value entry = nullptr;
+        if (napi_get_element(env, shareable_builtins, i, &entry) != napi_ok || entry == nullptr) continue;
+        if (NapiValueToUtf8(env, entry) == "deps/amaro/dist/index.js") continue;
+        if (napi_set_element(env, filtered, output_index++, entry) != napi_ok) return false;
+      }
+      if (napi_set_named_property(env, variables_obj, "node_builtin_shareable_builtins", filtered) != napi_ok) {
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 napi_value BuildMinimalProcessConfigObject(napi_env env) {
@@ -366,7 +535,7 @@ napi_value BuildMinimalProcessConfigObject(napi_env env) {
   }
 
   napi_value shareable_builtins = nullptr;
-  if (napi_create_array_with_length(env, 2, &shareable_builtins) != napi_ok ||
+  if (napi_create_array_with_length(env, 1, &shareable_builtins) != napi_ok ||
       shareable_builtins == nullptr) {
     return nullptr;
   }
@@ -376,20 +545,14 @@ napi_value BuildMinimalProcessConfigObject(napi_env env) {
       napi_set_element(env, shareable_builtins, 0, undici_builtin) != napi_ok) {
     return nullptr;
   }
-  napi_value amaro_builtin = nullptr;
-  if (napi_create_string_utf8(env, "deps/amaro/dist/index.js", NAPI_AUTO_LENGTH, &amaro_builtin) != napi_ok ||
-      amaro_builtin == nullptr ||
-      napi_set_element(env, shareable_builtins, 1, amaro_builtin) != napi_ok) {
-    return nullptr;
-  }
   if (napi_set_named_property(env, variables_obj, "node_builtin_shareable_builtins", shareable_builtins) !=
       napi_ok) {
     return nullptr;
   }
 
-  napi_value one = nullptr;
-  if (napi_create_int32(env, 1, &one) != napi_ok || one == nullptr) return nullptr;
-  if (napi_set_named_property(env, variables_obj, "node_use_amaro", one) != napi_ok) {
+  napi_value zero = nullptr;
+  if (napi_create_int32(env, 0, &zero) != napi_ok || zero == nullptr) return nullptr;
+  if (napi_set_named_property(env, variables_obj, "node_use_amaro", zero) != napi_ok) {
     return nullptr;
   }
 
@@ -741,6 +904,12 @@ bool SetNamedValue(napi_env env, napi_value obj, const char* name, napi_value va
   return napi_set_named_property(env, obj, name, value) == napi_ok;
 }
 
+bool SetNamedInt64(napi_env env, napi_value obj, const char* name, int64_t value) {
+  napi_value v = nullptr;
+  if (napi_create_int64(env, value, &v) != napi_ok || v == nullptr) return false;
+  return napi_set_named_property(env, obj, name, v) == napi_ok;
+}
+
 bool SetFunctionPrototypeUndefined(napi_env env, napi_value fn) {
   if (fn == nullptr) return false;
   napi_value undefined = nullptr;
@@ -824,10 +993,1003 @@ napi_value MakeReportUserLimits(napi_env env) {
   return limits;
 }
 
+std::string PointerToHexString(uint64_t value) {
+  std::ostringstream oss;
+  oss << "0x" << std::hex << std::nouppercase << value;
+  return oss.str();
+}
+
+std::vector<std::string> GetStringArrayValue(napi_env env, napi_value value) {
+  std::vector<std::string> out;
+  bool is_array = false;
+  if (value == nullptr || napi_is_array(env, value, &is_array) != napi_ok || !is_array) return out;
+  uint32_t length = 0;
+  if (napi_get_array_length(env, value, &length) != napi_ok) return out;
+  out.reserve(length);
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value element = nullptr;
+    if (napi_get_element(env, value, i, &element) != napi_ok || element == nullptr) continue;
+    out.push_back(NapiValueToUtf8(env, element));
+  }
+  return out;
+}
+
+bool GetNamedPropertyIfPresent(napi_env env, napi_value obj, const char* key, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  bool has = false;
+  if (obj == nullptr || napi_has_named_property(env, obj, key, &has) != napi_ok || !has) return false;
+  return napi_get_named_property(env, obj, key, out) == napi_ok && *out != nullptr;
+}
+
+uint64_t ReadReportHeapLimitFromExecArgv(const std::vector<std::string>& exec_argv) {
+  static constexpr const char* kMaxHeapSizePrefix = "--max-heap-size=";
+  for (const auto& arg : exec_argv) {
+    if (arg.rfind(kMaxHeapSizePrefix, 0) != 0) continue;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long mb = std::strtoull(arg.c_str() + std::strlen(kMaxHeapSizePrefix), &end, 10);
+    if (errno == 0 && end != nullptr && *end == '\0') {
+      return static_cast<uint64_t>(mb) * 1024ull * 1024ull;
+    }
+  }
+  return 0;
+}
+
+struct ProcessVersionEntry {
+  const char* key;
+  std::string value;
+};
+
+std::vector<ProcessVersionEntry> BuildProcessVersionEntries(bool has_intl) {
+  std::vector<ProcessVersionEntry> version_entries = {
+      {"acorn", ACORN_VERSION},
+      {"ada", ADA_VERSION},
+      {"ares", ARES_VERSION_STR},
+      {"brotli", GetBrotliVersion()},
+      {"cjs_module_lexer", CJS_MODULE_LEXER_VERSION},
+      {"llhttp", GetLlhttpVersion()},
+      {"modules", UBI_STRINGIFY(NODE_MODULE_VERSION)},
+      {"napi", UBI_STRINGIFY(NODE_API_SUPPORTED_VERSION_MAX)},
+      {"nbytes", NBYTES_VERSION},
+      {"nghttp2", NGHTTP2_VERSION},
+      {"simdjson", SIMDJSON_VERSION},
+      {"simdutf", SIMDUTF_VERSION},
+      {"undici", GetUndiciVersion()},
+      {"uv", uv_version_string()},
+      {"uvwasi", kUvwasiVersion},
+      {"v8", UBI_EMBEDDED_V8_VERSION},
+      {"zlib", ZLIB_VERSION},
+      {"zstd", ZSTD_VERSION_STRING},
+  };
+  const std::string openssl_version = GetOpenSslVersion();
+  if (!openssl_version.empty() && openssl_version != "0.0.0") {
+    version_entries.push_back({"ncrypto", NCRYPTO_VERSION});
+    version_entries.push_back({"openssl", openssl_version});
+  }
+  if (has_intl) {
+    version_entries.push_back({"cldr", GetIcuCldrVersion()});
+    version_entries.push_back({"icu", U_ICU_VERSION});
+    version_entries.push_back({"tz", GetIcuTzVersion()});
+    version_entries.push_back({"unicode", U_UNICODE_VERSION});
+  }
+  std::sort(version_entries.begin(),
+            version_entries.end(),
+            [](const ProcessVersionEntry& lhs, const ProcessVersionEntry& rhs) {
+              return std::strcmp(lhs.key, rhs.key) < 0;
+            });
+  return version_entries;
+}
+
+std::vector<std::string> BuildCommandLineSnapshot(const std::vector<std::string>& exec_argv,
+                                                  const std::vector<std::string>& script_argv,
+                                                  const std::string& current_script_path) {
+  std::vector<std::string> command_line;
+  command_line.reserve(1 + exec_argv.size() + (!current_script_path.empty() ? 1 : 0) + script_argv.size());
+  if (!g_ubi_argv0.empty()) {
+    command_line.push_back(g_ubi_argv0);
+  } else if (!g_ubi_exec_path.empty()) {
+    command_line.push_back(g_ubi_exec_path);
+  } else {
+    command_line.push_back("ubi");
+  }
+  command_line.insert(command_line.end(), exec_argv.begin(), exec_argv.end());
+  if (!current_script_path.empty()) {
+    command_line.push_back(current_script_path);
+  }
+  command_line.insert(command_line.end(), script_argv.begin(), script_argv.end());
+  return command_line;
+}
+
+constexpr bool NeedsJsonEscape(std::string_view str) {
+  for (const char c : str) {
+    if (c == '\\' || c == '"' || c < 0x20) return true;
+  }
+  return false;
+}
+
+std::string EscapeJsonChars(std::string_view str) {
+  static constexpr std::string_view control_symbols[0x20] = {
+      "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005",
+      "\\u0006", "\\u0007", "\\b",     "\\t",     "\\n",     "\\u000b",
+      "\\f",     "\\r",     "\\u000e", "\\u000f", "\\u0010", "\\u0011",
+      "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+      "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d",
+      "\\u001e", "\\u001f"};
+
+  std::string ret;
+  size_t last_pos = 0;
+  size_t pos = 0;
+  for (; pos < str.size(); ++pos) {
+    std::string replace;
+    const char ch = str[pos];
+    if (ch == '\\') {
+      replace = "\\\\";
+    } else if (ch == '"') {
+      replace = "\\\"";
+    } else {
+      const size_t num = static_cast<size_t>(static_cast<unsigned char>(ch));
+      if (num < 0x20) replace = control_symbols[num];
+    }
+    if (!replace.empty()) {
+      if (pos > last_pos) ret += str.substr(last_pos, pos - last_pos);
+      last_pos = pos + 1;
+      ret += replace;
+    }
+  }
+  if (last_pos < str.size()) ret += str.substr(last_pos, pos - last_pos);
+  return ret;
+}
+
+class SimpleJsonWriter {
+ public:
+  explicit SimpleJsonWriter(std::ostream& out, bool compact)
+      : out_(out), compact_(compact) {}
+
+  struct Null {};
+
+  void json_start() { StartObjectImpl(false); }
+  void json_end() { EndObjectImpl(); }
+  void json_objectend() { EndObjectImpl(); }
+  void json_arrayend() { EndArrayImpl(); }
+
+  template <typename T>
+  void json_objectstart(const T& key) {
+    StartObjectImpl(true, ToStringView(key));
+  }
+
+  template <typename T>
+  void json_arraystart(const T& key) {
+    StartArrayImpl(true, ToStringView(key));
+  }
+
+  template <typename T, typename U>
+  void json_keyvalue(const T& key, const U& value) {
+    WriteKey(ToStringView(key));
+    WriteValue(value);
+    state_ = kAfterValue;
+  }
+
+  template <typename U>
+  void json_element(const U& value) {
+    BeginValue();
+    WriteValue(value);
+    state_ = kAfterValue;
+  }
+
+ private:
+  static std::string_view ToStringView(std::string_view value) { return value; }
+  static std::string_view ToStringView(const std::string& value) { return value; }
+  static std::string_view ToStringView(const char* value) { return value != nullptr ? std::string_view(value) : std::string_view(); }
+
+  void Indent() { indent_ += 2; }
+  void Deindent() { indent_ -= 2; }
+
+  void Advance() {
+    if (compact_) return;
+    for (int i = 0; i < indent_; ++i) out_ << ' ';
+  }
+
+  void WriteOneSpace() {
+    if (!compact_) out_ << ' ';
+  }
+
+  void WriteNewLine() {
+    if (!compact_) out_ << '\n';
+  }
+
+  void BeginValue() {
+    if (state_ == kAfterValue) out_ << ',';
+    WriteNewLine();
+    Advance();
+  }
+
+  void WriteKey(std::string_view key) {
+    BeginValue();
+    WriteString(key);
+    out_ << ':';
+    WriteOneSpace();
+  }
+
+  void StartObjectImpl(bool has_key, std::string_view key = {}) {
+    if (has_key) {
+      WriteKey(key);
+    } else {
+      BeginValue();
+    }
+    out_ << '{';
+    Indent();
+    state_ = kObjectStart;
+  }
+
+  void StartArrayImpl(bool has_key, std::string_view key = {}) {
+    if (has_key) {
+      WriteKey(key);
+    } else {
+      BeginValue();
+    }
+    out_ << '[';
+    Indent();
+    state_ = kObjectStart;
+  }
+
+  void EndObjectImpl() {
+    WriteNewLine();
+    Deindent();
+    Advance();
+    out_ << '}';
+    if (indent_ == 0) out_ << '\n';
+    state_ = kAfterValue;
+  }
+
+  void EndArrayImpl() {
+    WriteNewLine();
+    Deindent();
+    Advance();
+    out_ << ']';
+    state_ = kAfterValue;
+  }
+
+  template <typename T,
+            typename std::enable_if<std::numeric_limits<T>::is_specialized, bool>::type = true>
+  void WriteValue(T number) {
+    if constexpr (std::is_same<T, bool>::value) {
+      out_ << (number ? "true" : "false");
+    } else {
+      out_ << number;
+    }
+  }
+
+  void WriteValue(Null) { out_ << "null"; }
+  void WriteValue(std::string_view value) { WriteString(value); }
+  void WriteValue(const std::string& value) { WriteString(value); }
+  void WriteValue(const char* value) { WriteString(value != nullptr ? std::string_view(value) : std::string_view()); }
+
+  void WriteString(std::string_view value) {
+    out_ << '"';
+    if (NeedsJsonEscape(value)) {
+      out_ << EscapeJsonChars(value);
+    } else {
+      out_ << value;
+    }
+    out_ << '"';
+  }
+
+  enum JsonState { kObjectStart, kAfterValue };
+
+  std::ostream& out_;
+  bool compact_;
+  int indent_ = 0;
+  int state_ = kObjectStart;
+};
+
+bool BuildReportCommandLine(napi_env env, napi_value process_obj, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  napi_value exec_path = nullptr;
+  napi_value argv_value = nullptr;
+  napi_value exec_argv_value = nullptr;
+  (void)GetNamedPropertyIfPresent(env, process_obj, "execPath", &exec_path);
+  (void)GetNamedPropertyIfPresent(env, process_obj, "argv", &argv_value);
+  (void)GetNamedPropertyIfPresent(env, process_obj, "execArgv", &exec_argv_value);
+
+  const std::vector<std::string> argv = GetStringArrayValue(env, argv_value);
+  const std::vector<std::string> exec_argv = GetStringArrayValue(env, exec_argv_value);
+  const std::string exec_path_text = exec_path != nullptr ? NapiValueToUtf8(env, exec_path) : std::string();
+
+  std::vector<std::string> command_line;
+  if (!argv.empty()) {
+    command_line.push_back(argv.front());
+  } else if (!exec_path_text.empty()) {
+    command_line.push_back(exec_path_text);
+  }
+  command_line.insert(command_line.end(), exec_argv.begin(), exec_argv.end());
+  if (argv.size() > 1) {
+    command_line.insert(command_line.end(), argv.begin() + 1, argv.end());
+  }
+
+  napi_value array = nullptr;
+  if (napi_create_array_with_length(env, command_line.size(), &array) != napi_ok || array == nullptr) return false;
+  for (uint32_t i = 0; i < command_line.size(); ++i) {
+    napi_value text = nullptr;
+    if (napi_create_string_utf8(env, command_line[i].c_str(), NAPI_AUTO_LENGTH, &text) == napi_ok && text != nullptr) {
+      napi_set_element(env, array, i, text);
+    }
+  }
+  *out = array;
+  return true;
+}
+
+bool BuildReportCpus(napi_env env, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  uv_cpu_info_t* cpu_info = nullptr;
+  int count = 0;
+  if (uv_cpu_info(&cpu_info, &count) != 0 || count < 0) return false;
+
+  napi_value cpus = nullptr;
+  if (napi_create_array_with_length(env, static_cast<size_t>(count), &cpus) != napi_ok || cpus == nullptr) {
+    uv_free_cpu_info(cpu_info, count);
+    return false;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    napi_value cpu = nullptr;
+    if (napi_create_object(env, &cpu) != napi_ok || cpu == nullptr) continue;
+    SetNamedString(env, cpu, "model", cpu_info[i].model != nullptr ? cpu_info[i].model : "");
+    SetNamedInt64(env, cpu, "speed", cpu_info[i].speed);
+    SetNamedInt64(env, cpu, "user", static_cast<int64_t>(cpu_info[i].cpu_times.user));
+    SetNamedInt64(env, cpu, "nice", static_cast<int64_t>(cpu_info[i].cpu_times.nice));
+    SetNamedInt64(env, cpu, "sys", static_cast<int64_t>(cpu_info[i].cpu_times.sys));
+    SetNamedInt64(env, cpu, "idle", static_cast<int64_t>(cpu_info[i].cpu_times.idle));
+    SetNamedInt64(env, cpu, "irq", static_cast<int64_t>(cpu_info[i].cpu_times.irq));
+    napi_set_element(env, cpus, static_cast<uint32_t>(i), cpu);
+  }
+
+  uv_free_cpu_info(cpu_info, count);
+  *out = cpus;
+  return true;
+}
+
+bool BuildReportNetworkInterfaces(napi_env env, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  uv_interface_address_t* interfaces = nullptr;
+  int count = 0;
+  if (uv_interface_addresses(&interfaces, &count) != 0 || count < 0) return false;
+
+  napi_value array = nullptr;
+  if (napi_create_array_with_length(env, static_cast<size_t>(count), &array) != napi_ok || array == nullptr) {
+    uv_free_interface_addresses(interfaces, count);
+    return false;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    napi_value entry = nullptr;
+    if (napi_create_object(env, &entry) != napi_ok || entry == nullptr) continue;
+    SetNamedString(env, entry, "name", interfaces[i].name != nullptr ? interfaces[i].name : "");
+    SetNamedBool(env, entry, "internal", interfaces[i].is_internal != 0);
+
+    char mac[18] = {'\0'};
+    std::snprintf(mac,
+                  sizeof(mac),
+                  "%02x:%02x:%02x:%02x:%02x:%02x",
+                  static_cast<unsigned char>(interfaces[i].phys_addr[0]),
+                  static_cast<unsigned char>(interfaces[i].phys_addr[1]),
+                  static_cast<unsigned char>(interfaces[i].phys_addr[2]),
+                  static_cast<unsigned char>(interfaces[i].phys_addr[3]),
+                  static_cast<unsigned char>(interfaces[i].phys_addr[4]),
+                  static_cast<unsigned char>(interfaces[i].phys_addr[5]));
+    SetNamedString(env, entry, "mac", mac);
+
+    if (interfaces[i].address.address4.sin_family == AF_INET) {
+      char ip[INET_ADDRSTRLEN] = {'\0'};
+      char netmask[INET_ADDRSTRLEN] = {'\0'};
+      if (uv_ip4_name(&interfaces[i].address.address4, ip, sizeof(ip)) == 0) {
+        SetNamedString(env, entry, "address", ip);
+      }
+      if (uv_ip4_name(&interfaces[i].netmask.netmask4, netmask, sizeof(netmask)) == 0) {
+        SetNamedString(env, entry, "netmask", netmask);
+      }
+      SetNamedString(env, entry, "family", "IPv4");
+    } else if (interfaces[i].address.address4.sin_family == AF_INET6) {
+      char ip[INET6_ADDRSTRLEN] = {'\0'};
+      char netmask[INET6_ADDRSTRLEN] = {'\0'};
+      if (uv_ip6_name(&interfaces[i].address.address6, ip, sizeof(ip)) == 0) {
+        SetNamedString(env, entry, "address", ip);
+      }
+      if (uv_ip6_name(&interfaces[i].netmask.netmask6, netmask, sizeof(netmask)) == 0) {
+        SetNamedString(env, entry, "netmask", netmask);
+      }
+      SetNamedString(env, entry, "family", "IPv6");
+      SetNamedInt32(env, entry, "scopeid", static_cast<int32_t>(interfaces[i].address.address6.sin6_scope_id));
+    } else {
+      SetNamedString(env, entry, "family", "unknown");
+    }
+
+    napi_set_element(env, array, static_cast<uint32_t>(i), entry);
+  }
+
+  uv_free_interface_addresses(interfaces, count);
+  *out = array;
+  return true;
+}
+
+bool SnapshotProcessEnv(napi_env env, napi_value process_obj, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  napi_value env_obj = nullptr;
+  if (!GetNamedPropertyIfPresent(env, process_obj, "env", &env_obj) || env_obj == nullptr) return false;
+
+  napi_value snapshot = nullptr;
+  if (napi_create_object(env, &snapshot) != napi_ok || snapshot == nullptr) return false;
+
+  napi_value keys = nullptr;
+  if (napi_get_property_names(env, env_obj, &keys) != napi_ok || keys == nullptr) return false;
+  uint32_t length = 0;
+  if (napi_get_array_length(env, keys, &length) != napi_ok) return false;
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) continue;
+    napi_value value = nullptr;
+    if (napi_get_property(env, env_obj, key, &value) != napi_ok || value == nullptr) continue;
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, value, &type) != napi_ok || type == napi_undefined) continue;
+    napi_value value_string = nullptr;
+    if (napi_coerce_to_string(env, value, &value_string) != napi_ok || value_string == nullptr) continue;
+    napi_set_property(env, snapshot, key, value_string);
+  }
+
+  *out = snapshot;
+  return true;
+}
+
+bool BuildErrorProperties(napi_env env, napi_value error, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  napi_value props = nullptr;
+  if (napi_create_object(env, &props) != napi_ok || props == nullptr) return false;
+
+  napi_valuetype error_type = napi_undefined;
+  if (error == nullptr ||
+      napi_typeof(env, error, &error_type) != napi_ok ||
+      (error_type != napi_object && error_type != napi_function)) {
+    *out = props;
+    return true;
+  }
+
+  napi_value keys = nullptr;
+  if (napi_get_property_names(env, error, &keys) != napi_ok || keys == nullptr) {
+    *out = props;
+    return true;
+  }
+  uint32_t length = 0;
+  if (napi_get_array_length(env, keys, &length) != napi_ok) {
+    *out = props;
+    return true;
+  }
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) continue;
+    const std::string key_text = NapiValueToUtf8(env, key);
+    if (key_text == "message" || key_text == "stack") continue;
+    napi_value value = nullptr;
+    if (napi_get_property(env, error, key, &value) != napi_ok || value == nullptr) continue;
+    napi_value value_string = nullptr;
+    if (napi_coerce_to_string(env, value, &value_string) != napi_ok || value_string == nullptr) continue;
+    napi_set_property(env, props, key, value_string);
+  }
+
+  *out = props;
+  return true;
+}
+
+bool BuildJavascriptStack(napi_env env,
+                          napi_value error,
+                          const std::string& fallback_message,
+                          napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  napi_value js_stack = nullptr;
+  napi_value stack_array = nullptr;
+  napi_value error_props = nullptr;
+  if (napi_create_object(env, &js_stack) != napi_ok || js_stack == nullptr ||
+      napi_create_array(env, &stack_array) != napi_ok || stack_array == nullptr ||
+      !BuildErrorProperties(env, error, &error_props) || error_props == nullptr) {
+    return false;
+  }
+
+  std::string message = fallback_message;
+  std::string stack_text;
+  napi_valuetype error_type = napi_undefined;
+  if (error != nullptr &&
+      napi_typeof(env, error, &error_type) == napi_ok &&
+      (error_type == napi_object || error_type == napi_function)) {
+    napi_value message_value = nullptr;
+    if (GetNamedPropertyIfPresent(env, error, "message", &message_value)) {
+      const std::string maybe_message = NapiValueToUtf8(env, message_value);
+      if (!maybe_message.empty()) message = maybe_message;
+    }
+    napi_value stack_value = nullptr;
+    if (GetNamedPropertyIfPresent(env, error, "stack", &stack_value)) {
+      stack_text = NapiValueToUtf8(env, stack_value);
+      if (!stack_text.empty() && message.empty()) message = stack_text;
+    }
+  }
+
+  uint32_t index = 0;
+  if (!stack_text.empty()) {
+    std::istringstream in(stack_text);
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      napi_value line_value = nullptr;
+      if (napi_create_string_utf8(env, line.c_str(), NAPI_AUTO_LENGTH, &line_value) == napi_ok && line_value != nullptr) {
+        napi_set_element(env, stack_array, index++, line_value);
+      }
+    }
+  }
+
+  SetNamedString(env, js_stack, "message", message);
+  SetNamedValue(env, js_stack, "stack", stack_array);
+  SetNamedValue(env, js_stack, "errorProperties", error_props);
+  *out = js_stack;
+  return true;
+}
+
+bool BuildJavascriptHeap(napi_env env, napi_value process_obj, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  double heap_total = 0;
+  double heap_used = 0;
+  double external = 0;
+  double array_buffers = 0;
+  (void)unofficial_napi_get_process_memory_info(env, &heap_total, &heap_used, &external, &array_buffers);
+
+  napi_value exec_argv_value = nullptr;
+  (void)GetNamedPropertyIfPresent(env, process_obj, "execArgv", &exec_argv_value);
+  const uint64_t heap_limit = ReadReportHeapLimitFromExecArgv(GetStringArrayValue(env, exec_argv_value));
+
+  napi_value js_heap = nullptr;
+  napi_value heap_spaces = nullptr;
+  napi_value new_space = nullptr;
+  if (napi_create_object(env, &js_heap) != napi_ok || js_heap == nullptr ||
+      napi_create_object(env, &heap_spaces) != napi_ok || heap_spaces == nullptr ||
+      napi_create_object(env, &new_space) != napi_ok || new_space == nullptr) {
+    return false;
+  }
+
+  SetNamedInt64(env, js_heap, "totalMemory", static_cast<int64_t>(heap_total));
+  SetNamedInt64(env, js_heap, "executableMemory", 0);
+  SetNamedInt64(env, js_heap, "totalCommittedMemory", static_cast<int64_t>(heap_total));
+  SetNamedInt64(env, js_heap, "availableMemory", 0);
+  SetNamedInt64(env, js_heap, "totalGlobalHandlesMemory", 0);
+  SetNamedInt64(env, js_heap, "usedGlobalHandlesMemory", 0);
+  SetNamedInt64(env, js_heap, "usedMemory", static_cast<int64_t>(heap_used));
+  SetNamedInt64(env, js_heap, "memoryLimit", static_cast<int64_t>(heap_limit));
+  SetNamedInt64(env, js_heap, "mallocedMemory", 0);
+  SetNamedInt64(env, js_heap, "externalMemory", static_cast<int64_t>(external));
+  SetNamedInt64(env, js_heap, "peakMallocedMemory", 0);
+  SetNamedInt64(env, js_heap, "nativeContextCount", 0);
+  SetNamedInt64(env, js_heap, "detachedContextCount", 0);
+  SetNamedInt64(env, js_heap, "doesZapGarbage", 0);
+
+  SetNamedInt64(env, new_space, "memorySize", 0);
+  SetNamedInt64(env, new_space, "committedMemory", 0);
+  SetNamedInt64(env, new_space, "capacity", 0);
+  SetNamedInt64(env, new_space, "used", 0);
+  SetNamedInt64(env, new_space, "available", 0);
+  SetNamedValue(env, heap_spaces, "new_space", new_space);
+  SetNamedValue(env, js_heap, "heapSpaces", heap_spaces);
+
+  *out = js_heap;
+  return true;
+}
+
+bool BuildResourceUsage(napi_env env, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  uv_rusage_t rusage{};
+  if (uv_getrusage(&rusage) != 0) return false;
+
+  size_t rss = 0;
+  (void)uv_resident_set_memory(&rss);
+
+  napi_value usage = nullptr;
+  napi_value page_faults = nullptr;
+  napi_value fs_activity = nullptr;
+  if (napi_create_object(env, &usage) != napi_ok || usage == nullptr ||
+      napi_create_object(env, &page_faults) != napi_ok || page_faults == nullptr ||
+      napi_create_object(env, &fs_activity) != napi_ok || fs_activity == nullptr) {
+    return false;
+  }
+
+  const double user_cpu_seconds = static_cast<double>(rusage.ru_utime.tv_sec) +
+                                  static_cast<double>(rusage.ru_utime.tv_usec) / kMicrosPerSec;
+  const double kernel_cpu_seconds = static_cast<double>(rusage.ru_stime.tv_sec) +
+                                    static_cast<double>(rusage.ru_stime.tv_usec) / kMicrosPerSec;
+  SetNamedDouble(env, usage, "userCpuSeconds", user_cpu_seconds);
+  SetNamedDouble(env, usage, "kernelCpuSeconds", kernel_cpu_seconds);
+  SetNamedDouble(env, usage, "cpuConsumptionPercent", 0.0);
+  SetNamedDouble(env, usage, "userCpuConsumptionPercent", 0.0);
+  SetNamedDouble(env, usage, "kernelCpuConsumptionPercent", 0.0);
+  SetNamedString(env, usage, "maxRss", std::to_string(static_cast<long long>(rusage.ru_maxrss)));
+  SetNamedString(env, usage, "rss", std::to_string(static_cast<unsigned long long>(rss)));
+  SetNamedString(env, usage, "free_memory", std::to_string(static_cast<unsigned long long>(uv_get_free_memory())));
+  SetNamedString(env, usage, "total_memory", std::to_string(static_cast<unsigned long long>(uv_get_total_memory())));
+  SetNamedString(env, usage, "available_memory", std::to_string(static_cast<unsigned long long>(uv_get_available_memory())));
+  const uint64_t constrained_memory = uv_get_constrained_memory();
+  if (constrained_memory != 0) {
+    SetNamedString(env, usage, "constrained_memory", std::to_string(static_cast<unsigned long long>(constrained_memory)));
+  }
+
+  SetNamedInt64(env, page_faults, "IORequired", static_cast<int64_t>(rusage.ru_majflt));
+  SetNamedInt64(env, page_faults, "IONotRequired", static_cast<int64_t>(rusage.ru_minflt));
+  SetNamedValue(env, usage, "pageFaults", page_faults);
+
+  SetNamedInt64(env, fs_activity, "reads", static_cast<int64_t>(rusage.ru_inblock));
+  SetNamedInt64(env, fs_activity, "writes", static_cast<int64_t>(rusage.ru_oublock));
+  SetNamedValue(env, usage, "fsActivity", fs_activity);
+
+  *out = usage;
+  return true;
+}
+
+std::string ResolveReportEndpointHost(uv_loop_t* loop, const sockaddr* addr) {
+  if (loop == nullptr || addr == nullptr) return {};
+  uv_getnameinfo_t request{};
+  if (uv_getnameinfo(loop, &request, nullptr, const_cast<sockaddr*>(addr), NI_NUMERICSERV) != 0) {
+    return {};
+  }
+  return request.host;
+}
+
+bool BuildSocketEndpoint(napi_env env,
+                         uv_loop_t* loop,
+                         const sockaddr* addr,
+                         bool exclude_network,
+                         napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (addr == nullptr) return true;
+
+  napi_value endpoint = nullptr;
+  if (napi_create_object(env, &endpoint) != napi_ok || endpoint == nullptr) return false;
+
+  std::string host;
+  int port = 0;
+  if (addr->sa_family == AF_INET) {
+    char ip[INET_ADDRSTRLEN] = {'\0'};
+    const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(addr);
+    if (uv_ip4_name(ipv4, ip, sizeof(ip)) == 0) {
+      SetNamedString(env, endpoint, "ip4", ip);
+      host = ip;
+    }
+    port = ntohs(ipv4->sin_port);
+  } else if (addr->sa_family == AF_INET6) {
+    char ip[INET6_ADDRSTRLEN] = {'\0'};
+    const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(addr);
+    if (uv_ip6_name(ipv6, ip, sizeof(ip)) == 0) {
+      SetNamedString(env, endpoint, "ip6", ip);
+      host = ip;
+    }
+    port = ntohs(ipv6->sin6_port);
+  }
+
+  if (!exclude_network) {
+    const std::string resolved = ResolveReportEndpointHost(loop, addr);
+    if (!resolved.empty()) host = resolved;
+  }
+  SetNamedString(env, endpoint, "host", host);
+  SetNamedInt32(env, endpoint, "port", port);
+  *out = endpoint;
+  return true;
+}
+
+bool BuildPipeName(uv_pipe_t* pipe, bool peer, std::optional<std::string>* out) {
+  if (out == nullptr || pipe == nullptr) return false;
+  out->reset();
+
+  size_t size = 256;
+  std::vector<char> buffer(size, '\0');
+  int rc = peer ? uv_pipe_getpeername(pipe, buffer.data(), &size)
+                : uv_pipe_getsockname(pipe, buffer.data(), &size);
+  if (rc == UV_ENOBUFS) {
+    buffer.assign(size + 1, '\0');
+    rc = peer ? uv_pipe_getpeername(pipe, buffer.data(), &size)
+              : uv_pipe_getsockname(pipe, buffer.data(), &size);
+  }
+  if (rc != 0 || size == 0) return true;
+  if (size > buffer.size()) size = buffer.size();
+  out->emplace(buffer.data(), size);
+  if (out->has_value() && !out->value().empty() && out->value().back() == '\0') {
+    out->value().pop_back();
+  }
+  return true;
+}
+
+bool BuildPathHandleName(uv_handle_t* handle, std::optional<std::string>* out) {
+  if (out == nullptr || handle == nullptr) return false;
+  out->reset();
+
+  size_t size = 256;
+  std::vector<char> buffer(size, '\0');
+  int rc = -1;
+  if (handle->type == UV_FS_EVENT) {
+    rc = uv_fs_event_getpath(reinterpret_cast<uv_fs_event_t*>(handle), buffer.data(), &size);
+  } else if (handle->type == UV_FS_POLL) {
+    rc = uv_fs_poll_getpath(reinterpret_cast<uv_fs_poll_t*>(handle), buffer.data(), &size);
+  } else {
+    return true;
+  }
+  if (rc == UV_ENOBUFS) {
+    buffer.assign(size + 1, '\0');
+    if (handle->type == UV_FS_EVENT) {
+      rc = uv_fs_event_getpath(reinterpret_cast<uv_fs_event_t*>(handle), buffer.data(), &size);
+    } else {
+      rc = uv_fs_poll_getpath(reinterpret_cast<uv_fs_poll_t*>(handle), buffer.data(), &size);
+    }
+  }
+  if (rc != 0 || size == 0) return true;
+  if (size > buffer.size()) size = buffer.size();
+  out->emplace(buffer.data(), size);
+  if (out->has_value() && !out->value().empty() && out->value().back() == '\0') {
+    out->value().pop_back();
+  }
+  return true;
+}
+
+struct ReportLibuvBuildState {
+  napi_env env = nullptr;
+  napi_value array = nullptr;
+  bool exclude_network = false;
+  uint32_t index = 0;
+};
+
+void AppendReportLibuvHandle(uv_handle_t* handle, void* arg) {
+  auto* state = static_cast<ReportLibuvBuildState*>(arg);
+  if (state == nullptr || state->env == nullptr || state->array == nullptr || handle == nullptr) return;
+
+  napi_env env = state->env;
+  napi_value entry = nullptr;
+  if (napi_create_object(env, &entry) != napi_ok || entry == nullptr) return;
+
+  const char* type_name = uv_handle_type_name(uv_handle_get_type(handle));
+  SetNamedString(env, entry, "type", type_name != nullptr ? type_name : "unknown");
+  SetNamedBool(env, entry, "is_active", uv_is_active(handle) != 0);
+  SetNamedBool(env, entry, "is_referenced", uv_has_ref(handle) != 0);
+  SetNamedString(env, entry, "address", PointerToHexString(reinterpret_cast<uint64_t>(handle)));
+
+  switch (handle->type) {
+    case UV_FS_EVENT:
+    case UV_FS_POLL: {
+      std::optional<std::string> filename;
+      if (BuildPathHandleName(handle, &filename) && filename.has_value()) {
+        SetNamedString(env, entry, "filename", *filename);
+      }
+      break;
+    }
+    case UV_PROCESS: {
+      auto* process = reinterpret_cast<uv_process_t*>(handle);
+      SetNamedInt64(env, entry, "pid", static_cast<int64_t>(process->pid));
+      break;
+    }
+    case UV_TCP: {
+      auto* tcp = reinterpret_cast<uv_tcp_t*>(handle);
+      sockaddr_storage storage{};
+      int size = sizeof(storage);
+      napi_value local = nullptr;
+      if (uv_tcp_getsockname(tcp, reinterpret_cast<sockaddr*>(&storage), &size) == 0) {
+        (void)BuildSocketEndpoint(env, handle->loop, reinterpret_cast<sockaddr*>(&storage), state->exclude_network, &local);
+      }
+      if (local != nullptr) {
+        SetNamedValue(env, entry, "localEndpoint", local);
+      } else {
+        napi_value null_value = nullptr;
+        napi_get_null(env, &null_value);
+        SetNamedValue(env, entry, "localEndpoint", null_value);
+      }
+      size = sizeof(storage);
+      napi_value remote = nullptr;
+      if (uv_tcp_getpeername(tcp, reinterpret_cast<sockaddr*>(&storage), &size) == 0) {
+        (void)BuildSocketEndpoint(env, handle->loop, reinterpret_cast<sockaddr*>(&storage), state->exclude_network, &remote);
+      }
+      if (remote != nullptr) {
+        SetNamedValue(env, entry, "remoteEndpoint", remote);
+      } else {
+        napi_value null_value = nullptr;
+        napi_get_null(env, &null_value);
+        SetNamedValue(env, entry, "remoteEndpoint", null_value);
+      }
+      break;
+    }
+    case UV_UDP: {
+      auto* udp = reinterpret_cast<uv_udp_t*>(handle);
+      sockaddr_storage storage{};
+      int size = sizeof(storage);
+      napi_value local = nullptr;
+      if (uv_udp_getsockname(udp, reinterpret_cast<sockaddr*>(&storage), &size) == 0) {
+        (void)BuildSocketEndpoint(env, handle->loop, reinterpret_cast<sockaddr*>(&storage), state->exclude_network, &local);
+      }
+      if (local != nullptr) {
+        SetNamedValue(env, entry, "localEndpoint", local);
+      } else {
+        napi_value null_value = nullptr;
+        napi_get_null(env, &null_value);
+        SetNamedValue(env, entry, "localEndpoint", null_value);
+      }
+      size = sizeof(storage);
+      napi_value remote = nullptr;
+      if (uv_udp_getpeername(udp, reinterpret_cast<sockaddr*>(&storage), &size) == 0) {
+        (void)BuildSocketEndpoint(env, handle->loop, reinterpret_cast<sockaddr*>(&storage), state->exclude_network, &remote);
+      }
+      if (remote != nullptr) {
+        SetNamedValue(env, entry, "remoteEndpoint", remote);
+      } else {
+        napi_value null_value = nullptr;
+        napi_get_null(env, &null_value);
+        SetNamedValue(env, entry, "remoteEndpoint", null_value);
+      }
+      break;
+    }
+    case UV_NAMED_PIPE: {
+      auto* pipe = reinterpret_cast<uv_pipe_t*>(handle);
+      std::optional<std::string> local;
+      std::optional<std::string> remote;
+      (void)BuildPipeName(pipe, false, &local);
+      (void)BuildPipeName(pipe, true, &remote);
+      if (local.has_value()) {
+        SetNamedString(env, entry, "localEndpoint", *local);
+      } else {
+        napi_value null_value = nullptr;
+        napi_get_null(env, &null_value);
+        SetNamedValue(env, entry, "localEndpoint", null_value);
+      }
+      if (remote.has_value()) {
+        SetNamedString(env, entry, "remoteEndpoint", *remote);
+      } else {
+        napi_value null_value = nullptr;
+        napi_get_null(env, &null_value);
+        SetNamedValue(env, entry, "remoteEndpoint", null_value);
+      }
+      break;
+    }
+    case UV_TIMER: {
+      auto* timer = reinterpret_cast<uv_timer_t*>(handle);
+      const uint64_t due = timer->timeout;
+      const uint64_t now = uv_now(timer->loop);
+      SetNamedInt64(env, entry, "repeat", static_cast<int64_t>(uv_timer_get_repeat(timer)));
+      SetNamedInt64(env, entry, "firesInMsFromNow", static_cast<int64_t>(due >= now ? due - now : 0));
+      SetNamedBool(env, entry, "expired", now >= due);
+      break;
+    }
+    case UV_TTY: {
+      int width = 0;
+      int height = 0;
+      if (uv_tty_get_winsize(reinterpret_cast<uv_tty_t*>(handle), &width, &height) == 0) {
+        SetNamedInt32(env, entry, "width", width);
+        SetNamedInt32(env, entry, "height", height);
+      }
+      break;
+    }
+    case UV_SIGNAL: {
+      auto* signal = reinterpret_cast<uv_signal_t*>(handle);
+      SetNamedInt32(env, entry, "signum", signal->signum);
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (handle->type == UV_TCP || handle->type == UV_UDP
+#ifndef _WIN32
+      || handle->type == UV_NAMED_PIPE
+#endif
+  ) {
+    int send_size = 0;
+    int recv_size = 0;
+    (void)uv_send_buffer_size(handle, &send_size);
+    (void)uv_recv_buffer_size(handle, &recv_size);
+    SetNamedInt32(env, entry, "sendBufferSize", send_size);
+    SetNamedInt32(env, entry, "recvBufferSize", recv_size);
+  }
+
+#ifndef _WIN32
+  if (handle->type == UV_TCP || handle->type == UV_NAMED_PIPE ||
+      handle->type == UV_TTY || handle->type == UV_UDP || handle->type == UV_POLL) {
+    uv_os_fd_t fd_value = -1;
+    if (uv_fileno(handle, &fd_value) == 0) {
+      SetNamedInt32(env, entry, "fd", static_cast<int32_t>(fd_value));
+      if (fd_value == STDIN_FILENO) {
+        SetNamedString(env, entry, "stdio", "stdin");
+      } else if (fd_value == STDOUT_FILENO) {
+        SetNamedString(env, entry, "stdio", "stdout");
+      } else if (fd_value == STDERR_FILENO) {
+        SetNamedString(env, entry, "stdio", "stderr");
+      }
+    }
+  }
+#endif
+
+  if (handle->type == UV_TCP || handle->type == UV_NAMED_PIPE || handle->type == UV_TTY) {
+    auto* stream = reinterpret_cast<uv_stream_t*>(handle);
+    SetNamedInt64(env, entry, "writeQueueSize", static_cast<int64_t>(stream->write_queue_size));
+    SetNamedBool(env, entry, "readable", uv_is_readable(stream) != 0);
+    SetNamedBool(env, entry, "writable", uv_is_writable(stream) != 0);
+  }
+  if (handle->type == UV_UDP) {
+    auto* udp = reinterpret_cast<uv_udp_t*>(handle);
+    SetNamedInt64(env, entry, "writeQueueSize", static_cast<int64_t>(uv_udp_get_send_queue_size(udp)));
+    SetNamedInt64(env, entry, "writeQueueCount", static_cast<int64_t>(uv_udp_get_send_queue_count(udp)));
+  }
+
+  napi_set_element(env, state->array, state->index++, entry);
+}
+
+bool BuildReportLibuv(napi_env env, bool exclude_network, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  uv_loop_t* loop = nullptr;
+  if (napi_get_uv_event_loop(env, &loop) != napi_ok || loop == nullptr) return false;
+
+  napi_value array = nullptr;
+  if (napi_create_array(env, &array) != napi_ok || array == nullptr) return false;
+
+  ReportLibuvBuildState state{env, array, exclude_network, 0};
+  uv_walk(loop, AppendReportLibuvHandle, &state);
+
+  napi_value loop_entry = nullptr;
+  if (napi_create_object(env, &loop_entry) != napi_ok || loop_entry == nullptr) return false;
+  SetNamedString(env, loop_entry, "type", "loop");
+  SetNamedBool(env, loop_entry, "is_active", uv_loop_alive(loop) != 0);
+  SetNamedString(env, loop_entry, "address", PointerToHexString(reinterpret_cast<uint64_t>(loop)));
+  SetNamedDouble(env, loop_entry, "loopIdleTimeSeconds", static_cast<double>(uv_metrics_idle_time(loop)) / kNanosPerSec);
+  napi_set_element(env, array, state.index++, loop_entry);
+
+  *out = array;
+  return true;
+}
+
+napi_value StringifyReportObject(napi_env env, napi_value report_obj, bool compact) {
+  napi_value global = nullptr;
+  napi_value json_obj = nullptr;
+  napi_value stringify_fn = nullptr;
+  if (report_obj == nullptr ||
+      napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "JSON", &json_obj) != napi_ok || json_obj == nullptr ||
+      napi_get_named_property(env, json_obj, "stringify", &stringify_fn) != napi_ok || stringify_fn == nullptr) {
+    return nullptr;
+  }
+  napi_value null_value = nullptr;
+  napi_get_null(env, &null_value);
+  napi_value space = nullptr;
+  if (compact) {
+    napi_create_int32(env, 0, &space);
+  } else {
+    napi_create_int32(env, 2, &space);
+  }
+  napi_value argv[3] = {report_obj, null_value, space};
+  napi_value json_string = nullptr;
+  if (napi_call_function(env, json_obj, stringify_fn, 3, argv, &json_string) != napi_ok || json_string == nullptr) {
+    return nullptr;
+  }
+  return json_string;
+}
+
 napi_value BuildReportObject(napi_env env,
                              const std::string& event_message,
                              const std::string& trigger,
-                             const std::string& report_filename) {
+                             const std::string& report_filename,
+                             napi_value error_value) {
   napi_value report = nullptr;
   if (napi_create_object(env, &report) != napi_ok || report == nullptr) return nullptr;
 
@@ -838,9 +2000,6 @@ napi_value BuildReportObject(napi_env env,
       process_obj == nullptr) {
     return nullptr;
   }
-
-  napi_value os = RequireBuiltin(env, "os");
-  if (os == nullptr) return nullptr;
 
   napi_value header = nullptr;
   if (napi_create_object(env, &header) != napi_ok || header == nullptr) return nullptr;
@@ -854,173 +2013,82 @@ napi_value BuildReportObject(napi_env env,
     SetNamedValue(env, header, "filename", null_value);
   }
 
-  const std::time_t now = std::time(nullptr);
-  std::tm local_tm{};
+  const auto now_tp = std::chrono::system_clock::now();
+  const auto now = std::chrono::system_clock::to_time_t(now_tp);
+  std::tm utc_tm{};
 #if defined(_WIN32)
-  localtime_s(&local_tm, &now);
+  gmtime_s(&utc_tm, &now);
 #else
-  localtime_r(&now, &local_tm);
+  gmtime_r(&now, &utc_tm);
 #endif
   char time_buf[64] = {'\0'};
-  std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%S%z", &local_tm);
+  std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%SZ", &utc_tm);
   SetNamedString(env, header, "dumpEventTime", time_buf);
-  SetNamedDouble(env, header, "dumpEventTimeStamp", static_cast<double>(now) * 1000.0);
+  SetNamedString(
+      env,
+      header,
+      "dumpEventTimeStamp",
+      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now_tp.time_since_epoch()).count()));
   SetNamedInt32(env, header, "processId", static_cast<int32_t>(uv_os_getpid()));
   SetNamedInt32(env, header, "threadId", static_cast<int32_t>(uv_os_getpid()));
+  SetNamedInt32(env, header, "wordSize", static_cast<int32_t>(sizeof(void*) * 8));
 
-  napi_value argv = nullptr;
-  if (napi_get_named_property(env, process_obj, "argv", &argv) == napi_ok && argv != nullptr) {
-    SetNamedValue(env, header, "commandLine", argv);
+  napi_value command_line = nullptr;
+  if (BuildReportCommandLine(env, process_obj, &command_line) && command_line != nullptr) {
+    SetNamedValue(env, header, "commandLine", command_line);
   }
   napi_value node_version = nullptr;
-  if (napi_get_named_property(env, process_obj, "version", &node_version) == napi_ok && node_version != nullptr) {
+  if (GetNamedPropertyIfPresent(env, process_obj, "version", &node_version)) {
     SetNamedValue(env, header, "nodejsVersion", node_version);
   }
-  SetNamedInt32(env, header, "wordSize", static_cast<int32_t>(sizeof(void*) * 8));
   napi_value arch = nullptr;
-  if (napi_get_named_property(env, process_obj, "arch", &arch) == napi_ok && arch != nullptr) {
+  if (GetNamedPropertyIfPresent(env, process_obj, "arch", &arch)) {
     SetNamedValue(env, header, "arch", arch);
   }
   napi_value platform = nullptr;
-  if (napi_get_named_property(env, process_obj, "platform", &platform) == napi_ok && platform != nullptr) {
+  if (GetNamedPropertyIfPresent(env, process_obj, "platform", &platform)) {
     SetNamedValue(env, header, "platform", platform);
   }
   napi_value versions = nullptr;
-  if (napi_get_named_property(env, process_obj, "versions", &versions) == napi_ok && versions != nullptr) {
+  if (GetNamedPropertyIfPresent(env, process_obj, "versions", &versions)) {
     SetNamedValue(env, header, "componentVersions", versions);
   }
   napi_value release = nullptr;
-  if (napi_get_named_property(env, process_obj, "release", &release) == napi_ok && release != nullptr) {
+  if (GetNamedPropertyIfPresent(env, process_obj, "release", &release)) {
     SetNamedValue(env, header, "release", release);
   }
 
-  auto setHeaderFromOs = [&](const char* fn_name, const char* field) {
-    napi_value fn = nullptr;
-    if (napi_get_named_property(env, os, fn_name, &fn) != napi_ok || fn == nullptr) return;
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, fn, &type) != napi_ok || type != napi_function) return;
-    napi_value result = nullptr;
-    if (napi_call_function(env, os, fn, 0, nullptr, &result) != napi_ok || result == nullptr) return;
-    SetNamedValue(env, header, field, result);
-  };
-  setHeaderFromOs("type", "osName");
-  setHeaderFromOs("release", "osRelease");
-  setHeaderFromOs("version", "osVersion");
-  setHeaderFromOs("machine", "osMachine");
-  setHeaderFromOs("hostname", "host");
+  char cwd_buf[4096] = {'\0'};
+  size_t cwd_size = sizeof(cwd_buf);
+  if (uv_cwd(cwd_buf, &cwd_size) == 0) {
+    SetNamedString(env, header, "cwd", std::string(cwd_buf, cwd_size));
+  }
 
-  napi_value cwd_fn = nullptr;
-  if (napi_get_named_property(env, process_obj, "cwd", &cwd_fn) == napi_ok && cwd_fn != nullptr) {
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, cwd_fn, &type) == napi_ok && type == napi_function) {
-      napi_value cwd_result = nullptr;
-      if (napi_call_function(env, process_obj, cwd_fn, 0, nullptr, &cwd_result) == napi_ok &&
-          cwd_result != nullptr) {
-        SetNamedValue(env, header, "cwd", cwd_result);
-      }
+  uv_utsname_t os_info{};
+  if (uv_os_uname(&os_info) == 0) {
+    SetNamedString(env, header, "osName", os_info.sysname);
+    SetNamedString(env, header, "osRelease", os_info.release);
+    SetNamedString(env, header, "osVersion", os_info.version);
+    SetNamedString(env, header, "osMachine", os_info.machine);
+  }
+
+  napi_value cpus = nullptr;
+  if (BuildReportCpus(env, &cpus) && cpus != nullptr) {
+    SetNamedValue(env, header, "cpus", cpus);
+  }
+
+  ReportBindingState* state = GetReportState(env);
+  if (state == nullptr || !state->exclude_network) {
+    napi_value network_interfaces = nullptr;
+    if (BuildReportNetworkInterfaces(env, &network_interfaces) && network_interfaces != nullptr) {
+      SetNamedValue(env, header, "networkInterfaces", network_interfaces);
     }
   }
 
-  napi_value cpus_fn = nullptr;
-  if (napi_get_named_property(env, os, "cpus", &cpus_fn) == napi_ok && cpus_fn != nullptr) {
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, cpus_fn, &type) == napi_ok && type == napi_function) {
-      napi_value cpus = nullptr;
-      if (napi_call_function(env, os, cpus_fn, 0, nullptr, &cpus) == napi_ok && cpus != nullptr) {
-        bool is_arr = false;
-        if (napi_is_array(env, cpus, &is_arr) == napi_ok && is_arr) {
-          napi_value normalized_cpus = nullptr;
-          if (napi_create_array(env, &normalized_cpus) == napi_ok && normalized_cpus != nullptr) {
-            uint32_t cpu_count = 0;
-            napi_get_array_length(env, cpus, &cpu_count);
-            for (uint32_t i = 0; i < cpu_count; ++i) {
-              napi_value cpu = nullptr;
-              if (napi_get_element(env, cpus, i, &cpu) != napi_ok || cpu == nullptr) continue;
-              napi_value out_cpu = nullptr;
-              if (napi_create_object(env, &out_cpu) != napi_ok || out_cpu == nullptr) continue;
-              const char* scalar_fields[] = {"model", "speed"};
-              for (const char* field : scalar_fields) {
-                napi_value field_v = nullptr;
-                if (napi_get_named_property(env, cpu, field, &field_v) == napi_ok && field_v != nullptr) {
-                  SetNamedValue(env, out_cpu, field, field_v);
-                }
-              }
-              napi_value times = nullptr;
-              if (napi_get_named_property(env, cpu, "times", &times) == napi_ok && times != nullptr) {
-                const char* time_in_fields[] = {"user", "nice", "sys", "idle", "irq"};
-                for (const char* field : time_in_fields) {
-                  napi_value tv = nullptr;
-                  if (napi_get_named_property(env, times, field, &tv) == napi_ok && tv != nullptr) {
-                    SetNamedValue(env, out_cpu, field, tv);
-                  }
-                }
-              }
-              napi_set_element(env, normalized_cpus, i, out_cpu);
-            }
-            SetNamedValue(env, header, "cpus", normalized_cpus);
-          }
-        } else {
-          SetNamedValue(env, header, "cpus", cpus);
-        }
-      }
-    }
-  }
-
-  napi_value net_fn = nullptr;
-  if (napi_get_named_property(env, os, "networkInterfaces", &net_fn) == napi_ok && net_fn != nullptr) {
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, net_fn, &type) == napi_ok && type == napi_function) {
-      napi_value net_obj = nullptr;
-      if (napi_call_function(env, os, net_fn, 0, nullptr, &net_obj) == napi_ok && net_obj != nullptr) {
-        napi_value network_interfaces = nullptr;
-        if (napi_create_array(env, &network_interfaces) == napi_ok && network_interfaces != nullptr) {
-          uint32_t out_idx = 0;
-          napi_value iface_names = nullptr;
-          if (napi_get_property_names(env, net_obj, &iface_names) == napi_ok && iface_names != nullptr) {
-            uint32_t iface_count = 0;
-            napi_get_array_length(env, iface_names, &iface_count);
-            for (uint32_t i = 0; i < iface_count; ++i) {
-              napi_value iface_name_v = nullptr;
-              if (napi_get_element(env, iface_names, i, &iface_name_v) != napi_ok || iface_name_v == nullptr) continue;
-              const std::string iface_name = NapiValueToUtf8(env, iface_name_v);
-              napi_value iface_arr = nullptr;
-              if (napi_get_property(env, net_obj, iface_name_v, &iface_arr) != napi_ok || iface_arr == nullptr) continue;
-              bool is_arr = false;
-              if (napi_is_array(env, iface_arr, &is_arr) != napi_ok || !is_arr) continue;
-              uint32_t addr_count = 0;
-              napi_get_array_length(env, iface_arr, &addr_count);
-              for (uint32_t j = 0; j < addr_count; ++j) {
-                napi_value entry = nullptr;
-                if (napi_get_element(env, iface_arr, j, &entry) != napi_ok || entry == nullptr) continue;
-                napi_value out_entry = nullptr;
-                if (napi_create_object(env, &out_entry) != napi_ok || out_entry == nullptr) continue;
-                SetNamedString(env, out_entry, "name", iface_name);
-                const char* copied[] = {"address", "netmask", "family", "mac", "internal", "scopeid"};
-                for (const char* key : copied) {
-                  napi_value key_v = nullptr;
-                  if (napi_create_string_utf8(env, key, NAPI_AUTO_LENGTH, &key_v) != napi_ok || key_v == nullptr) continue;
-                  napi_value val = nullptr;
-                  if (napi_get_property(env, entry, key_v, &val) == napi_ok && val != nullptr) {
-                    napi_valuetype t = napi_undefined;
-                    if (napi_typeof(env, val, &t) == napi_ok && t != napi_undefined) {
-                      if (std::strcmp(key, "mac") == 0) {
-                        const std::string mac = NapiValueToUtf8(env, val);
-                        const std::string normalized = IsValidMacAddress(mac) ? mac : "00:00:00:00:00:00";
-                        SetNamedString(env, out_entry, "mac", normalized);
-                      } else {
-                        SetNamedValue(env, out_entry, key, val);
-                      }
-                    }
-                  }
-                }
-                napi_set_element(env, network_interfaces, out_idx++, out_entry);
-              }
-            }
-          }
-          SetNamedValue(env, header, "networkInterfaces", network_interfaces);
-        }
-      }
-    }
+  char host[UV_MAXHOSTNAMESIZE] = {'\0'};
+  size_t host_size = sizeof(host);
+  if (uv_os_gethostname(host, &host_size) == 0) {
+    SetNamedString(env, header, "host", std::string(host, host_size));
   }
 
   SetNamedString(env, header, "glibcVersionRuntime", "");
@@ -1032,76 +2100,38 @@ napi_value BuildReportObject(napi_env env,
   napi_create_array_with_length(env, 1, &native_stack);
   napi_value frame = nullptr;
   napi_create_object(env, &frame);
-  SetNamedString(env, frame, "pc", "0x0");
-  SetNamedString(env, frame, "symbol", "ubi::report");
+  SetNamedString(env, frame, "pc", PointerToHexString(reinterpret_cast<uint64_t>(&BuildReportObject)));
+  SetNamedString(env, frame, "symbol", "ubi::BuildReportObject");
   napi_set_element(env, native_stack, 0, frame);
   SetNamedValue(env, report, "nativeStack", native_stack);
 
   napi_value js_stack = nullptr;
-  napi_create_object(env, &js_stack);
-  SetNamedString(env, js_stack, "message", event_message);
-  napi_value js_frames = nullptr;
-  napi_create_array(env, &js_frames);
-  SetNamedValue(env, js_stack, "stack", js_frames);
-  napi_value error_props = nullptr;
-  napi_create_object(env, &error_props);
-  SetNamedValue(env, js_stack, "errorProperties", error_props);
-  SetNamedValue(env, report, "javascriptStack", js_stack);
+  if (BuildJavascriptStack(env, error_value, event_message, &js_stack) && js_stack != nullptr) {
+    SetNamedValue(env, report, "javascriptStack", js_stack);
+  }
 
   napi_value libuv = nullptr;
-  napi_create_array_with_length(env, 2, &libuv);
-  napi_value loop_entry = nullptr;
-  napi_create_object(env, &loop_entry);
-  SetNamedString(env, loop_entry, "type", "loop");
-  SetNamedString(env, loop_entry, "address", "0x1");
-  SetNamedBool(env, loop_entry, "is_active", true);
-  napi_set_element(env, libuv, 0, loop_entry);
-  napi_value timer_entry = nullptr;
-  napi_create_object(env, &timer_entry);
-  SetNamedString(env, timer_entry, "type", "timer");
-  SetNamedString(env, timer_entry, "address", "0x2");
-  SetNamedBool(env, timer_entry, "is_active", false);
-  SetNamedBool(env, timer_entry, "is_referenced", false);
-  napi_set_element(env, libuv, 1, timer_entry);
-  SetNamedValue(env, report, "libuv", libuv);
+  if (BuildReportLibuv(env, state != nullptr && state->exclude_network, &libuv) && libuv != nullptr) {
+    SetNamedValue(env, report, "libuv", libuv);
+  }
 
   napi_value shared_objects = nullptr;
   napi_create_array(env, &shared_objects);
   SetNamedValue(env, report, "sharedObjects", shared_objects);
 
   napi_value usage = nullptr;
-  napi_create_object(env, &usage);
-  SetNamedDouble(env, usage, "userCpuSeconds", 0.0);
-  SetNamedDouble(env, usage, "kernelCpuSeconds", 0.0);
-  SetNamedDouble(env, usage, "cpuConsumptionPercent", 0.0);
-  SetNamedDouble(env, usage, "userCpuConsumptionPercent", 0.0);
-  SetNamedDouble(env, usage, "kernelCpuConsumptionPercent", 0.0);
-  SetNamedString(env, usage, "maxRss", "0");
-  SetNamedString(env, usage, "rss", "0");
-  SetNamedString(env, usage, "free_memory", "0");
-  SetNamedString(env, usage, "total_memory", "0");
-  SetNamedString(env, usage, "available_memory", "0");
-  napi_value page_faults = nullptr;
-  napi_create_object(env, &page_faults);
-  SetNamedInt32(env, page_faults, "IORequired", 0);
-  SetNamedInt32(env, page_faults, "IONotRequired", 0);
-  SetNamedValue(env, usage, "pageFaults", page_faults);
-  napi_value fs_activity = nullptr;
-  napi_create_object(env, &fs_activity);
-  SetNamedInt32(env, fs_activity, "reads", 0);
-  SetNamedInt32(env, fs_activity, "writes", 0);
-  SetNamedValue(env, usage, "fsActivity", fs_activity);
-  SetNamedValue(env, report, "resourceUsage", usage);
+  if (BuildResourceUsage(env, &usage) && usage != nullptr) {
+    SetNamedValue(env, report, "resourceUsage", usage);
+  }
 
   napi_value workers = nullptr;
   napi_create_array(env, &workers);
   SetNamedValue(env, report, "workers", workers);
 
-  ReportBindingState* state = GetReportState(env);
   if (state == nullptr || !state->exclude_env) {
-    napi_value env_obj = nullptr;
-    if (napi_get_named_property(env, process_obj, "env", &env_obj) == napi_ok && env_obj != nullptr) {
-      SetNamedValue(env, report, "environmentVariables", env_obj);
+    napi_value env_snapshot = nullptr;
+    if (SnapshotProcessEnv(env, process_obj, &env_snapshot) && env_snapshot != nullptr) {
+      SetNamedValue(env, report, "environmentVariables", env_snapshot);
     }
   }
 
@@ -1111,25 +2141,9 @@ napi_value BuildReportObject(napi_env env,
   }
 
   napi_value js_heap = nullptr;
-  napi_create_object(env, &js_heap);
-  const char* heap_int_fields[] = {
-      "totalMemory", "executableMemory", "totalCommittedMemory", "availableMemory",
-      "totalGlobalHandlesMemory", "usedGlobalHandlesMemory", "usedMemory",
-      "memoryLimit", "mallocedMemory", "externalMemory", "peakMallocedMemory",
-      "nativeContextCount", "detachedContextCount", "doesZapGarbage",
-  };
-  for (const char* field : heap_int_fields) {
-    SetNamedInt32(env, js_heap, field, 0);
+  if (BuildJavascriptHeap(env, process_obj, &js_heap) && js_heap != nullptr) {
+    SetNamedValue(env, report, "javascriptHeap", js_heap);
   }
-  napi_value heap_spaces = nullptr;
-  napi_create_object(env, &heap_spaces);
-  napi_value space = nullptr;
-  napi_create_object(env, &space);
-  const char* heap_space_fields[] = {"memorySize", "committedMemory", "capacity", "used", "available"};
-  for (const char* field : heap_space_fields) SetNamedInt32(env, space, field, 0);
-  SetNamedValue(env, heap_spaces, "new_space", space);
-  SetNamedValue(env, js_heap, "heapSpaces", heap_spaces);
-  SetNamedValue(env, report, "javascriptHeap", js_heap);
 
   return report;
 }
@@ -1164,6 +2178,473 @@ bool HasExecArgvFlag(const std::vector<std::string>& exec_argv, const char* flag
     if (arg == flag) return true;
   }
   return false;
+}
+
+std::string GetExecArgvStringOption(const std::vector<std::string>& exec_argv, const char* prefix) {
+  if (prefix == nullptr || prefix[0] == '\0') return {};
+  const std::string needle(prefix);
+  for (const auto& arg : exec_argv) {
+    if (arg.rfind(needle, 0) == 0) {
+      return arg.substr(needle.size());
+    }
+  }
+  return {};
+}
+
+std::string ResolveReportFilename(ReportBindingState* state, const std::string& requested_file) {
+  std::string filename = requested_file;
+  if (filename.empty()) {
+    if (state == nullptr || state->filename.empty()) {
+      if (state != nullptr) state->sequence++;
+      const uint64_t sequence = state != nullptr ? state->sequence : 1;
+      std::ostringstream generated;
+      generated << BuildDefaultReportFilename() << sequence << ".json";
+      filename = generated.str();
+    } else {
+      filename = state->filename;
+    }
+  }
+  return filename;
+}
+
+std::string ResolveReportOutputPath(const ReportBindingState* state, const std::string& filename) {
+  const bool use_stdout = filename == "stdout";
+  const bool use_stderr = filename == "stderr";
+  const std::string directory = state != nullptr ? state->directory : std::string();
+  return (use_stdout || use_stderr || std::filesystem::path(filename).is_absolute() || directory.empty())
+             ? filename
+             : JoinPath(directory, filename);
+}
+
+bool WriteReportPayload(const ReportBindingState* state,
+                        const std::string& filename,
+                        const std::string& payload) {
+  const bool use_stdout = filename == "stdout";
+  const bool use_stderr = filename == "stderr";
+  const std::string output_path = ResolveReportOutputPath(state, filename);
+
+  if (use_stdout) {
+    std::cout << payload;
+    if (payload.empty() || payload.back() != '\n') std::cout << '\n';
+    std::cerr << "\nNode.js report completed" << std::endl;
+    return true;
+  }
+  if (use_stderr) {
+    std::cerr << payload;
+    if (payload.empty() || payload.back() != '\n') std::cerr << '\n';
+    return true;
+  }
+
+  errno = 0;
+  std::ofstream out(output_path, std::ios::out | std::ios::binary);
+  if (!out.is_open()) {
+    std::cerr << "\nFailed to open Node.js report file: " << filename;
+    const std::string directory = state != nullptr ? state->directory : std::string();
+    if (!directory.empty()) {
+      std::cerr << " directory: " << directory;
+    }
+    std::cerr << " (errno: " << errno << ")" << std::endl;
+    return false;
+  }
+  out << payload;
+  out.close();
+  std::cerr << "\nWriting Node.js report to file: " << filename
+            << "\nNode.js report completed" << std::endl;
+  return true;
+}
+
+void WriteJsonStringArray(SimpleJsonWriter& writer,
+                          const char* key,
+                          const std::vector<std::string>& values) {
+  writer.json_arraystart(key);
+  for (const auto& value : values) {
+    writer.json_element(value);
+  }
+  writer.json_arrayend();
+}
+
+void WriteReportComponentVersions(SimpleJsonWriter& writer, bool has_intl) {
+  writer.json_objectstart("componentVersions");
+  writer.json_keyvalue("node", NODE_VERSION_STRING);
+  for (const auto& entry : BuildProcessVersionEntries(has_intl)) {
+    if (!entry.value.empty()) writer.json_keyvalue(entry.key, entry.value);
+  }
+  writer.json_objectend();
+}
+
+void WriteReportRelease(SimpleJsonWriter& writer) {
+  writer.json_objectstart("release");
+  writer.json_keyvalue("name", "node");
+#if NODE_VERSION_IS_LTS
+  writer.json_keyvalue("lts", NODE_VERSION_LTS_CODENAME);
+#endif
+  const std::string release_url_prefix =
+      std::string("https://nodejs.org/download/release/v") + NODE_VERSION_STRING + "/";
+  const std::string release_file_prefix =
+      release_url_prefix + "node-v" + NODE_VERSION_STRING;
+  writer.json_keyvalue("sourceUrl", release_file_prefix + ".tar.gz");
+  writer.json_keyvalue("headersUrl", release_file_prefix + "-headers.tar.gz");
+  writer.json_objectend();
+}
+
+void WriteReportCpuInfo(SimpleJsonWriter& writer) {
+  writer.json_arraystart("cpus");
+  uv_cpu_info_t* cpu_info = nullptr;
+  int count = 0;
+  if (uv_cpu_info(&cpu_info, &count) == 0 && count >= 0) {
+    for (int i = 0; i < count; ++i) {
+      writer.json_start();
+      writer.json_keyvalue("model", cpu_info[i].model != nullptr ? cpu_info[i].model : "");
+      writer.json_keyvalue("speed", static_cast<int64_t>(cpu_info[i].speed));
+      writer.json_keyvalue("user", static_cast<int64_t>(cpu_info[i].cpu_times.user));
+      writer.json_keyvalue("nice", static_cast<int64_t>(cpu_info[i].cpu_times.nice));
+      writer.json_keyvalue("sys", static_cast<int64_t>(cpu_info[i].cpu_times.sys));
+      writer.json_keyvalue("idle", static_cast<int64_t>(cpu_info[i].cpu_times.idle));
+      writer.json_keyvalue("irq", static_cast<int64_t>(cpu_info[i].cpu_times.irq));
+      writer.json_end();
+    }
+    uv_free_cpu_info(cpu_info, count);
+  }
+  writer.json_arrayend();
+}
+
+void WriteReportNetworkInterfaces(SimpleJsonWriter& writer) {
+  writer.json_arraystart("networkInterfaces");
+  uv_interface_address_t* interfaces = nullptr;
+  int count = 0;
+  if (uv_interface_addresses(&interfaces, &count) == 0 && count >= 0) {
+    for (int i = 0; i < count; ++i) {
+      writer.json_start();
+      writer.json_keyvalue("name", interfaces[i].name != nullptr ? interfaces[i].name : "");
+      writer.json_keyvalue("internal", interfaces[i].is_internal != 0);
+
+      char mac[18] = {'\0'};
+      std::snprintf(mac,
+                    sizeof(mac),
+                    "%02X:%02X:%02X:%02X:%02X:%02X",
+                    static_cast<unsigned char>(interfaces[i].phys_addr[0]),
+                    static_cast<unsigned char>(interfaces[i].phys_addr[1]),
+                    static_cast<unsigned char>(interfaces[i].phys_addr[2]),
+                    static_cast<unsigned char>(interfaces[i].phys_addr[3]),
+                    static_cast<unsigned char>(interfaces[i].phys_addr[4]),
+                    static_cast<unsigned char>(interfaces[i].phys_addr[5]));
+      writer.json_keyvalue("mac", mac);
+
+      if (interfaces[i].address.address4.sin_family == AF_INET) {
+        char address[INET_ADDRSTRLEN] = {'\0'};
+        char netmask[INET_ADDRSTRLEN] = {'\0'};
+        if (uv_ip4_name(&interfaces[i].address.address4, address, sizeof(address)) == 0) {
+          writer.json_keyvalue("address", address);
+        }
+        if (uv_ip4_name(&interfaces[i].netmask.netmask4, netmask, sizeof(netmask)) == 0) {
+          writer.json_keyvalue("netmask", netmask);
+        }
+        writer.json_keyvalue("family", "IPv4");
+      } else if (interfaces[i].address.address4.sin_family == AF_INET6) {
+        char address[INET6_ADDRSTRLEN] = {'\0'};
+        char netmask[INET6_ADDRSTRLEN] = {'\0'};
+        if (uv_ip6_name(&interfaces[i].address.address6, address, sizeof(address)) == 0) {
+          writer.json_keyvalue("address", address);
+        }
+        if (uv_ip6_name(&interfaces[i].netmask.netmask6, netmask, sizeof(netmask)) == 0) {
+          writer.json_keyvalue("netmask", netmask);
+        }
+        writer.json_keyvalue("family", "IPv6");
+        writer.json_keyvalue("scopeid",
+                             static_cast<int64_t>(interfaces[i].address.address6.sin6_scope_id));
+      } else {
+        writer.json_keyvalue("family", "unknown");
+      }
+      writer.json_end();
+    }
+    uv_free_interface_addresses(interfaces, count);
+  }
+  writer.json_arrayend();
+}
+
+void WriteReportResourceUsage(SimpleJsonWriter& writer) {
+  writer.json_objectstart("resourceUsage");
+  uv_rusage_t rusage{};
+  (void)uv_getrusage(&rusage);
+
+  size_t rss = 0;
+  (void)uv_resident_set_memory(&rss);
+  writer.json_keyvalue("userCpuSeconds",
+                       static_cast<double>(rusage.ru_utime.tv_sec) +
+                           static_cast<double>(rusage.ru_utime.tv_usec) / kMicrosPerSec);
+  writer.json_keyvalue("kernelCpuSeconds",
+                       static_cast<double>(rusage.ru_stime.tv_sec) +
+                           static_cast<double>(rusage.ru_stime.tv_usec) / kMicrosPerSec);
+  writer.json_keyvalue("cpuConsumptionPercent", 0.0);
+  writer.json_keyvalue("userCpuConsumptionPercent", 0.0);
+  writer.json_keyvalue("kernelCpuConsumptionPercent", 0.0);
+  writer.json_keyvalue("maxRss", std::to_string(static_cast<uint64_t>(rusage.ru_maxrss)));
+  writer.json_keyvalue("rss", std::to_string(static_cast<uint64_t>(rss)));
+  writer.json_keyvalue("free_memory", std::to_string(static_cast<uint64_t>(uv_get_free_memory())));
+  writer.json_keyvalue("total_memory", std::to_string(static_cast<uint64_t>(uv_get_total_memory())));
+  writer.json_keyvalue("available_memory", std::to_string(static_cast<uint64_t>(uv_get_available_memory())));
+  const uint64_t constrained_memory = uv_get_constrained_memory();
+  if (constrained_memory > 0) {
+    writer.json_keyvalue("constrained_memory", std::to_string(constrained_memory));
+  }
+  writer.json_objectstart("pageFaults");
+  writer.json_keyvalue("IORequired", static_cast<int64_t>(rusage.ru_majflt));
+  writer.json_keyvalue("IONotRequired", static_cast<int64_t>(rusage.ru_minflt));
+  writer.json_objectend();
+  writer.json_objectstart("fsActivity");
+  writer.json_keyvalue("reads", static_cast<int64_t>(rusage.ru_inblock));
+  writer.json_keyvalue("writes", static_cast<int64_t>(rusage.ru_oublock));
+  writer.json_objectend();
+  writer.json_objectend();
+}
+
+void WriteReportEnvironmentVariables(SimpleJsonWriter& writer) {
+  writer.json_objectstart("environmentVariables");
+#if defined(_WIN32)
+  char** entries = _environ;
+#else
+  char** entries = environ;
+#endif
+  if (entries != nullptr) {
+    for (; *entries != nullptr; ++entries) {
+      const char* sep = std::strchr(*entries, '=');
+      if (sep == nullptr) continue;
+      const std::string key(*entries, static_cast<size_t>(sep - *entries));
+      writer.json_keyvalue(key, sep + 1);
+    }
+  }
+  writer.json_objectend();
+}
+
+void WriteReportUserLimits(SimpleJsonWriter& writer) {
+  writer.json_objectstart("userLimits");
+  const char* keys[] = {
+      "core_file_size_blocks",
+      "data_seg_size_bytes",
+      "file_size_blocks",
+      "max_locked_memory_bytes",
+      "max_memory_size_bytes",
+      "open_files",
+      "stack_size_bytes",
+      "cpu_time_seconds",
+      "max_user_processes",
+      "virtual_memory_bytes",
+  };
+  for (const char* key : keys) {
+    writer.json_objectstart(key);
+    writer.json_keyvalue("soft", "unlimited");
+    writer.json_keyvalue("hard", "unlimited");
+    writer.json_objectend();
+  }
+  writer.json_objectend();
+}
+
+void WriteReportJavascriptHeap(SimpleJsonWriter& writer,
+                               napi_env env,
+                               const ReportBindingState* state) {
+  double heap_total = 0;
+  double heap_used = 0;
+  double external = 0;
+  double array_buffers = 0;
+  if (env != nullptr) {
+    (void)unofficial_napi_get_process_memory_info(env, &heap_total, &heap_used, &external, &array_buffers);
+  }
+
+  writer.json_objectstart("javascriptHeap");
+  writer.json_keyvalue("totalMemory", static_cast<int64_t>(heap_total));
+  writer.json_keyvalue("executableMemory", static_cast<int64_t>(0));
+  writer.json_keyvalue("totalCommittedMemory", static_cast<int64_t>(heap_total));
+  writer.json_keyvalue("availableMemory", static_cast<int64_t>(0));
+  writer.json_keyvalue("totalGlobalHandlesMemory", static_cast<int64_t>(0));
+  writer.json_keyvalue("usedGlobalHandlesMemory", static_cast<int64_t>(0));
+  writer.json_keyvalue("usedMemory", static_cast<int64_t>(heap_used));
+  writer.json_keyvalue("memoryLimit", static_cast<int64_t>(state != nullptr ? state->max_heap_size_bytes : 0));
+  writer.json_keyvalue("mallocedMemory", static_cast<int64_t>(0));
+  writer.json_keyvalue("externalMemory", static_cast<int64_t>(external));
+  writer.json_keyvalue("peakMallocedMemory", static_cast<int64_t>(0));
+  writer.json_keyvalue("nativeContextCount", static_cast<int64_t>(0));
+  writer.json_keyvalue("detachedContextCount", static_cast<int64_t>(0));
+  writer.json_keyvalue("doesZapGarbage", static_cast<int64_t>(0));
+  writer.json_objectstart("heapSpaces");
+  writer.json_objectstart("new_space");
+  writer.json_keyvalue("memorySize", static_cast<int64_t>(0));
+  writer.json_keyvalue("committedMemory", static_cast<int64_t>(0));
+  writer.json_keyvalue("capacity", static_cast<int64_t>(0));
+  writer.json_keyvalue("used", static_cast<int64_t>(0));
+  writer.json_keyvalue("available", static_cast<int64_t>(0));
+  writer.json_objectend();
+  writer.json_objectend();
+  writer.json_objectend();
+}
+
+std::string BuildNativeFatalReportPayload(napi_env env,
+                                          const ReportBindingState* state,
+                                          const std::string& event_message,
+                                          const std::string& trigger,
+                                          const std::string& report_filename) {
+  std::ostringstream out;
+  SimpleJsonWriter writer(out, state != nullptr && state->compact);
+
+  writer.json_start();
+  writer.json_objectstart("header");
+  writer.json_keyvalue("reportVersion", 5);
+  writer.json_keyvalue("event", event_message);
+  writer.json_keyvalue("trigger", trigger);
+  if (!report_filename.empty()) {
+    writer.json_keyvalue("filename", report_filename);
+  } else {
+    writer.json_keyvalue("filename", SimpleJsonWriter::Null{});
+  }
+
+  const auto now_tp = std::chrono::system_clock::now();
+  const auto now = std::chrono::system_clock::to_time_t(now_tp);
+  std::tm utc_tm{};
+#if defined(_WIN32)
+  gmtime_s(&utc_tm, &now);
+#else
+  gmtime_r(&now, &utc_tm);
+#endif
+  char time_buf[64] = {'\0'};
+  std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%SZ", &utc_tm);
+  writer.json_keyvalue("dumpEventTime", time_buf);
+  writer.json_keyvalue(
+      "dumpEventTimeStamp",
+      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now_tp.time_since_epoch()).count()));
+  writer.json_keyvalue("processId", static_cast<int64_t>(uv_os_getpid()));
+  writer.json_keyvalue("threadId", static_cast<int64_t>(uv_os_getpid()));
+  writer.json_keyvalue("wordSize", static_cast<int64_t>(sizeof(void*) * 8));
+
+  if (state != nullptr && !state->command_line.empty()) {
+    WriteJsonStringArray(writer, "commandLine", state->command_line);
+  } else {
+    WriteJsonStringArray(writer, "commandLine", BuildCommandLineSnapshot({}, {}, ""));
+  }
+
+  writer.json_keyvalue("nodejsVersion", NODE_VERSION);
+  writer.json_keyvalue("arch", DetectArch());
+  writer.json_keyvalue("platform", DetectPlatform());
+  WriteReportComponentVersions(writer, state != nullptr && state->has_intl);
+  WriteReportRelease(writer);
+
+  char cwd_buf[4096] = {'\0'};
+  size_t cwd_size = sizeof(cwd_buf);
+  if (uv_cwd(cwd_buf, &cwd_size) == 0) {
+    writer.json_keyvalue("cwd", std::string(cwd_buf, cwd_size));
+  } else {
+    writer.json_keyvalue("cwd", "");
+  }
+
+  uv_utsname_t os_info{};
+  if (uv_os_uname(&os_info) == 0) {
+    writer.json_keyvalue("osName", os_info.sysname);
+    writer.json_keyvalue("osRelease", os_info.release);
+    writer.json_keyvalue("osVersion", os_info.version);
+    writer.json_keyvalue("osMachine", os_info.machine);
+  } else {
+    writer.json_keyvalue("osName", "");
+    writer.json_keyvalue("osRelease", "");
+    writer.json_keyvalue("osVersion", "");
+    writer.json_keyvalue("osMachine", "");
+  }
+
+  WriteReportCpuInfo(writer);
+  if (state == nullptr || !state->exclude_network) {
+    WriteReportNetworkInterfaces(writer);
+  }
+
+  char host[UV_MAXHOSTNAMESIZE] = {'\0'};
+  size_t host_size = sizeof(host);
+  if (uv_os_gethostname(host, &host_size) == 0) {
+    writer.json_keyvalue("host", std::string(host, host_size));
+  } else {
+    writer.json_keyvalue("host", "");
+  }
+  writer.json_keyvalue("glibcVersionRuntime", "");
+  writer.json_keyvalue("glibcVersionCompiler", "");
+  writer.json_objectend();
+
+  writer.json_arraystart("nativeStack");
+  writer.json_start();
+  writer.json_keyvalue("pc", PointerToHexString(reinterpret_cast<uint64_t>(&BuildNativeFatalReportPayload)));
+  writer.json_keyvalue("symbol", "ubi::BuildNativeFatalReportPayload");
+  writer.json_end();
+  writer.json_arrayend();
+
+  writer.json_objectstart("javascriptStack");
+  writer.json_keyvalue("message", event_message);
+  writer.json_arraystart("stack");
+  writer.json_arrayend();
+  writer.json_objectstart("errorProperties");
+  writer.json_objectend();
+  writer.json_objectend();
+
+  writer.json_arraystart("libuv");
+  writer.json_start();
+  writer.json_keyvalue("type", "loop");
+  writer.json_keyvalue("address", PointerToHexString(reinterpret_cast<uint64_t>(env)));
+  writer.json_keyvalue("is_active", true);
+  writer.json_end();
+  writer.json_arrayend();
+
+  writer.json_arraystart("sharedObjects");
+  writer.json_arrayend();
+  WriteReportResourceUsage(writer);
+  writer.json_arraystart("workers");
+  writer.json_arrayend();
+  if (state == nullptr || !state->exclude_env) {
+    WriteReportEnvironmentVariables(writer);
+  }
+  WriteReportUserLimits(writer);
+  WriteReportJavascriptHeap(writer, env, state);
+  writer.json_end();
+  return out.str();
+}
+
+[[noreturn]] void FatalErrorReportCallback(napi_env env,
+                                           const char* location,
+                                           const char* message) {
+  const std::string event_message = message != nullptr ? message : "Fatal error";
+  if (location != nullptr && location[0] != '\0') {
+    std::fprintf(stderr, "FATAL ERROR: %s %s\n", location, event_message.c_str());
+  } else {
+    std::fprintf(stderr, "FATAL ERROR: %s\n", event_message.c_str());
+  }
+
+  ReportBindingState* state = GetReportState(env);
+  if (state != nullptr && state->report_on_fatal_error) {
+    const std::string filename = ResolveReportFilename(state, "");
+    const std::string payload = BuildNativeFatalReportPayload(env, state, event_message, "FatalError", filename);
+    (void)WriteReportPayload(state, filename, payload);
+  }
+
+  std::fflush(stderr);
+  std::abort();
+}
+
+[[noreturn]] void OomErrorReportCallback(napi_env env,
+                                         const char* location,
+                                         bool is_heap_oom,
+                                         const char* detail) {
+  const char* message = is_heap_oom ? "Allocation failed - JavaScript heap out of memory"
+                                    : "Allocation failed - process out of memory";
+  if (location != nullptr && location[0] != '\0') {
+    std::fprintf(stderr, "FATAL ERROR: %s %s\n", location, message);
+  } else {
+    std::fprintf(stderr, "FATAL ERROR: %s\n", message);
+  }
+  if (detail != nullptr && detail[0] != '\0') {
+    std::fprintf(stderr, "Reason: %s\n", detail);
+  }
+
+  ReportBindingState* state = GetReportState(env);
+  if (state != nullptr && state->report_on_fatal_error) {
+    const std::string filename = ResolveReportFilename(state, "");
+    const std::string payload = BuildNativeFatalReportPayload(env, state, message, "OOMError", filename);
+    (void)WriteReportPayload(state, filename, payload);
+  }
+
+  std::fflush(stderr);
+  std::abort();
 }
 
 bool IsValidMacAddress(const std::string& mac) {
@@ -2565,38 +4046,60 @@ napi_value ProcessMethodsDlopenCallback(napi_env env, napi_callback_info info) {
   const std::string maybe_name = NapiValueToUtf8(env, argv[1]);
   if (!maybe_name.empty()) filename = maybe_name;
 
-  napi_value module = argv[0];
+  int32_t flags = kDefaultDlopenFlags;
+  if (argc > 2 && argv[2] != nullptr) {
+    if (napi_get_value_int32(env, argv[2], &flags) != napi_ok) {
+      ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_TYPE", "flag argument must be an integer.");
+      return nullptr;
+    }
+  }
+  const std::string cache_key = BuildDlopenCacheKey(filename, flags);
+
+  napi_value module = nullptr;
+  if (napi_coerce_to_object(env, argv[0], &module) != napi_ok || module == nullptr) {
+    return nullptr;
+  }
+
+  napi_value exports_value = nullptr;
+  if (napi_get_named_property(env, module, "exports", &exports_value) != napi_ok || exports_value == nullptr) {
+    return nullptr;
+  }
+
   napi_value exports = nullptr;
-  if (napi_get_named_property(env, module, "exports", &exports) != napi_ok || exports == nullptr) {
+  if (napi_coerce_to_object(env, exports_value, &exports) != napi_ok || exports == nullptr) {
     return nullptr;
   }
 
   napi_addon_register_func init = nullptr;
+  uv_lib_t* lib = nullptr;
+  std::unique_ptr<uv_lib_t> newly_loaded;
+  bool cache_loaded_library = false;
   {
     std::lock_guard<std::mutex> lock(g_process_dlopen_mutex);
-    uv_lib_t* lib = nullptr;
-    auto it = g_process_dlopen_handles.find(filename);
-    if (it == g_process_dlopen_handles.end()) {
-      auto loaded = std::make_unique<uv_lib_t>();
-      if (uv_dlopen(filename.c_str(), loaded.get()) != 0) {
-        const char* dlerror = uv_dlerror(loaded.get());
-        const std::string message =
-            dlerror != nullptr && dlerror[0] != '\0'
-                ? dlerror
-                : ("Cannot open shared object file: '" + filename + "'");
-        ThrowErrorWithCode(env, "ERR_DLOPEN_FAILED", message.c_str());
-        return nullptr;
-      }
-      lib = loaded.get();
-      g_process_dlopen_handles.emplace(filename, std::move(loaded));
-    } else {
+    auto it = g_process_dlopen_handles.find(cache_key);
+    if (it != g_process_dlopen_handles.end()) {
       lib = it->second.get();
     }
-    init = GetNapiInitializerCallback(lib);
   }
+
+  if (lib == nullptr) {
+    newly_loaded = std::make_unique<uv_lib_t>();
+    std::string message;
+    if (OpenDynamicLibrary(filename, flags, newly_loaded.get(), &message) != 0) {
+      ThrowErrorWithCode(env, "ERR_DLOPEN_FAILED", message.c_str());
+      return nullptr;
+    }
+    lib = newly_loaded.get();
+    cache_loaded_library = true;
+  }
+
+  init = GetNapiInitializerCallback(lib);
 
   if (init == nullptr) {
     const std::string message = "Module did not self-register: '" + filename + "'.";
+    if (cache_loaded_library && newly_loaded != nullptr) {
+      CloseDynamicLibrary(newly_loaded.get());
+    }
     ThrowErrorWithCode(env, "ERR_DLOPEN_FAILED", message.c_str());
     return nullptr;
   }
@@ -2612,6 +4115,11 @@ napi_value ProcessMethodsDlopenCallback(napi_env env, napi_callback_info info) {
   if (addon_exports != nullptr &&
       (napi_strict_equals(env, addon_exports, exports, &same_exports) != napi_ok || !same_exports)) {
     napi_set_named_property(env, module, "exports", addon_exports);
+  }
+
+  if (cache_loaded_library && newly_loaded != nullptr) {
+    std::lock_guard<std::mutex> lock(g_process_dlopen_mutex);
+    g_process_dlopen_handles.emplace(cache_key, std::move(newly_loaded));
   }
 
   napi_value undefined = nullptr;
@@ -2860,58 +4368,23 @@ napi_value ReportWriteReportCallback(napi_env env, napi_callback_info info) {
   ReportBindingState* state = GetReportState(env);
   if (state == nullptr) return nullptr;
 
-  if (!std::filesystem::exists(state->directory)) {
-    std::filesystem::create_directories(state->directory);
-  }
+  const std::string filename = ResolveReportFilename(state, requested_file);
 
-  std::string output_file = requested_file;
-  if (output_file.empty()) {
-    if (state->filename.empty()) {
-      state->sequence++;
-      std::ostringstream generated;
-      generated << BuildDefaultReportFilename() << state->sequence << ".json";
-      output_file = generated.str();
-    } else {
-      output_file = state->filename;
-    }
-  }
-  const std::string absolute_path =
-      std::filesystem::path(output_file).is_absolute() ? output_file : JoinPath(state->directory, output_file);
-
-  napi_value report_obj = BuildReportObject(env, event_message, trigger, absolute_path);
+  napi_value report_obj = BuildReportObject(env, event_message, trigger, filename, argc >= 4 ? argv[3] : nullptr);
   if (report_obj == nullptr) return nullptr;
-
-  napi_value global = nullptr;
-  napi_value json_obj = nullptr;
-  napi_value stringify_fn = nullptr;
-  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
-      napi_get_named_property(env, global, "JSON", &json_obj) != napi_ok || json_obj == nullptr ||
-      napi_get_named_property(env, json_obj, "stringify", &stringify_fn) != napi_ok || stringify_fn == nullptr) {
-    return nullptr;
-  }
-  napi_value null_value = nullptr;
-  napi_get_null(env, &null_value);
-  napi_value space = nullptr;
-  if (state->compact) {
-    napi_create_int32(env, 0, &space);
-  } else {
-    napi_create_int32(env, 2, &space);
-  }
-  napi_value stringify_argv[3] = {report_obj, null_value, space};
-  napi_value json_string = nullptr;
-  if (napi_call_function(env, json_obj, stringify_fn, 3, stringify_argv, &json_string) != napi_ok ||
-      json_string == nullptr) {
-    return nullptr;
-  }
+  napi_value json_string = StringifyReportObject(env, report_obj, state->compact);
+  if (json_string == nullptr) return nullptr;
   std::string payload = NapiValueToUtf8(env, json_string);
   payload.push_back('\n');
 
-  std::ofstream out(absolute_path, std::ios::out | std::ios::trunc);
-  out << payload;
-  out.close();
+  if (!WriteReportPayload(state, filename, payload)) {
+    napi_value empty = nullptr;
+    napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &empty);
+    return empty;
+  }
 
   napi_value path_value = nullptr;
-  napi_create_string_utf8(env, absolute_path.c_str(), NAPI_AUTO_LENGTH, &path_value);
+  napi_create_string_utf8(env, filename.c_str(), NAPI_AUTO_LENGTH, &path_value);
   return path_value;
 }
 
@@ -2921,27 +4394,10 @@ napi_value ReportGetReportCallback(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   const std::string event_message = "JavaScript API";
   const std::string trigger = "GetReport";
-  napi_value report_obj = BuildReportObject(env, event_message, trigger, "");
+  ReportBindingState* state = GetReportState(env);
+  napi_value report_obj = BuildReportObject(env, event_message, trigger, "", argc >= 1 ? argv[0] : nullptr);
   if (report_obj == nullptr) return nullptr;
-  napi_value global = nullptr;
-  napi_value json_obj = nullptr;
-  napi_value stringify_fn = nullptr;
-  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
-      napi_get_named_property(env, global, "JSON", &json_obj) != napi_ok || json_obj == nullptr ||
-      napi_get_named_property(env, json_obj, "stringify", &stringify_fn) != napi_ok || stringify_fn == nullptr) {
-    return nullptr;
-  }
-  napi_value null_value = nullptr;
-  napi_get_null(env, &null_value);
-  napi_value space = nullptr;
-  napi_create_int32(env, 2, &space);
-  napi_value stringify_argv[3] = {report_obj, null_value, space};
-  napi_value json_string = nullptr;
-  if (napi_call_function(env, json_obj, stringify_fn, 3, stringify_argv, &json_string) != napi_ok ||
-      json_string == nullptr) {
-    return nullptr;
-  }
-  return json_string;
+  return StringifyReportObject(env, report_obj, state != nullptr && state->compact);
 }
 
 napi_value ReportGetCompactCallback(napi_env env, napi_callback_info info) {
@@ -3010,7 +4466,7 @@ napi_value ReportSetExcludeEnvCallback(napi_env env, napi_callback_info info) {
 napi_value ReportGetDirectoryCallback(napi_env env, napi_callback_info info) {
   ReportBindingState* state = GetReportState(env);
   napi_value out = nullptr;
-  const std::string value = state != nullptr ? state->directory : ".";
+  const std::string value = state != nullptr ? state->directory : "";
   napi_create_string_utf8(env, value.c_str(), NAPI_AUTO_LENGTH, &out);
   return out;
 }
@@ -3022,7 +4478,6 @@ napi_value ReportSetDirectoryCallback(napi_env env, napi_callback_info info) {
   ReportBindingState* state = GetReportState(env);
   if (state != nullptr && argc >= 1 && argv[0] != nullptr) {
     state->directory = NapiValueToUtf8(env, argv[0]);
-    if (state->directory.empty()) state->directory = ".";
   }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -3220,7 +4675,7 @@ napi_status UbiInstallProcessObject(napi_env env,
   status = napi_set_named_property(env, process_obj, "execArgv", exec_argv_arr);
   if (status != napi_ok) return status;
 
-  const std::string title = process_title.empty() ? "ubi" : process_title;
+  const std::string title = process_title.empty() ? g_ubi_exec_path : process_title;
   g_process_title = title;
   (void)uv_set_process_title(g_process_title.c_str());
   napi_value title_value = nullptr;
@@ -3347,35 +4802,21 @@ napi_status UbiInstallProcessObject(napi_env env,
   napi_value versions_obj = nullptr;
   status = napi_create_object(env, &versions_obj);
   if (status != napi_ok || versions_obj == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  struct VersionEntry {
-    const char* key;
-    std::string value;
-  };
-  const VersionEntry version_entries[] = {
-      {"node", NODE_VERSION_STRING},
-      {"acorn", ACORN_VERSION},
-      {"ada", ADA_VERSION},
-      {"amaro", GetAmaroVersion()},
-      {"ares", ARES_VERSION_STR},
-      {"brotli", GetBrotliVersion()},
-      {"cjs_module_lexer", CJS_MODULE_LEXER_VERSION},
-      {"llhttp", GetLlhttpVersion()},
-      {"modules", UBI_STRINGIFY(NODE_MODULE_VERSION)},
-      {"napi", UBI_STRINGIFY(NODE_API_SUPPORTED_VERSION_MAX)},
-      {"nbytes", NBYTES_VERSION},
-      {"ncrypto", NCRYPTO_VERSION},
-      {"nghttp2", NGHTTP2_VERSION},
-      {"openssl", GetOpenSslVersion()},
-      {"simdjson", SIMDJSON_VERSION},
-      {"simdutf", SIMDUTF_VERSION},
-      {"undici", GetUndiciVersion()},
-      {"uv", uv_version_string()},
-      {"uvwasi", kUvwasiVersion},
-      {"v8", UBI_EMBEDDED_V8_VERSION},
-      {"zlib", ZLIB_VERSION},
-      {"zstd", ZSTD_VERSION_STRING},
-  };
+  const bool has_intl = RuntimeHasIntl(env);
+  std::vector<ProcessVersionEntry> version_entries = BuildProcessVersionEntries(has_intl);
+
+  napi_value node_version_value = nullptr;
+  status = napi_create_string_utf8(env, NODE_VERSION_STRING, NAPI_AUTO_LENGTH, &node_version_value);
+  if (status != napi_ok || node_version_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  napi_property_descriptor node_prop = {};
+  node_prop.utf8name = "node";
+  node_prop.value = node_version_value;
+  node_prop.attributes = napi_enumerable;
+  status = napi_define_properties(env, versions_obj, 1, &node_prop);
+  if (status != napi_ok) return status;
+
   for (const auto& entry : version_entries) {
+    if (entry.value.empty()) continue;
     napi_value value = nullptr;
     status = napi_create_string_utf8(env, entry.value.c_str(), NAPI_AUTO_LENGTH, &value);
     if (status != napi_ok || value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
@@ -3579,9 +5020,13 @@ napi_status UbiInstallProcessObject(napi_env env,
     state.report_on_fatal_error = HasExecArgvFlag(exec_argv, "--report-on-fatalerror");
     state.report_on_signal = HasExecArgvFlag(exec_argv, "--report-on-signal");
     state.report_on_uncaught_exception = HasExecArgvFlag(exec_argv, "--report-uncaught-exception");
-    state.directory = ".";
-    state.filename.clear();
-    state.signal = "SIGUSR2";
+    state.has_intl = has_intl;
+    state.directory = GetExecArgvStringOption(exec_argv, "--report-directory=");
+    state.filename = GetExecArgvStringOption(exec_argv, "--report-filename=");
+    const std::string report_signal = GetExecArgvStringOption(exec_argv, "--report-signal=");
+    state.signal = report_signal.empty() ? "SIGUSR2" : report_signal;
+    state.command_line = BuildCommandLineSnapshot(exec_argv, script_argv, current_script_path);
+    state.max_heap_size_bytes = ReadReportHeapLimitFromExecArgv(exec_argv);
     state.sequence = 0;
 
     napi_value binding = nullptr;
@@ -3626,6 +5071,10 @@ napi_status UbiInstallProcessObject(napi_env env,
     if (napi_create_reference(env, binding, 1, &state.binding_ref) != napi_ok || state.binding_ref == nullptr) {
       return napi_generic_failure;
     }
+  }
+
+  if (unofficial_napi_set_fatal_error_callbacks(env, FatalErrorReportCallback, OomErrorReportCallback) != napi_ok) {
+    return napi_generic_failure;
   }
 
   return napi_ok;

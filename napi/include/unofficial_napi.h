@@ -51,6 +51,18 @@ NAPI_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_val
 NAPI_EXTERN napi_status unofficial_napi_set_promise_reject_callback(napi_env env,
                                                                     napi_value callback);
 
+using unofficial_napi_fatal_error_callback =
+    void (*)(napi_env env, const char* location, const char* message);
+using unofficial_napi_oom_error_callback =
+    void (*)(napi_env env, const char* location, bool is_heap_oom, const char* detail);
+
+// Unofficial helpers for embedder-native fatal/OOM handling.
+// These callbacks run from the engine's fatal error hooks.
+NAPI_EXTERN napi_status unofficial_napi_set_fatal_error_callbacks(
+    napi_env env,
+    unofficial_napi_fatal_error_callback fatal_callback,
+    unofficial_napi_oom_error_callback oom_callback);
+
 // Unofficial helpers used by util/options parity work in ubi.
 // These expose engine-specific data that is not available in the public N-API.
 NAPI_EXTERN napi_status unofficial_napi_get_promise_details(napi_env env,

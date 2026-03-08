@@ -3,10 +3,13 @@
 #include <csignal>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -19,6 +22,7 @@
 
 #include "node_version.h"
 #include "unofficial_napi.h"
+#include "ubi_option_helpers.h"
 #include "ubi_compat_exec.h"
 #include "ubi_process.h"
 #include "ubi_runtime_platform.h"
@@ -129,41 +133,381 @@ std::string ResolveCliScriptPath(const char* script_path) {
   return direct.string();
 }
 
-std::vector<std::string> NormalizeCliOptionVector(const std::vector<std::string>& raw_args) {
-  std::vector<std::string> out;
-  out.reserve(raw_args.size());
+std::string CliErrorPrefix() {
+  std::string exec_path = UbiGetProcessExecPath();
+  if (exec_path.empty()) exec_path = "ubi";
+  return exec_path;
+}
 
-  for (size_t i = 0; i < raw_args.size(); ++i) {
-    const std::string& token = raw_args[i];
+std::string FormatCliError(const std::string& message) {
+  return CliErrorPrefix() + ": " + message;
+}
 
-    if (token == "--input-type" && i + 1 < raw_args.size()) {
-      out.push_back("--input-type=" + raw_args[++i]);
-      continue;
+bool ApplyEnvUpdate(const std::string& key, const std::string& value) {
+#if defined(_WIN32)
+  return _putenv_s(key.c_str(), value.c_str()) == 0;
+#else
+  return setenv(key.c_str(), value.c_str(), 1) == 0;
+#endif
+}
+
+void ApplyEnvUpdates(const std::unordered_map<std::string, std::string>& updates) {
+  for (const auto& [key, value] : updates) {
+    (void)ApplyEnvUpdate(key, value);
+  }
+}
+
+bool TokenHasInlineValue(const std::string& token) {
+  return token.find('=') != std::string::npos;
+}
+
+bool OptionConsumesNextToken(const std::string& token) {
+  static const std::unordered_set<std::string> kValueOptions = {
+      "-e",
+      "--eval",
+      "-pe",
+      "-ep",
+      "-r",
+      "--require",
+      "--input-type",
+      "--inspect-port",
+      "--debug-port",
+      "--stack-trace-limit",
+      "--secure-heap",
+      "--secure-heap-min",
+      "--disable-warning",
+      "--env-file",
+      "--env-file-if-exists",
+      "--experimental-config-file",
+      "--run",
+      "--allow-fs-read",
+      "--allow-fs-write",
+  };
+  return kValueOptions.find(token) != kValueOptions.end();
+}
+
+bool TokenRequiresNonEmptyInlineValue(const std::string& token) {
+  static const std::unordered_set<std::string> kRequireValue = {
+      "--debug-port=",
+      "--inspect-port=",
+  };
+  for (const auto& prefix : kRequireValue) {
+    if (token == prefix) return true;
+  }
+  return false;
+}
+
+bool IsBooleanOptionForNegation(const std::string& option) {
+  static const std::unordered_set<std::string> kBooleanOptions = {
+      "--abort-on-uncaught-exception",
+      "--allow-addons",
+      "--allow-child-process",
+      "--allow-inspector",
+      "--allow-wasi",
+      "--allow-worker",
+      "--async-context-frame",
+      "--check",
+      "--enable-source-maps",
+      "--entry-url",
+      "--experimental-addon-modules",
+      "--experimental-detect-module",
+      "--experimental-eventsource",
+      "--experimental-fetch",
+      "--experimental-global-customevent",
+      "--experimental-global-webcrypto",
+      "--experimental-import-meta-resolve",
+      "--experimental-inspector-network-resource",
+      "--experimental-network-inspection",
+      "--experimental-print-required-tla",
+      "--experimental-quic",
+      "--experimental-require-module",
+      "--experimental-report",
+      "--experimental-sqlite",
+      "--experimental-test-coverage",
+      "--experimental-test-module-mocks",
+      "--experimental-transform-types",
+      "--experimental-vm-modules",
+      "--experimental-wasm-modules",
+      "--experimental-webstorage",
+      "--experimental-worker",
+      "--expose-internals",
+      "--force-fips",
+      "--frozen-intrinsics",
+      "--insecure-http-parser",
+      "--inspect-brk",
+      "--interactive",
+      "--network-family-autoselection",
+      "--no-addons",
+      "--no-deprecation",
+      "--no-experimental-global-navigator",
+      "--no-experimental-websocket",
+      "--no-node-snapshot",
+      "--no-verify-base-objects",
+      "--node-snapshot",
+      "--openssl-legacy-provider",
+      "--openssl-shared-config",
+      "--pending-deprecation",
+      "--permission",
+      "--preserve-symlinks",
+      "--preserve-symlinks-main",
+      "--print",
+      "--report-on-signal",
+      "--strip-types",
+      "--test",
+      "--test-force-exit",
+      "--test-only",
+      "--test-update-snapshots",
+      "--throw-deprecation",
+      "--tls-max-v1.2",
+      "--tls-max-v1.3",
+      "--tls-min-v1.0",
+      "--tls-min-v1.1",
+      "--tls-min-v1.2",
+      "--tls-min-v1.3",
+      "--trace-deprecation",
+      "--trace-require-module",
+      "--trace-sigint",
+      "--trace-tls",
+      "--trace-warnings",
+      "--use-bundled-ca",
+      "--use-env-proxy",
+      "--use-openssl-ca",
+      "--use-system-ca",
+      "--verify-base-objects",
+      "--warnings",
+      "--watch",
+      "--watch-preserve-output",
+  };
+  return kBooleanOptions.find(option) != kBooleanOptions.end();
+}
+
+bool IsKnownNonBooleanOption(const std::string& option) {
+  static const std::unordered_set<std::string> kNonBooleanOptions = {
+      "--allow-fs-read",
+      "--allow-fs-write",
+      "--debug-port",
+      "--diagnostic-dir",
+      "--disable-warning",
+      "--dns-result-order",
+      "--env-file",
+      "--env-file-if-exists",
+      "--es-module-specifier-resolution",
+      "--eval",
+      "--experimental-config-file",
+      "--heapsnapshot-signal",
+      "--icu-data-dir",
+      "--input-type",
+      "--inspect-port",
+      "--localstorage-file",
+      "--max-http-header-size",
+      "--openssl-config",
+      "--redirect-warnings",
+      "--require",
+      "--run",
+      "--secure-heap",
+      "--secure-heap-min",
+      "--stack-trace-limit",
+      "--test-global-setup",
+      "--test-isolation",
+      "--test-rerun-failures",
+      "--test-shard",
+      "--tls-cipher-list",
+      "--tls-keylog",
+      "--unhandled-rejections",
+      "--watch-kill-signal",
+  };
+  return kNonBooleanOptions.find(option) != kNonBooleanOptions.end();
+}
+
+bool ValidateNegatedOption(const std::string& token, std::string* error_out) {
+  if (token.rfind("--no-", 0) != 0) return true;
+  if (IsBooleanOptionForNegation(token)) return true;
+  const std::string normalized = "--" + token.substr(5);
+  if (IsBooleanOptionForNegation(normalized)) return true;
+  if (IsKnownNonBooleanOption(normalized)) {
+    if (error_out != nullptr) {
+      *error_out = FormatCliError(token + " is an invalid negation because it is not a boolean option");
     }
+    return false;
+  }
+  if (error_out != nullptr) {
+    *error_out = "bad option: " + token;
+  }
+  return false;
+}
 
-    if ((token == "-e" || token == "--eval") && i + 1 < raw_args.size()) {
-      out.push_back("--eval=" + raw_args[++i]);
-      continue;
-    }
+bool HasDisallowedNodeOption(const std::string& token) {
+  static const std::unordered_set<std::string> kDisallowedExact = {
+      "--",
+      "--check",
+      "--eval",
+      "--expose-internals",
+      "--expose_internals",
+      "--help",
+      "--interactive",
+      "--print",
+      "--test",
+      "--v8-options",
+      "--version",
+      "-c",
+      "-e",
+      "-h",
+      "-i",
+      "-p",
+      "-pe",
+      "-v",
+  };
+  const size_t eq = token.find('=');
+  const std::string key = eq == std::string::npos ? token : token.substr(0, eq);
+  return kDisallowedExact.find(key) != kDisallowedExact.end();
+}
 
-    if (token == "-p" || token == "--print") {
-      out.push_back("--print");
-      if (i + 1 < raw_args.size()) {
-        out.push_back("--eval=" + raw_args[++i]);
+bool IsRecognizedCliOptionToken(const std::string& token) {
+  if (token == "--" || token == "-") return true;
+  if (token == "-c" || token == "--check" ||
+      token == "-e" || token == "--eval" ||
+      token == "-i" || token == "--interactive" ||
+      token == "-p" || token == "--print" ||
+      token == "-pe" || token == "-ep" ||
+      token == "-r" || token == "--require" ||
+      token == "--run") {
+    return true;
+  }
+  if (TokenHasInlineValue(token)) {
+    const std::string key = token.substr(0, token.find('='));
+    return OptionConsumesNextToken(key) ||
+           key == "--env-file" ||
+           key == "--env-file-if-exists" ||
+           key == "--experimental-config-file" ||
+           key == "--input-type";
+  }
+  if (OptionConsumesNextToken(token)) return true;
+  if (IsBooleanOptionForNegation(token)) return true;
+  if (token.rfind("--no-", 0) == 0) return true;
+  if (token.rfind("--env-file=", 0) == 0 ||
+      token.rfind("--env-file-if-exists=", 0) == 0 ||
+      token.rfind("--experimental-config-file=", 0) == 0 ||
+      token.rfind("--input-type=", 0) == 0) {
+    return true;
+  }
+  return false;
+}
+
+bool ValidateNodeOptions(const std::vector<std::string>& node_options_tokens, std::string* error_out) {
+  for (const auto& token : node_options_tokens) {
+    if (HasDisallowedNodeOption(token)) {
+      if (error_out != nullptr) {
+        *error_out = FormatCliError(token + " is not allowed in NODE_OPTIONS");
       }
-      continue;
+      return false;
     }
+  }
+  return true;
+}
 
-    if ((token == "-pe" || token == "-ep") && i + 1 < raw_args.size()) {
-      out.push_back("--print");
-      out.push_back("--eval=" + raw_args[++i]);
-      continue;
+bool RawExecArgvHasInputType(const std::vector<std::string>& raw_exec_argv) {
+  for (const auto& token : raw_exec_argv) {
+    if (token == "--input-type" || token.rfind("--input-type=", 0) == 0) {
+      return true;
     }
+  }
+  return false;
+}
 
-    out.push_back(token);
+bool IsPermissionFlagToken(const std::string& token) {
+  const size_t eq = token.find('=');
+  const std::string key = eq == std::string::npos ? token : token.substr(0, eq);
+  return key == "--permission" ||
+         key == "--allow-fs-read" ||
+         key == "--allow-fs-write" ||
+         key == "--allow-addons" ||
+         key == "--allow-child-process" ||
+         key == "--allow-inspector" ||
+         key == "--allow-worker" ||
+         key == "--allow-wasi";
+}
+
+bool AreProcessWarningsSuppressed() {
+  const char* value = std::getenv("NODE_NO_WARNINGS");
+  if (value == nullptr || value[0] == '\0') return false;
+  return std::strcmp(value, "0") != 0;
+}
+
+void WarnUnsupportedPermissionsIfNeeded(const ubi_options::EffectiveCliState& state) {
+  if (AreProcessWarningsSuppressed()) return;
+  for (const auto& token : state.effective_tokens) {
+    if (!IsPermissionFlagToken(token)) continue;
+    std::cerr << "Warning: permissions are not supported in Ubi; ignoring permission flags.\n";
+    return;
+  }
+}
+
+bool TryLoadPackageScripts(const std::filesystem::path& package_json_path,
+                           std::vector<std::pair<std::string, std::string>>* scripts_out) {
+  if (scripts_out == nullptr) return false;
+  scripts_out->clear();
+
+  std::ifstream input(package_json_path, std::ios::in | std::ios::binary);
+  if (!input.is_open()) return false;
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+
+  simdjson::ondemand::parser parser;
+  simdjson::padded_string padded(buffer.str());
+  simdjson::ondemand::document document;
+  simdjson::ondemand::object root;
+  if (parser.iterate(padded).get(document) != simdjson::SUCCESS ||
+      document.get_object().get(root) != simdjson::SUCCESS) {
+    return false;
   }
 
-  return out;
+  simdjson::ondemand::value scripts_value;
+  if (root["scripts"].get(scripts_value) != simdjson::SUCCESS) return false;
+  simdjson::ondemand::object scripts;
+  if (scripts_value.get_object().get(scripts) != simdjson::SUCCESS) return false;
+
+  for (auto field : scripts) {
+    std::string_view raw_key;
+    std::string_view value;
+    if (field.unescaped_key().get(raw_key) != simdjson::SUCCESS ||
+        field.value().get_string().get(value) != simdjson::SUCCESS) {
+      continue;
+    }
+    scripts_out->push_back({std::string(raw_key), std::string(value)});
+  }
+  return true;
+}
+
+int RunCliPackageScript(const std::string& script_name, std::string* error_out) {
+  const std::filesystem::path package_json_path =
+      std::filesystem::current_path() / "package.json";
+  std::vector<std::pair<std::string, std::string>> scripts;
+  const bool has_scripts = TryLoadPackageScripts(package_json_path, &scripts);
+
+  if (!has_scripts) {
+    if (error_out != nullptr) {
+      *error_out = "Missing script: \"" + script_name + "\"";
+    }
+    return 1;
+  }
+
+  for (const auto& [name, _] : scripts) {
+    if (name == script_name) {
+      if (error_out != nullptr) {
+        *error_out = "The --run launcher is not implemented for existing scripts yet";
+      }
+      return 1;
+    }
+  }
+
+  if (error_out != nullptr) {
+    *error_out = "Missing script: \"" + script_name + "\" for " +
+                 package_json_path.string() + "\n\nAvailable scripts are:\n";
+    for (const auto& [name, value] : scripts) {
+      *error_out += "  " + name + ": " + value + "\n";
+    }
+  }
+  return 1;
 }
 
 bool StdinIsTTY() {
@@ -228,114 +572,239 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     std::cout << NODE_VERSION << "\n";
     return 0;
   }
-  int mode_index = -1;
-  std::string mode;
-  for (int i = 1; i < argc; ++i) {
+  enum class CliMode {
+    kNone,
+    kInteractive,
+    kEval,
+    kPrint,
+    kCheck,
+    kRun,
+  };
+
+  CliMode mode = CliMode::kNone;
+  std::vector<std::string> raw_exec_argv;
+  std::vector<std::string> script_argv;
+  raw_exec_argv.reserve(static_cast<size_t>(argc));
+  int script_index = argc;
+  std::string run_target;
+  bool saw_check = false;
+  bool print_flag = false;
+  bool has_eval_string = false;
+
+  auto set_requires_argument_error = [&](const std::string& token) {
+    if (error_out != nullptr) {
+      *error_out = FormatCliError(token + " requires an argument");
+    }
+  };
+
+  auto finalize_effective_state = [&](ubi_options::EffectiveCliState* out_state) -> bool {
+    if (out_state == nullptr) return false;
+    *out_state = ubi_options::BuildEffectiveCliState(raw_exec_argv);
+    if (!out_state->ok) {
+      if (error_out != nullptr) {
+        *error_out = FormatCliError(out_state->error);
+      }
+      return false;
+    }
+    if (!ValidateNodeOptions(out_state->node_options_tokens, error_out)) {
+      return false;
+    }
+    ApplyEnvUpdates(out_state->env_updates);
+    for (const auto& warning : out_state->warnings) {
+      std::cerr << warning << "\n";
+    }
+    WarnUnsupportedPermissionsIfNeeded(*out_state);
+    return true;
+  };
+
+  int i = 1;
+  for (; i < argc; ++i) {
     if (argv[i] == nullptr) continue;
     const std::string token(argv[i]);
-    if (token == "-e" || token == "--eval" || token == "-p" || token == "--print" ||
-        token == "-pe" || token == "-ep" || token == "-i" || token == "--interactive") {
-      mode_index = i;
-      mode = token;
+
+    if (token == "--") {
+      script_index = i + 1;
       break;
+    }
+    if (token == "-") {
+      script_index = i;
+      break;
+    }
+    if (token.empty() || token[0] != '-') {
+      script_index = i;
+      break;
+    }
+    if (token.rfind("--env-file-", 0) == 0 &&
+        token != "--env-file" &&
+        token.rfind("--env-file=", 0) != 0 &&
+        token != "--env-file-if-exists" &&
+        token.rfind("--env-file-if-exists=", 0) != 0) {
+      if (error_out != nullptr) {
+        *error_out = "bad option: " + token;
+      }
+      return 9;
+    }
+    if (!ValidateNegatedOption(token, error_out)) {
+      return 9;
+    }
+    if (TokenRequiresNonEmptyInlineValue(token)) {
+      set_requires_argument_error(token.substr(0, token.size() - 1));
+      return 9;
+    }
+
+    if (token == "-c" || token == "--check") {
+      raw_exec_argv.push_back(token);
+      saw_check = true;
+      mode = CliMode::kCheck;
+      continue;
+    }
+    if (token == "-i" || token == "--interactive") {
+      raw_exec_argv.push_back(token);
+      mode = CliMode::kInteractive;
+      continue;
+    }
+    if (token == "-e" || token == "--eval" ||
+        token == "-pe" || token == "-ep") {
+      if (saw_check) {
+        if (error_out != nullptr) {
+          *error_out = FormatCliError("either --check or --eval can be used, not both");
+        }
+        return 9;
+      }
+      if (i + 1 >= argc || argv[i + 1] == nullptr) {
+        set_requires_argument_error(token);
+        return 9;
+      }
+      raw_exec_argv.push_back(token);
+      raw_exec_argv.emplace_back(argv[++i]);
+      has_eval_string = true;
+      if (token == "-p" || token == "--print" || token == "-pe" || token == "-ep") {
+        print_flag = true;
+      }
+      mode = print_flag ? CliMode::kPrint : CliMode::kEval;
+      script_index = i + 1;
+      break;
+    }
+    if (token == "-p" || token == "--print") {
+      raw_exec_argv.push_back(token);
+      print_flag = true;
+      mode = CliMode::kPrint;
+      if (i + 1 < argc && argv[i + 1] != nullptr) {
+        const std::string next(argv[i + 1]);
+        if (!IsRecognizedCliOptionToken(next)) {
+          raw_exec_argv.emplace_back(argv[++i]);
+          has_eval_string = true;
+          script_index = i + 1;
+          break;
+        }
+      }
+      continue;
+    }
+    if (token == "--run") {
+      if (i + 1 >= argc || argv[i + 1] == nullptr) {
+        set_requires_argument_error(token);
+        return 9;
+      }
+      raw_exec_argv.push_back(token);
+      run_target = argv[++i];
+      raw_exec_argv.push_back(run_target);
+      mode = CliMode::kRun;
+      script_index = i + 1;
+      break;
+    }
+
+    raw_exec_argv.push_back(token);
+    if (TokenHasInlineValue(token)) continue;
+    if (OptionConsumesNextToken(token)) {
+      if (i + 1 >= argc || argv[i + 1] == nullptr) {
+        set_requires_argument_error(token);
+        return 9;
+      }
+      raw_exec_argv.emplace_back(argv[++i]);
     }
   }
 
-  const bool is_interactive = (mode == "-i" || mode == "--interactive");
-  if (is_interactive) {
-    for (int i = mode_index + 1; i < argc; ++i) {
-      if (argv[i] == nullptr) continue;
-      const std::string token(argv[i]);
-      if (token == "--input-type" || token.rfind("--input-type=", 0) == 0) {
-        if (error_out != nullptr) {
-          *error_out = "Cannot specify --input-type for REPL";
-        }
-        return 1;
+  if (script_index == argc) script_index = i;
+
+  ubi_options::EffectiveCliState effective_state;
+  if (!finalize_effective_state(&effective_state)) {
+    return 9;
+  }
+
+  UbiSetExecArgv(raw_exec_argv);
+
+  if (mode == CliMode::kInteractive) {
+    if (RawExecArgvHasInputType(raw_exec_argv)) {
+      if (error_out != nullptr) {
+        *error_out = "Cannot specify --input-type for REPL";
       }
+      return 1;
     }
-    std::vector<std::string> raw_exec_argv;
-    raw_exec_argv.reserve(static_cast<size_t>(argc - 1));
-    for (int i = 1; i < argc; ++i) {
-      if (argv[i] != nullptr) raw_exec_argv.emplace_back(argv[i]);
-    }
-    UbiSetExecArgv(NormalizeCliOptionVector(raw_exec_argv));
     UbiSetScriptArgv({});
     static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
     return RunCliBuiltin(kInteractiveMain, error_out);
   }
 
-  const bool is_eval_mode = (mode == "-e" || mode == "--eval" || mode == "-pe" || mode == "-ep");
-  const bool is_print_mode = (mode == "-p" || mode == "--print" || mode == "-pe" || mode == "-ep");
-  if (is_eval_mode || is_print_mode) {
-    if (mode_index < 0 || mode_index + 1 >= argc || argv[mode_index + 1] == nullptr) {
-      if (error_out != nullptr) {
-        *error_out = kUsage;
-      }
-      return 1;
+  if (has_eval_string || (print_flag && mode == CliMode::kPrint)) {
+    if (script_index < argc && argv[script_index] != nullptr && std::string(argv[script_index]) == "--") {
+      script_index++;
     }
-    std::vector<std::string> script_argv;
-    script_argv.reserve(static_cast<size_t>(argc - (mode_index + 2)));
-    for (int i = mode_index + 2; i < argc; ++i) {
-      if (argv[i] != nullptr) {
-        script_argv.emplace_back(argv[i]);
-      }
+    script_argv.reserve(static_cast<size_t>(argc - script_index));
+    for (int argi = script_index; argi < argc; ++argi) {
+      if (argv[argi] != nullptr) script_argv.emplace_back(argv[argi]);
     }
-    std::vector<std::string> raw_exec_argv;
-    raw_exec_argv.reserve(static_cast<size_t>(mode_index + 1));
-    for (int i = 1; i <= mode_index + 1 && i < argc; ++i) {
-      if (argv[i] != nullptr) raw_exec_argv.emplace_back(argv[i]);
-    }
-    UbiSetExecArgv(NormalizeCliOptionVector(raw_exec_argv));
     UbiSetScriptArgv(script_argv);
     static constexpr const char kEvalStringMain[] = "require('internal/main/eval_string');";
     return RunCliBuiltin(kEvalStringMain, error_out);
   }
 
-  int script_index = 1;
-  std::vector<std::string> exec_argv;
-  exec_argv.reserve(static_cast<size_t>(argc));
-  while (script_index < argc && argv[script_index] != nullptr) {
-    const std::string token(argv[script_index]);
-    if (token == "--") {
-      script_index++;
-      break;
-    }
-    if (token == "-") {
-      break;
-    }
-    if (!token.empty() && token[0] == '-') {
-      exec_argv.push_back(token);
-      script_index++;
-      continue;
-    }
-    break;
+  if (mode == CliMode::kRun) {
+    return RunCliPackageScript(run_target, error_out);
   }
-  UbiSetExecArgv(exec_argv);
 
   const bool use_stdin_entry =
       script_index >= argc || argv[script_index] == nullptr || std::string(argv[script_index]) == "-";
   if (use_stdin_entry) {
-    std::vector<std::string> script_argv;
     if (script_index < argc && argv[script_index] != nullptr && std::string(argv[script_index]) == "-") {
       script_argv.reserve(static_cast<size_t>(argc - (script_index + 1)));
-      for (int i = script_index + 1; i < argc; ++i) {
-        if (argv[i] != nullptr) {
-          script_argv.emplace_back(argv[i]);
-        }
+      for (int argi = script_index + 1; argi < argc; ++argi) {
+        if (argv[argi] != nullptr) script_argv.emplace_back(argv[argi]);
       }
     }
     UbiSetScriptArgv(script_argv);
     static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
     static constexpr const char kEvalStdinMain[] = "require('internal/main/eval_stdin');";
+    static constexpr const char kCheckSyntaxMain[] = "require('internal/main/check_syntax');";
+    static constexpr const char kCheckSyntaxModuleStdinMain[] =
+        "/*__ubi_skip_pre_execution__*/"
+        "const { prepareMainThreadExecution, markBootstrapComplete } = "
+        "require('internal/process/pre_execution');"
+        "const { readStdin } = require('internal/process/execution');"
+        "prepareMainThreadExecution(true);"
+        "markBootstrapComplete();"
+        "readStdin((code) => {"
+        "  try {"
+        "    const { ModuleWrap } = internalBinding('module_wrap');"
+        "    new ModuleWrap('[stdin]', undefined, code, 0, 0);"
+        "  } catch (err) {"
+        "    if (err && typeof err.stack === 'string' && !err.stack.startsWith('[stdin]')) {"
+        "      err.stack = '[stdin]\\n' + err.stack;"
+        "    }"
+        "    throw err;"
+        "  }"
+        "});";
+    if (mode == CliMode::kCheck) {
+      if (RawExecArgvHasInputType(raw_exec_argv)) {
+        return RunCliBuiltin(kCheckSyntaxModuleStdinMain, error_out);
+      }
+      return RunCliBuiltin(kCheckSyntaxMain, error_out);
+    }
     return RunCliBuiltin(StdinIsTTY() ? kInteractiveMain : kEvalStdinMain, error_out);
   }
 
-  std::vector<std::string> script_argv;
   script_argv.reserve(static_cast<size_t>(argc - (script_index + 1)));
-  for (int i = script_index + 1; i < argc; ++i) {
-    if (argv[i] != nullptr) {
-      script_argv.emplace_back(argv[i]);
-    }
+  for (int argi = script_index + 1; argi < argc; ++argi) {
+    if (argv[argi] != nullptr) script_argv.emplace_back(argv[argi]);
   }
   UbiSetScriptArgv(script_argv);
   return UbiRunCliScript(argv[script_index], error_out);

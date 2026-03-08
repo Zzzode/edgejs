@@ -50,11 +50,13 @@ napi_value StreamBaseGetActiveOwner(napi_env env, void* data) {
 const char* ActiveResourceNameForProvider(int32_t provider_type) {
   switch (provider_type) {
     case kUbiProviderTcpWrap:
+      return "TCPSocketWrap";
     case kUbiProviderTcpServerWrap:
-      return "TCPWRAP";
+      return "TCPServerWrap";
     case kUbiProviderPipeWrap:
+      return "PipeWrap";
     case kUbiProviderPipeServerWrap:
-      return "PIPEWRAP";
+      return "PipeServerWrap";
     case kUbiProviderJsStream:
       return "JSSTREAM";
     default:
@@ -448,32 +450,6 @@ void DeleteOnReadRefs(UbiStreamBase* base) {
   base->user_buffer_len = 0;
 }
 
-void EmitSyntheticEofIfNeeded(UbiStreamBase* base) {
-  if (base == nullptr || base->env == nullptr || base->eof_emitted || base->onread_ref == nullptr) return;
-
-  napi_value self = UbiStreamBaseGetWrapper(base);
-  napi_value owner_symbol = GetOwnerSymbol(base->env);
-  napi_value owner = nullptr;
-  if (self != nullptr &&
-      owner_symbol != nullptr &&
-      napi_get_property(base->env, self, owner_symbol, &owner) == napi_ok &&
-      owner != nullptr) {
-    napi_valuetype owner_type = napi_undefined;
-    if (napi_typeof(base->env, owner, &owner_type) == napi_ok &&
-        owner_type != napi_null &&
-        owner_type != napi_undefined) {
-    napi_value connecting = GetNamedPropertyValue(base->env, owner, "connecting");
-    bool is_connecting = false;
-    if (connecting != nullptr && napi_get_value_bool(base->env, connecting, &is_connecting) == napi_ok && is_connecting) {
-      return;
-    }
-    }
-  }
-
-  base->eof_emitted = true;
-  (void)CallJsOnRead(base, UV_EOF, nullptr, 0, nullptr);
-}
-
 void MaybeCallHandleOnClose(UbiStreamBase* base) {
   if (base == nullptr || base->env == nullptr || base->finalized) return;
   napi_value self = UbiStreamBaseGetWrapper(base);
@@ -760,7 +736,12 @@ napi_value UbiStreamBaseClose(UbiStreamBase* base, napi_value close_callback) {
   }
 
   UbiStreamBaseSetCloseCallback(base, close_callback);
-  EmitSyntheticEofIfNeeded(base);
+  if (base->ops != nullptr && base->ops->get_stream != nullptr) {
+    if (uv_stream_t* stream = base->ops->get_stream(base)) {
+      (void)uv_read_stop(stream);
+    }
+  }
+  UbiStreamBaseSetReading(base, false);
 
   base->closing = true;
   if (base->ops != nullptr && base->ops->on_close != nullptr) {
@@ -790,13 +771,13 @@ bool UbiStreamBaseHasRef(UbiStreamBase* base) {
 void UbiStreamBaseRef(UbiStreamBase* base) {
   if (base == nullptr || base->ops == nullptr || base->ops->get_handle == nullptr) return;
   uv_handle_t* handle = base->ops->get_handle(base);
-  if (handle != nullptr && !base->closed && !uv_is_closing(handle)) uv_ref(handle);
+  if (handle != nullptr && !base->closed) uv_ref(handle);
 }
 
 void UbiStreamBaseUnref(UbiStreamBase* base) {
   if (base == nullptr || base->ops == nullptr || base->ops->get_handle == nullptr) return;
   uv_handle_t* handle = base->ops->get_handle(base);
-  if (handle != nullptr && !base->closed && !uv_is_closing(handle)) uv_unref(handle);
+  if (handle != nullptr && !base->closed) uv_unref(handle);
 }
 
 napi_value UbiStreamBaseGetOnRead(UbiStreamBase* base) {

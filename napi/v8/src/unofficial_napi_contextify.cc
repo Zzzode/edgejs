@@ -423,6 +423,47 @@ bool RestoreOwnProperties(v8::Isolate* isolate,
   return true;
 }
 
+bool HideCommonJsGlobalsForModuleEvaluation(v8::Isolate* isolate,
+                                            v8::Local<v8::Context> context,
+                                            std::vector<SavedOwnProperty>* saved_properties) {
+  if (saved_properties == nullptr) return false;
+  saved_properties->clear();
+
+  v8::Local<v8::Object> global = context->Global();
+  static constexpr const char* kKeys[] = {
+      "require",
+      "__filename",
+      "__dirname",
+      "exports",
+      "module",
+  };
+
+  for (const char* key_text : kKeys) {
+    v8::Local<v8::Name> key = OneByteString(isolate, key_text);
+    bool has_own = false;
+    if (!global->HasOwnProperty(context, key).To(&has_own)) {
+      return false;
+    }
+    if (!has_own) continue;
+
+    v8::Local<v8::Value> value;
+    if (!global->Get(context, key).ToLocal(&value)) {
+      return false;
+    }
+
+    SavedOwnProperty saved;
+    saved.key.Reset(isolate, key);
+    saved.value.Reset(isolate, value);
+    saved_properties->push_back(std::move(saved));
+
+    if (!global->Delete(context, key).FromMaybe(false)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 void CleanupContextRecords(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
 
@@ -1490,6 +1531,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
   v8::Local<v8::Module> module;
   if (!v8::ScriptCompiler::CompileModule(isolate, &source_obj).ToLocal(&module)) {
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      AttachSyntaxArrowMessage(isolate, context, try_catch.Exception(), try_catch.Message());
       try_catch.ReThrow();
       return napi_pending_exception;
     }
@@ -1692,15 +1734,29 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
+  v8::Local<v8::Module> module = record->module.Get(isolate);
+
+  std::vector<SavedOwnProperty> hidden_cjs_globals;
+  const bool is_source_text_module = module->IsSourceTextModule();
+  if (is_source_text_module &&
+      !HideCommonJsGlobalsForModuleEvaluation(isolate, context, &hidden_cjs_globals)) {
+    return napi_generic_failure;
+  }
 
   v8::TryCatch try_catch(isolate);
   v8::Local<v8::Value> result;
-  if (!record->module.Get(isolate)->Evaluate(context).ToLocal(&result)) {
+  if (!module->Evaluate(context).ToLocal(&result)) {
+    if (is_source_text_module) {
+      (void)RestoreOwnProperties(isolate, context, context->Global(), hidden_cjs_globals);
+    }
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
       try_catch.ReThrow();
       return napi_pending_exception;
     }
     return napi_generic_failure;
+  }
+  if (is_source_text_module) {
+    (void)RestoreOwnProperties(isolate, context, context->Global(), hidden_cjs_globals);
   }
   *result_out = napi_v8_wrap_value(env, result);
   return napi_ok;

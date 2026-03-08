@@ -120,7 +120,7 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
 
   const bool has_intl = RuntimeHasIntl(env);
   const bool has_inspector = false;
-  const bool has_tracing = false;
+  const bool has_tracing = true;
 #ifdef OPENSSL_VERSION_NUMBER
   const bool has_openssl = true;
 #else

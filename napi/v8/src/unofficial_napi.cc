@@ -58,6 +58,13 @@ std::unordered_map<v8::Isolate*, napi_env> g_env_by_isolate;
 std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_callbacks;
 std::unordered_map<v8::ArrayBuffer::Allocator*, void*> g_tracking_allocators;
 
+struct FatalErrorCallbacks {
+  unofficial_napi_fatal_error_callback fatal = nullptr;
+  unofficial_napi_oom_error_callback oom = nullptr;
+};
+
+std::unordered_map<v8::Isolate*, FatalErrorCallbacks> g_fatal_error_callbacks;
+
 class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
  public:
   TrackingArrayBufferAllocator()
@@ -112,6 +119,50 @@ void ApplyDefaultV8Flags() {
   v8::V8::SetFlagsFromString(
       kNodeDefaultShippingV8Flags,
       static_cast<int>(sizeof(kNodeDefaultShippingV8Flags) - 1));
+}
+
+void FatalErrorCallback(const char* location, const char* message) {
+  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
+  if (isolate == nullptr) return;
+
+  unofficial_napi_fatal_error_callback callback = nullptr;
+  napi_env env = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto callback_it = g_fatal_error_callbacks.find(isolate);
+    if (callback_it != g_fatal_error_callbacks.end()) {
+      callback = callback_it->second.fatal;
+    }
+    auto env_it = g_env_by_isolate.find(isolate);
+    if (env_it != g_env_by_isolate.end()) {
+      env = env_it->second;
+    }
+  }
+  if (callback != nullptr) {
+    callback(env, location, message);
+  }
+}
+
+void OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
+  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
+  if (isolate == nullptr) return;
+
+  unofficial_napi_oom_error_callback callback = nullptr;
+  napi_env env = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto callback_it = g_fatal_error_callbacks.find(isolate);
+    if (callback_it != g_fatal_error_callbacks.end()) {
+      callback = callback_it->second.oom;
+    }
+    auto env_it = g_env_by_isolate.find(isolate);
+    if (env_it != g_env_by_isolate.end()) {
+      env = env_it->second;
+    }
+  }
+  if (callback != nullptr) {
+    callback(env, location, details.is_heap_oom, details.detail);
+  }
 }
 
 napi_status AcquireRuntime(UbiV8Platform** platform_out) {
@@ -825,11 +876,32 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
       cb_it->second.Reset();
       g_promise_reject_callbacks.erase(cb_it);
     }
+    g_fatal_error_callbacks.erase(env->isolate);
   }
   if (env->isolate != nullptr) {
     env->isolate->SetPromiseRejectCallback(nullptr);
+    env->isolate->SetFatalErrorHandler(nullptr);
+    env->isolate->SetOOMErrorHandler(nullptr);
   }
   delete env;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_fatal_error_callbacks(
+    napi_env env,
+    unofficial_napi_fatal_error_callback fatal_callback,
+    unofficial_napi_oom_error_callback oom_callback) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto& entry = g_fatal_error_callbacks[env->isolate];
+    entry.fatal = fatal_callback;
+    entry.oom = oom_callback;
+  }
+
+  env->isolate->SetFatalErrorHandler(fatal_callback != nullptr ? FatalErrorCallback : nullptr);
+  env->isolate->SetOOMErrorHandler(oom_callback != nullptr ? OOMErrorCallback : nullptr);
   return napi_ok;
 }
 

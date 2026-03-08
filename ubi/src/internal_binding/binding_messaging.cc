@@ -330,6 +330,29 @@ bool IsCloneableTransferableValue(napi_env env, napi_value value) {
   return napi_get_property(env, value, clone_symbol, &clone_method) == napi_ok && IsFunction(env, clone_method);
 }
 
+bool IsTransferableValue(napi_env env, napi_value value) {
+  if (!IsObjectLike(env, value)) return false;
+
+  napi_value transfer_mode_symbol = GetUtilPrivateSymbol(env, "transfer_mode_private_symbol");
+  napi_value transfer_symbol = GetMessagingSymbol(env, "messaging_transfer_symbol");
+  if (transfer_mode_symbol == nullptr || transfer_symbol == nullptr) return false;
+
+  bool has_mode = false;
+  if (napi_has_property(env, value, transfer_mode_symbol, &has_mode) != napi_ok || !has_mode) return false;
+
+  napi_value transfer_mode = nullptr;
+  if (napi_get_property(env, value, transfer_mode_symbol, &transfer_mode) != napi_ok || transfer_mode == nullptr) {
+    return false;
+  }
+
+  uint32_t mode = 0;
+  if (napi_get_value_uint32(env, transfer_mode, &mode) != napi_ok || (mode & 1u) == 0) return false;
+
+  napi_value transfer_method = nullptr;
+  return napi_get_property(env, value, transfer_symbol, &transfer_method) == napi_ok &&
+         IsFunction(env, transfer_method);
+}
+
 bool IsBlobHandleValue(napi_env env, napi_value value) {
   if (!IsObjectLike(env, value)) return false;
   bool has_blob_data = false;
@@ -497,13 +520,40 @@ bool IsStructuredClonePassThroughValue(napi_env env, napi_value value) {
   return false;
 }
 
+bool IsProcessEnvValue(napi_env env, napi_value value) {
+  if (!IsObjectLike(env, value)) return false;
+
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return false;
+  napi_value process = GetNamed(env, global, "process");
+  if (!IsObjectLike(env, process)) return false;
+  napi_value process_env = GetNamed(env, process, "env");
+  if (!IsObjectLike(env, process_env)) return false;
+
+  bool same = false;
+  return napi_strict_equals(env, value, process_env, &same) == napi_ok && same;
+}
+
 napi_value PrepareTransferableDataForStructuredClone(napi_env env, napi_value value);
 napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value value);
+struct ValueTransformPair {
+  napi_value source = nullptr;
+  napi_value target = nullptr;
+};
 bool PrepareJSTransferableCloneData(
     napi_env env, napi_value value, napi_value* data_out, napi_value* deserialize_info_out);
 napi_value CreateJSTransferableCloneMarker(napi_env env, napi_value value);
 napi_value DeserializeJSTransferableCloneMarker(napi_env env, napi_value data, napi_value deserialize_info);
 napi_value CloneRootJSTransferableValueForQueue(napi_env env, napi_value value);
+napi_value TransformTransferredPortsForQueue(
+    napi_env env,
+    napi_value value,
+    const std::vector<QueuedMessage::TransferredPortEntry>& transferred_ports,
+    std::vector<ValueTransformPair>* seen_pairs);
+bool CollectTransferredPorts(
+    napi_env env,
+    napi_value transfer_list,
+    std::vector<QueuedMessage::TransferredPortEntry>* out);
 
 napi_value CloneArrayEntriesForStructuredClone(napi_env env, napi_value array) {
   uint32_t length = 0;
@@ -798,6 +848,53 @@ bool PrepareJSTransferableCloneData(
   return true;
 }
 
+bool PrepareJSTransferableTransferData(napi_env env,
+                                       napi_value value,
+                                       napi_value* data_out,
+                                       napi_value* deserialize_info_out,
+                                       napi_value* transfer_list_out) {
+  if (data_out != nullptr) *data_out = nullptr;
+  if (deserialize_info_out != nullptr) *deserialize_info_out = nullptr;
+  if (transfer_list_out != nullptr) *transfer_list_out = nullptr;
+  if (!IsTransferableValue(env, value)) return false;
+
+  napi_value transfer_list = nullptr;
+  napi_value transfer_list_symbol = GetMessagingSymbol(env, "messaging_transfer_list_symbol");
+  napi_value transfer_list_method = nullptr;
+  if (transfer_list_symbol != nullptr &&
+      napi_get_property(env, value, transfer_list_symbol, &transfer_list_method) == napi_ok &&
+      IsFunction(env, transfer_list_method)) {
+    napi_value list_value = nullptr;
+    if (napi_call_function(env, value, transfer_list_method, 0, nullptr, &list_value) != napi_ok) {
+      return false;
+    }
+    transfer_list = list_value;
+  }
+
+  napi_value transfer_symbol = GetMessagingSymbol(env, "messaging_transfer_symbol");
+  napi_value transfer_method = nullptr;
+  if (transfer_symbol == nullptr ||
+      napi_get_property(env, value, transfer_symbol, &transfer_method) != napi_ok ||
+      !IsFunction(env, transfer_method)) {
+    return false;
+  }
+
+  napi_value transfer_result = nullptr;
+  if (napi_call_function(env, value, transfer_method, 0, nullptr, &transfer_result) != napi_ok ||
+      transfer_result == nullptr) {
+    return false;
+  }
+
+  napi_value transfer_data = GetNamed(env, transfer_result, "data");
+  napi_value deserialize_info = GetNamed(env, transfer_result, "deserializeInfo");
+  if (transfer_data == nullptr || deserialize_info == nullptr) return false;
+
+  if (data_out != nullptr) *data_out = transfer_data;
+  if (deserialize_info_out != nullptr) *deserialize_info_out = deserialize_info;
+  if (transfer_list_out != nullptr) *transfer_list_out = transfer_list;
+  return true;
+}
+
 napi_value CreateJSTransferableCloneMarker(napi_env env, napi_value value) {
   napi_value prepared_data = nullptr;
   napi_value deserialize_info = nullptr;
@@ -831,6 +928,59 @@ napi_value CloneRootJSTransferableValueForQueue(napi_env env, napi_value value) 
   }
 
   return cloned;
+}
+
+bool TransferRootJSTransferableValueForQueue(
+    napi_env env,
+    napi_value value,
+    napi_value* cloned_out,
+    std::vector<QueuedMessage::TransferredPortEntry>* transferred_ports_out) {
+  if (cloned_out != nullptr) *cloned_out = nullptr;
+  if (transferred_ports_out != nullptr) transferred_ports_out->clear();
+
+  napi_value transfer_data = nullptr;
+  napi_value deserialize_info = nullptr;
+  napi_value nested_transfer_list = nullptr;
+  if (!PrepareJSTransferableTransferData(
+          env, value, &transfer_data, &deserialize_info, &nested_transfer_list) ||
+      transfer_data == nullptr ||
+      deserialize_info == nullptr) {
+    return false;
+  }
+
+  if (transferred_ports_out != nullptr &&
+      !CollectTransferredPorts(env, nested_transfer_list, transferred_ports_out)) {
+    return false;
+  }
+
+  std::vector<ValueTransformPair> seen_pairs;
+  const std::vector<QueuedMessage::TransferredPortEntry> empty_transferred_ports;
+  const auto& transferred_ports =
+      transferred_ports_out != nullptr ? *transferred_ports_out : empty_transferred_ports;
+  napi_value transformed_data =
+      TransformTransferredPortsForQueue(env, transfer_data, transferred_ports, &seen_pairs);
+  if (transformed_data == nullptr) return false;
+
+  napi_value prepared_data = PrepareTransferableDataForStructuredClone(env, transformed_data);
+  if (prepared_data == nullptr) return false;
+
+  napi_value marker = nullptr;
+  if (napi_create_object(env, &marker) != napi_ok || marker == nullptr) return false;
+  napi_value true_value = nullptr;
+  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr ||
+      napi_set_named_property(env, marker, "__ubiJSTransferableCloneMarker", true_value) != napi_ok ||
+      napi_set_named_property(env, marker, "data", prepared_data) != napi_ok ||
+      napi_set_named_property(env, marker, "deserializeInfo", deserialize_info) != napi_ok) {
+    return false;
+  }
+
+  napi_value cloned = nullptr;
+  if (unofficial_napi_structured_clone(env, marker, &cloned) != napi_ok || cloned == nullptr) {
+    return false;
+  }
+
+  if (cloned_out != nullptr) *cloned_out = cloned;
+  return true;
 }
 
 napi_value StructuredCloneJSTransferableValue(napi_env env, napi_value value) {
@@ -951,7 +1101,7 @@ bool IsMessagePortValue(napi_env env, napi_value value) {
   return UnwrapMessagePort(env, value) != nullptr;
 }
 
-bool TransferListContainsMessagePort(napi_env env, napi_value transfer_list, napi_value candidate) {
+bool TransferListContainsValue(napi_env env, napi_value transfer_list, napi_value candidate) {
   if (transfer_list == nullptr || candidate == nullptr) return false;
   bool is_array = false;
   if (napi_is_array(env, transfer_list, &is_array) != napi_ok || !is_array) return false;
@@ -967,6 +1117,10 @@ bool TransferListContainsMessagePort(napi_env env, napi_value transfer_list, nap
     }
   }
   return false;
+}
+
+bool TransferListContainsMessagePort(napi_env env, napi_value transfer_list, napi_value candidate) {
+  return TransferListContainsValue(env, transfer_list, candidate);
 }
 
 bool TransferListContainsDuplicateMessagePort(napi_env env, napi_value transfer_list) {
@@ -1509,11 +1663,6 @@ void EmitProcessWarning(napi_env env, const char* message) {
 void ThrowClosedMessagePortError(napi_env env) {
   napi_throw_error(env, "ERR_CLOSED_MESSAGE_PORT", "Cannot send data on closed MessagePort");
 }
-
-struct ValueTransformPair {
-  napi_value source = nullptr;
-  napi_value target = nullptr;
-};
 
 void OnMessagePortClosed(uv_handle_t* handle);
 
@@ -2107,12 +2256,6 @@ void ProcessQueuedMessages(MessagePortWrap* wrap, bool force) {
       next.payload_data = nullptr;
     }
     if (self != nullptr && message_error == nullptr) {
-      payload = RestoreTransferableDataAfterStructuredClone(
-          wrap->handle_wrap.env,
-          payload != nullptr ? payload : Undefined(wrap->handle_wrap.env));
-      message_error = TakePendingException(wrap->handle_wrap.env);
-    }
-    if (self != nullptr && message_error == nullptr) {
       ReceivedTransferredPortState received_ports;
       std::vector<ValueTransformPair> seen_pairs;
       payload = RestoreTransferredPortsInValue(
@@ -2122,6 +2265,12 @@ void ProcessQueuedMessages(MessagePortWrap* wrap, bool force) {
           &received_ports,
           &seen_pairs);
       message_error = TakePendingException(wrap->handle_wrap.env);
+      if (message_error == nullptr) {
+        payload = RestoreTransferableDataAfterStructuredClone(
+            wrap->handle_wrap.env,
+            payload != nullptr ? payload : Undefined(wrap->handle_wrap.env));
+        message_error = TakePendingException(wrap->handle_wrap.env);
+      }
       if (message_error == nullptr) {
         napi_value ports = BuildTransferredPortsArray(wrap->handle_wrap.env, next, &received_ports);
         DeleteTransferredPortRefs(wrap->handle_wrap.env, &next.transferred_ports);
@@ -2410,27 +2559,36 @@ napi_value MessagePortPostMessageCallback(napi_env env, napi_callback_info info)
 
   MessagePortWrap* wrap = UnwrapMessagePort(env, this_arg);
   std::vector<QueuedMessage::TransferredPortEntry> transferred_ports;
-  if (!CollectTransferredPorts(env, transfer_list, &transferred_ports)) {
-    return nullptr;
-  }
-
-  std::vector<ValueTransformPair> seen_pairs;
-  napi_value transformed_payload =
-      TransformTransferredPortsForQueue(env, payload, transferred_ports, &seen_pairs);
-
   napi_value cloned_payload = nullptr;
-  if (IsCloneableTransferableValue(env, transformed_payload)) {
-    cloned_payload = CloneRootJSTransferableValueForQueue(env, transformed_payload);
-  } else {
-    cloned_payload = CloneMessageValue(env, transformed_payload, normalized_transfer_arg);
-  }
-  if (cloned_payload == nullptr) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+  if (transfer_list != nullptr &&
+      TransferListContainsValue(env, transfer_list, payload) &&
+      IsTransferableValue(env, payload)) {
+    if (!TransferRootJSTransferableValueForQueue(env, payload, &cloned_payload, &transferred_ports)) {
       DeleteTransferredPortRefs(env, &transferred_ports);
       return nullptr;
     }
-    cloned_payload = payload;
+  } else {
+    if (!CollectTransferredPorts(env, transfer_list, &transferred_ports)) {
+      return nullptr;
+    }
+
+    std::vector<ValueTransformPair> seen_pairs;
+    napi_value transformed_payload =
+        TransformTransferredPortsForQueue(env, payload, transferred_ports, &seen_pairs);
+
+    if (IsCloneableTransferableValue(env, transformed_payload)) {
+      cloned_payload = CloneRootJSTransferableValueForQueue(env, transformed_payload);
+    } else {
+      cloned_payload = CloneMessageValue(env, transformed_payload, normalized_transfer_arg);
+    }
+    if (cloned_payload == nullptr) {
+      bool pending = false;
+      if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+        DeleteTransferredPortRefs(env, &transferred_ports);
+        return nullptr;
+      }
+      cloned_payload = payload;
+    }
   }
   if (normalized_transfer_arg != nullptr && !ApplyArrayBufferTransfers(env, normalized_transfer_arg)) {
     DeleteTransferredPortRefs(env, &transferred_ports);
@@ -2665,9 +2823,15 @@ napi_value StructuredCloneCallback(napi_env env, napi_callback_info info) {
     return nullptr;
   }
 
-  napi_value out = StructuredCloneJSTransferableValue(env, argv[0]);
+  napi_value clone_input = argv[0];
+  if (IsProcessEnvValue(env, clone_input)) {
+    clone_input = CloneObjectPropertiesForStructuredClone(env, clone_input);
+    if (clone_input == nullptr) return nullptr;
+  }
+
+  napi_value out = StructuredCloneJSTransferableValue(env, clone_input);
   const napi_status clone_status =
-      out != nullptr ? napi_ok : unofficial_napi_structured_clone(env, argv[0], &out);
+      out != nullptr ? napi_ok : unofficial_napi_structured_clone(env, clone_input, &out);
   if (clone_status != napi_ok || out == nullptr) {
     bool has_pending = false;
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) return nullptr;
