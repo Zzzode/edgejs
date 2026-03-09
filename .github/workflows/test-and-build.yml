@@ -31,7 +31,7 @@ jobs:
           ! grep -nE "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
 
       - name: Build napi-v8
-        run: cmake -S napi/v8 -B napi/v8/build -DNAPI_V8_BUILD_TESTS=ON
+        run: cmake -S napi/v8 -B napi/v8/build -DCMAKE_BUILD_TYPE=Release -DNAPI_V8_BUILD_TESTS=ON
 
       - name: Compile napi-v8
         run: cmake --build napi/v8/build -j4
@@ -39,26 +39,15 @@ jobs:
       - name: Test napi-v8
         run: ctest --test-dir napi/v8/build --output-on-failure -R '^napi_v8\.'
 
-      - name: Build ubi (Debug)
-        run: |
-          make build CMAKE_BUILD_TYPE=Debug JOBS=4
-      - name: Test ubi
-        run: ctest --test-dir build-ubi --output-on-failure -j4
-      - name: Remove debug build
-        run: rm -rf build-ubi
-
       - name: Build ubi
         run: |
           make build CMAKE_BUILD_TYPE=Release JOBS=4
-
-      - name: Test ubi
-        run: ctest --test-dir build-ubi --output-on-failure -j4
 
       - name: Generate dist
         shell: bash
         run: |
           set -euo pipefail
-          make dist JOBS=4 ZIP_NAME=ubi-linux.zip
+          make dist-only JOBS=4 ZIP_NAME=ubi-linux.zip
 
       - name: Upload artifact ubi
         uses: actions/upload-artifact@v4
@@ -66,6 +55,10 @@ jobs:
           name: ubi-linux
           path: ubi-linux.zip
           if-no-files-found: error
+
+      - name: Test ubi
+        run: |
+          make test-only TEST_JOBS=4
 
       - name: sccache stats
         if: always()
@@ -96,7 +89,7 @@ jobs:
           ! grep -nE "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
 
       - name: Build napi-v8
-        run: cmake -S napi/v8 -B napi/v8/build -DNAPI_V8_BUILD_TESTS=ON
+        run: cmake -S napi/v8 -B napi/v8/build -DCMAKE_BUILD_TYPE=Release -DNAPI_V8_BUILD_TESTS=ON
 
       - name: Compile napi-v8
         run: cmake --build napi/v8/build -j4
@@ -108,14 +101,11 @@ jobs:
         run: |
           make build CMAKE_BUILD_TYPE=Release JOBS=4
 
-      - name: Test ubi
-        run: ctest --test-dir build-ubi --output-on-failure -j4
-
       - name: Generate dist
         shell: bash
         run: |
           set -euo pipefail
-          make dist JOBS=4 ZIP_NAME=ubi-macos.zip
+          make dist-only JOBS=4 ZIP_NAME=ubi-macos.zip
 
       - name: Upload artifact ubi
         uses: actions/upload-artifact@v4
@@ -123,6 +113,10 @@ jobs:
           name: ubi-macos
           path: ubi-macos.zip
           if-no-files-found: error
+
+      - name: Test ubi
+        run: |
+          make test-only TEST_JOBS=4
 
       - name: sccache stats
         if: always()

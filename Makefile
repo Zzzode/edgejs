@@ -1,0 +1,78 @@
+.PHONY: build test test-only check-portability clean-dist dist dist-only
+
+UNAME_S := $(shell uname -s)
+BUILD_DIR ?= build-ubi
+DIST_DIR ?= dist
+DIST_BIN_DIR ?= $(DIST_DIR)/bin
+DIST_BIN_COMPAT_DIR ?= $(DIST_DIR)/bin-compat
+DIST_NODE_LIB_DIR ?= $(DIST_DIR)/node-lib
+ZIP_NAME ?= ubi.zip
+CMAKE_BUILD_TYPE ?= Release
+JOBS ?= 8
+TEST_JOBS ?= 0
+UBI_BINARY ?= $(BUILD_DIR)/ubi
+UBIENV_BINARY ?= $(BUILD_DIR)/ubienv
+CMAKE_ARGS ?=
+BUILD_ENV ?= env
+EXTRA_CMAKE_ARGS ?=
+CTEST_ARGS ?=
+
+ifeq ($(UNAME_S),Darwin)
+BUILD_ENV := env -u CPPFLAGS -u LDFLAGS
+EXTRA_CMAKE_ARGS += '-UOPENSSL_*' -DOPENSSL_USE_STATIC_LIBS=TRUE -DCMAKE_EXE_LINKER_FLAGS= -DCMAKE_SHARED_LINKER_FLAGS= -DCMAKE_MODULE_LINKER_FLAGS=
+endif
+
+build:
+	$(BUILD_ENV) cmake -S ubi -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
+	$(BUILD_ENV) cmake --build $(BUILD_DIR) -j$(JOBS)
+
+test: build test-only
+
+test-only:
+	ctest --test-dir $(BUILD_DIR) --output-on-failure -j$(TEST_JOBS) $(CTEST_ARGS)
+
+check-portability:
+ifeq ($(UNAME_S),Darwin)
+	@for bin in $(UBI_BINARY) $(UBIENV_BINARY); do \
+		deps=$$(otool -L "$$bin" | tail -n +2 | awk '{print $$1}' | grep '^/' | grep -Ev '^(/System/Library/|/usr/lib/)' || true); \
+		if [ -n "$$deps" ]; then \
+			echo "error: $$bin links to non-system dylibs:" >&2; \
+			echo "$$deps" >&2; \
+			exit 1; \
+		fi; \
+		file "$$bin"; \
+	done
+endif
+
+clean-dist:
+	rm -rf $(DIST_DIR)
+	rm -f $(ZIP_NAME)
+
+dist: build dist-only
+
+dist-only:
+	rm -rf $(DIST_DIR)
+	rm -f $(ZIP_NAME)
+	mkdir -p $(DIST_BIN_DIR)
+	cp $(UBI_BINARY) $(DIST_BIN_DIR)/ubi
+	cp $(UBIENV_BINARY) $(DIST_BIN_DIR)/ubienv
+	cp -R bin-compat $(DIST_BIN_COMPAT_DIR)
+	cp README.md $(DIST_DIR)/README.md
+	cp -R node-lib $(DIST_NODE_LIB_DIR)
+	mkdir -p $(DIST_NODE_LIB_DIR)/internal/deps
+	for dep in undici acorn minimatch cjs-module-lexer amaro; do \
+		mkdir -p "$(DIST_NODE_LIB_DIR)/internal/deps/$$(dirname "$$dep")"; \
+		cp -R "node/deps/$$dep" "$(DIST_NODE_LIB_DIR)/internal/deps/$$dep"; \
+	done
+	if [ "$(UNAME_S)" = "Darwin" ]; then \
+		for bin in $(DIST_BIN_DIR)/ubi $(DIST_BIN_DIR)/ubienv; do \
+			deps=$$(otool -L "$$bin" | tail -n +2 | awk '{print $$1}' | grep '^/' | grep -Ev '^(/System/Library/|/usr/lib/)' || true); \
+			if [ -n "$$deps" ]; then \
+				echo "error: $$bin still links to non-system dylibs:" >&2; \
+				echo "$$deps" >&2; \
+				echo "Rebuild with 'make build' before packaging." >&2; \
+				exit 1; \
+			fi; \
+		done; \
+	fi
+	cd $(DIST_DIR) && zip -r ../$(ZIP_NAME) bin bin-compat README.md node-lib
