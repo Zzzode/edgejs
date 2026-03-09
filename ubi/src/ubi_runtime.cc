@@ -1761,7 +1761,7 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-  if (source_text == nullptr) {
+  if (source_text == nullptr || source_text[0] == '\0') {
     if (error_out != nullptr) {
       *error_out = "Empty script source";
     }

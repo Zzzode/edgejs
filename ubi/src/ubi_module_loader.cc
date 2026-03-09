@@ -2,6 +2,7 @@
 #include "ubi_buffer.h"
 #include "ubi_cares_wrap.h"
 #include "ubi_crypto.h"
+#include "ubi_env_loop.h"
 #include "ubi_errors_binding.h"
 #include "ubi_encoding.h"
 #include "ubi_fs.h"
@@ -103,19 +104,79 @@ void RemoveRequireContextsForState(ModuleLoaderState* state) {
   }
 }
 
-void OnModuleLoaderEnvCleanup(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-  g_loader_cleanup_hook_registered.erase(env);
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
 
+void FinalizeTraceEventsState(napi_env env) {
+  auto it = g_trace_events_states.find(env);
+  if (it == g_trace_events_states.end()) return;
+
+  TraceEventsBindingState& state = it->second;
+  DeleteRefIfPresent(env, &state.binding_ref);
+  DeleteRefIfPresent(env, &state.state_update_handler_ref);
+  for (auto& kv : state.category_buffers) {
+    DeleteRefIfPresent(env, &kv.second.typed_array_ref);
+    kv.second.data = nullptr;
+  }
+  state.category_buffers.clear();
+  state.category_refcounts.clear();
+  g_trace_events_states.erase(it);
+}
+
+void FinalizeContextifyBindingRef(napi_env env) {
+  auto it = g_contextify_binding_refs.find(env);
+  if (it == g_contextify_binding_refs.end()) return;
+  DeleteRefIfPresent(env, &it->second);
+  g_contextify_binding_refs.erase(it);
+}
+
+void FinalizeModuleLoaderState(napi_env env) {
   auto loader_it = g_loader_states.find(env);
   if (loader_it != g_loader_states.end()) {
     ModuleLoaderState* state = &loader_it->second;
     RemoveRequireContextsForState(state);
+
+    for (auto& kv : state->module_cache) {
+      DeleteRefIfPresent(env, &kv.second);
+    }
+    state->module_cache.clear();
+
+    for (auto& kv : state->binding_cache) {
+      DeleteRefIfPresent(env, &kv.second);
+    }
+    state->binding_cache.clear();
+
+    for (auto& kv : state->internal_binding_cache) {
+      DeleteRefIfPresent(env, &kv.second);
+    }
+    state->internal_binding_cache.clear();
+
+    DeleteRefIfPresent(env, &state->cache_object_ref);
+    DeleteRefIfPresent(env, &state->primordials_ref);
+    DeleteRefIfPresent(env, &state->internal_binding_ref);
+    DeleteRefIfPresent(env, &state->private_symbols_ref);
+    DeleteRefIfPresent(env, &state->per_isolate_symbols_ref);
+    DeleteRefIfPresent(env, &state->require_ref);
+    DeleteRefIfPresent(env, &state->native_builtins_binding_ref);
+    DeleteRefIfPresent(env, &state->internal_binding_loader_ref);
+    DeleteRefIfPresent(env, &state->require_builtin_loader_ref);
+    state->entry_dir.clear();
+
     g_loader_states.erase(loader_it);
   }
 
-  g_trace_events_states.erase(env);
-  g_contextify_binding_refs.erase(env);
+  FinalizeTraceEventsState(env);
+  FinalizeContextifyBindingRef(env);
+}
+
+void OnModuleLoaderEnvCleanup(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  g_loader_cleanup_hook_registered.erase(env);
+  if (UbiGetExistingEnvLoop(env) != nullptr) return;
+  FinalizeModuleLoaderState(env);
 }
 
 void EnsureModuleLoaderCleanupHook(napi_env env) {
@@ -147,6 +208,10 @@ void ReplaceAll(std::string* text, const std::string& from, const std::string& t
 }
 
 bool RuntimeHasIntl(napi_env env) {
+#if defined(UBI_HAS_ICU)
+  (void)env;
+  return true;
+#else
   napi_value global = nullptr;
   if (env == nullptr || napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
 
@@ -155,6 +220,7 @@ bool RuntimeHasIntl(napi_env env) {
 
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, intl, &type) == napi_ok && (type == napi_object || type == napi_function);
+#endif
 }
 
 void ReplaceJsonBooleanOrNumber(std::string* text, const char* key, bool value) {
@@ -226,7 +292,13 @@ std::string LoadBuiltinsConfigJson(bool has_intl) {
     // Ubi ships its own ICU-backed encoding support and should advertise that
     // in the serialized config consumed by bootstrap/node.
     ReplaceJsonBooleanOrNumber(&body, "v8_enable_i18n_support", has_intl);
-    ReplaceJsonBooleanOrNumber(&body, "icu_small", false);
+    ReplaceJsonBooleanOrNumber(&body,
+                               "icu_small",
+#if defined(UBI_HAS_SMALL_ICU)
+                               true);
+#else
+                               false);
+#endif
     cached_value = body;
     if (!cached_value.empty()) return cached_value;
   }
@@ -236,7 +308,13 @@ std::string LoadBuiltinsConfigJson(bool has_intl) {
   cached_value = std::string("{") +
                  "\"variables\":{" +
                  "\"v8_enable_i18n_support\":" + (has_intl ? "1" : "0") + "," +
-                 "\"icu_small\":false," +
+                 "\"icu_small\":" +
+#if defined(UBI_HAS_SMALL_ICU)
+                 "true,"
+#else
+                 "false,"
+#endif
+                 +
                  "\"node_use_amaro\":false," +
                  "\"node_builtin_shareable_builtins\":[" +
                  "\"deps/cjs-module-lexer/lexer.js\"," +
@@ -1070,7 +1148,8 @@ static bool IsPerContextBuiltinId(const std::string& id) {
 }
 
 static bool ShouldCacheInternalBinding(const std::string& name) {
-  return name != "encoding_binding" && name != "url" && name != "url_pattern";
+  (void)name;
+  return true;
 }
 
 static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state) {
@@ -3467,6 +3546,9 @@ static napi_value DispatchResolveBinding(napi_env env, void* raw_state, const ch
   if (std::strcmp(name, "url") == 0) {
     return GetOrCreateBinding(state, env, "url", UbiInstallUrlBinding);
   }
+  if (std::strcmp(name, "url_pattern") == 0) {
+    return GetOrCreateBinding(state, env, "url_pattern", UbiInstallUrlPatternBinding);
+  }
   if (std::strcmp(name, "util") == 0 || std::strcmp(name, "types") == 0) {
     napi_value util = GetCachedBinding(state, env, "util");
     napi_value types = GetCachedBinding(state, env, "types");
@@ -4184,6 +4266,11 @@ napi_value UbiGetInternalBinding(napi_env env) {
     return nullptr;
   }
   return out;
+}
+
+void UbiFinalizeModuleLoaderEnv(napi_env env) {
+  if (env == nullptr) return;
+  FinalizeModuleLoaderState(env);
 }
 
 bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out) {

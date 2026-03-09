@@ -367,6 +367,7 @@ napi_value ErrorsGetErrorSourcePositions(napi_env env, napi_callback_info info) 
   std::string script_resource_name;
   int32_t line_number = 0;
   int32_t start_column = 0;
+  int32_t source_map_callback_column = 0;
 
   if (argc >= 1 && argv[0] != nullptr) {
     napi_value stack_value = nullptr;
@@ -376,6 +377,7 @@ napi_value ErrorsGetErrorSourcePositions(napi_env env, napi_callback_info info) 
       if (ParseErrorStackForLocation(stack, &location)) {
         script_resource_name = location.script_resource_name;
         line_number = location.line_number;
+        source_map_callback_column = location.start_column;
         // JS consumers expect 0-based source columns, while stack traces use 1-based columns.
         start_column = location.start_column > 0 ? location.start_column - 1 : 0;
 
@@ -404,7 +406,7 @@ napi_value ErrorsGetErrorSourcePositions(napi_env env, napi_callback_info info) 
                   script_name_v != nullptr &&
                   napi_create_int32(env, line_number, &line_v) == napi_ok &&
                   line_v != nullptr &&
-                  napi_create_int32(env, start_column, &column_v) == napi_ok &&
+                  napi_create_int32(env, source_map_callback_column, &column_v) == napi_ok &&
                   column_v != nullptr) {
                 napi_value mapped_argv[3] = {script_name_v, line_v, column_v};
                 if (napi_call_function(env, global, cb, 3, mapped_argv, &mapped_v) == napi_ok &&

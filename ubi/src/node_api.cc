@@ -2,6 +2,7 @@
 #include "node_api_types.h"
 #include "ubi_async_wrap.h"
 #include "ubi_env_loop.h"
+#include "ubi_module_loader.h"
 #include "ubi_runtime.h"
 
 #include <atomic>
@@ -147,6 +148,7 @@ void CleanupEnvLoopOnTeardown(void* arg) {
     DrainAndCloseEnvLoop(loop);
     delete loop;
   }
+  UbiFinalizeModuleLoaderEnv(env);
   MaybeEraseEnvState(env);
 }
 

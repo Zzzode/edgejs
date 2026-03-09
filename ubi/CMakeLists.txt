@@ -584,6 +584,8 @@ if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
 endif()
 target_compile_definitions(ubi_runtime
   PRIVATE
+    UBI_HAS_ICU=1
+    UBI_HAS_SMALL_ICU=1
     UBI_EMBEDDED_V8_VERSION="${UBI_EMBEDDED_V8_VERSION}"
 )
 if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")

@@ -188,6 +188,13 @@ napi_value JsStreamCtor(napi_env env, napi_callback_info info) {
   }, nullptr, &wrap->base.wrapper_ref);
   UbiStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
   UbiStreamBaseSetInitialStreamProperties(&wrap->base, false, false);
+  // Node's native JSStream does not expose an enumerable `reading` own property,
+  // so keep it writable/configurable but hide it from default inspection.
+  napi_property_descriptor reading_desc = {};
+  reading_desc.utf8name = "reading";
+  reading_desc.value = UbiStreamBaseMakeBool(env, false);
+  reading_desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+  (void)napi_define_properties(env, self, 1, &reading_desc);
   return self;
 }
 

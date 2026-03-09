@@ -592,6 +592,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
   bool saw_check = false;
   bool print_flag = false;
   bool has_eval_string = false;
+  bool force_repl = false;
 
   auto set_requires_argument_error = [&](const std::string& token) {
     if (error_out != nullptr) {
@@ -668,6 +669,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     }
     if (token == "-i" || token == "--interactive") {
       raw_exec_argv.push_back(token);
+      force_repl = true;
       mode = CliMode::kInteractive;
       continue;
     }
@@ -741,7 +743,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
 
   UbiSetExecArgv(raw_exec_argv);
 
-  if (mode == CliMode::kInteractive) {
+  if (force_repl) {
     if (RawExecArgvHasInputType(raw_exec_argv)) {
       if (error_out != nullptr) {
         *error_out = "Cannot specify --input-type for REPL";

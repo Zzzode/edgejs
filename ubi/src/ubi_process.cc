@@ -443,6 +443,10 @@ std::string ReadTextFileIfExists(const std::filesystem::path& path) {
 }
 
 bool RuntimeHasIntl(napi_env env) {
+#if defined(UBI_HAS_ICU)
+  (void)env;
+  return true;
+#else
   napi_value global = nullptr;
   if (env == nullptr || napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
 
@@ -451,6 +455,7 @@ bool RuntimeHasIntl(napi_env env) {
 
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, intl, &type) == napi_ok && (type == napi_object || type == napi_function);
+#endif
 }
 
 std::string FindNodeConfigGypiText() {
@@ -497,7 +502,14 @@ bool EnsureProcessConfigVariablesForUbi(napi_env env, napi_value config_obj) {
 
   const int32_t has_intl = RuntimeHasIntl(env) ? 1 : 0;
   if (!SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", has_intl) ||
-      !SetProcessConfigVariableInt(env, variables_obj, "icu_small", 0) ||
+      !SetProcessConfigVariableInt(env,
+                                   variables_obj,
+                                   "icu_small",
+#if defined(UBI_HAS_SMALL_ICU)
+                                   1) ||
+#else
+                                   0) ||
+#endif
       !SetProcessConfigVariableInt(env, variables_obj, "node_use_amaro", 0)) {
     return false;
   }
@@ -3891,10 +3903,13 @@ napi_value ProcessMethodsLoadEnvFileCallback(napi_env env, napi_callback_info in
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
 
   napi_value util_binding = nullptr;
-  napi_value internal_binding = nullptr;
+  napi_value internal_binding = UbiGetInternalBinding(env);
   napi_valuetype internal_binding_type = napi_undefined;
-  if (napi_get_named_property(env, global, "internalBinding", &internal_binding) == napi_ok &&
-      internal_binding != nullptr &&
+  if (internal_binding == nullptr &&
+      napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok) {
+    internal_binding = nullptr;
+  }
+  if (internal_binding != nullptr &&
       napi_typeof(env, internal_binding, &internal_binding_type) == napi_ok &&
       internal_binding_type == napi_function) {
     napi_value util_name = nullptr;
