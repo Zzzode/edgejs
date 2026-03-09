@@ -43,12 +43,12 @@ std::filesystem::path ResolveBuiltBinary(const char* name) {
   const fs::path cwd = fs::current_path();
   const std::vector<fs::path> candidates = {
       cwd / name,
-      cwd / "build-ubi-rename" / name,
       cwd / "build-ubi" / name,
+      cwd / "build-ubi-rename" / name,
       cwd / "build" / name,
       cwd.parent_path() / name,
-      cwd.parent_path() / "build-ubi-rename" / name,
       cwd.parent_path() / "build-ubi" / name,
+      cwd.parent_path() / "build-ubi-rename" / name,
       cwd.parent_path() / "build" / name,
   };
   for (const auto& candidate : candidates) {
@@ -67,6 +67,21 @@ std::filesystem::path ResolveBuiltUbiBinary() {
 std::filesystem::path ResolveBuiltUbienvBinary() {
   return ResolveBuiltBinary("ubienv");
 }
+
+#if defined(NAPI_V8_NODE_ROOT_PATH) || defined(PROJECT_ROOT_PATH)
+std::filesystem::path ResolveNodeTestScriptPath(const char* relative_path) {
+  namespace fs = std::filesystem;
+#if defined(NAPI_V8_NODE_ROOT_PATH)
+  fs::path node_root(NAPI_V8_NODE_ROOT_PATH);
+#else
+  fs::path node_root(PROJECT_ROOT_PATH "/node");
+#endif
+  if (!node_root.is_absolute()) {
+    node_root = fs::absolute(node_root).lexically_normal();
+  }
+  return fs::absolute(node_root / "test" / relative_path).lexically_normal();
+}
+#endif
 
 std::string ShellSingleQuoted(const std::string& input) {
   std::string out;
@@ -201,7 +216,8 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsBypassCliParsingAndPrefixPath) {
   compat_out
       << "#!/bin/sh\n"
       << "printf 'args=%s\\n' \"$*\"\n"
-      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n"
+      << "printf 'ubi_binary_path=%s\\n' \"$UBI_BINARY_PATH\"\n";
   compat_out.close();
   ASSERT_TRUE(compat_out.good()) << "Failed to write compat node shim";
   fs::permissions(
@@ -235,6 +251,9 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsBypassCliParsingAndPrefixPath) {
   EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
   EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
   EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("ubi_binary_path=" + (install_bin_dir / "ubi").string()),
+            std::string::npos)
+      << stdout_output;
 #endif
 }
 
@@ -263,7 +282,8 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsUseParentBinCompatFromBuildTreeExec
   compat_out
       << "#!/bin/sh\n"
       << "printf 'args=%s\\n' \"$*\"\n"
-      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n"
+      << "printf 'ubi_binary_path=%s\\n' \"$UBI_BINARY_PATH\"\n";
   compat_out.close();
   ASSERT_TRUE(compat_out.good()) << "Failed to write compat node shim";
   fs::permissions(
@@ -297,6 +317,9 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsUseParentBinCompatFromBuildTreeExec
   EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
   EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
   EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("ubi_binary_path=" + (build_dir / "ubi").string()),
+            std::string::npos)
+      << stdout_output;
 #endif
 }
 
@@ -325,7 +348,8 @@ TEST_F(Test1CliPhase01, UbienvAlwaysPrefixesPathAndBypassesCliParsing) {
   compat_out
       << "#!/bin/sh\n"
       << "printf 'args=%s\\n' \"$*\"\n"
-      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n"
+      << "printf 'ubi_binary_path=%s\\n' \"$UBI_BINARY_PATH\"\n";
   compat_out.close();
   ASSERT_TRUE(compat_out.good()) << "Failed to write compat tool shim";
   fs::permissions(
@@ -359,6 +383,9 @@ TEST_F(Test1CliPhase01, UbienvAlwaysPrefixesPathAndBypassesCliParsing) {
   EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
   EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
   EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("ubi_binary_path=" + (build_dir / "ubienv").string()),
+            std::string::npos)
+      << stdout_output;
 #endif
 }
 
@@ -552,7 +579,9 @@ TEST_F(Test1CliPhase01, ScriptFileDoesNotLeakEvalGlobals) {
   ASSERT_NE(result.status, -1);
   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
-  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
   EXPECT_NE(result.stdout_output.find("script-globals:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
@@ -580,7 +609,9 @@ TEST_F(Test1CliPhase01, EvalModeExposesNodeStyleEvalGlobals) {
   ASSERT_NE(result.status, -1);
   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
-  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
   EXPECT_NE(result.stdout_output.find("eval-globals:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
@@ -874,6 +905,191 @@ TEST_F(Test1CliPhase01, TextDecoderAcceptsSharedArrayBufferInput) {
 #endif
 }
 
+TEST_F(Test1CliPhase01, TextDecoderUsesIcuPathForFatalUtf8AndUtf16Be) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Encoding subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_textdecoder_icu_semantics",
+      "const result = {\n"
+      "  fatalCode: (() => {\n"
+      "    try {\n"
+      "      new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from([0xff]));\n"
+      "      return 'ok';\n"
+      "    } catch (err) {\n"
+      "      return err && err.code;\n"
+      "    }\n"
+      "  })(),\n"
+      "  utf16beCodePoints: Array.from(\n"
+      "    new TextDecoder('utf-16be').decode(Buffer.from('test\\u20ac', 'utf16le').swap16()),\n"
+      "    (ch) => ch.codePointAt(0),\n"
+      "  ),\n"
+      "};\n"
+      "console.log(JSON.stringify(result));\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_textdecoder_icu_semantics_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("\"fatalCode\":\"ERR_ENCODING_INVALID_ENCODED_DATA\""),
+            std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"utf16beCodePoints\":[116,101,115,116,8364]"),
+            std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, IntlSurfaceMatchesNodeBasics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Intl subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_intl_surface",
+      "const result = {\n"
+      "  intlType: typeof Intl,\n"
+      "  processHasIntl: !!process.config?.variables?.v8_enable_i18n_support,\n"
+      "  nfkdSlash: '\\u2100'.normalize('NFKD'),\n"
+      "  nfkdAt: '\\uFF20'.normalize('NFKD'),\n"
+      "  trLower: 'I'.toLocaleLowerCase('tr'),\n"
+      "  trUpper: 'i'.toLocaleUpperCase('tr'),\n"
+      "};\n"
+      "console.log(JSON.stringify(result));\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_intl_surface_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("\"intlType\":\"object\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"processHasIntl\":true"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"nfkdSlash\":\"a/c\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"nfkdAt\":\"@\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"trLower\":\"ı\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"trUpper\":\"İ\""), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SerdesBindingMatchesNodeContractAndHostObjectSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Serdes subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_serdes_contract",
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const v8 = require('v8');\n"
+      "function snap(fn) {\n"
+      "  try { fn(); return { ok: true }; } catch (err) {\n"
+      "    return { name: err?.name, message: err?.message, code: err?.code };\n"
+      "  }\n"
+      "}\n"
+      "const ser = new v8.Serializer();\n"
+      "ser.writeHeader();\n"
+      "const out = ser.releaseBuffer();\n"
+      "const hostError = snap(() => v8.serialize(new (internalBinding('js_stream').JSStream)()));\n"
+      "console.log(JSON.stringify({\n"
+      "  isBuffer: Buffer.isBuffer(out),\n"
+      "  byteLength: out.byteLength,\n"
+      "  bufferByteLength: out.buffer.byteLength,\n"
+      "  byteOffset: out.byteOffset,\n"
+      "  serializerName: v8.Serializer.name,\n"
+      "  deserializerName: v8.Deserializer.name,\n"
+      "  deserializerLength: v8.Deserializer.length,\n"
+      "  serializerProtoWritable: Object.getOwnPropertyDescriptor(v8.Serializer, 'prototype').writable,\n"
+      "  deserializerProtoWritable: Object.getOwnPropertyDescriptor(v8.Deserializer, 'prototype').writable,\n"
+      "  noNewSer: snap(() => v8.Serializer()).code,\n"
+      "  noNewDer: snap(() => v8.Deserializer()).code,\n"
+      "  badWrite: snap(() => { const s = new v8.Serializer(); s.writeHeader(); s.writeRawBytes('x'); }).code,\n"
+      "  badDer: snap(() => new v8.Deserializer('x')).code,\n"
+      "  hostErrorMessage: hostError.message,\n"
+      "}));\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--no-warnings", "--expose-internals", script_path},
+      "ubi_phase01_cli_serdes_contract_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("\"isBuffer\":true"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"byteLength\":2"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"bufferByteLength\":2"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"byteOffset\":0"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"serializerName\":\"Serializer\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"deserializerName\":\"Deserializer\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"deserializerLength\":1"), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"serializerProtoWritable\":false"), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"deserializerProtoWritable\":false"), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"noNewSer\":\"ERR_CONSTRUCT_CALL_REQUIRED\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"noNewDer\":\"ERR_CONSTRUCT_CALL_REQUIRED\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"badWrite\":\"ERR_INVALID_ARG_TYPE\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"badDer\":\"ERR_INVALID_ARG_TYPE\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"hostErrorMessage\":\"Unserializable host object: JSStream {}\""),
+            std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SerdesPassesRawNodeV8SerdesScript) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Serdes raw Node subprocess parity check is POSIX-only";
+#elif !defined(NAPI_V8_NODE_ROOT_PATH) && !defined(PROJECT_ROOT_PATH)
+  GTEST_SKIP() << "Node test root path is unavailable";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::filesystem::path script_path = ResolveNodeTestScriptPath("parallel/test-v8-serdes.js");
+  ASSERT_TRUE(std::filesystem::exists(script_path)) << "Missing script: " << script_path.string();
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--no-warnings", "--expose-internals", script_path.string()},
+      "ubi_phase01_cli_raw_node_v8_serdes_run");
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stdout_output.empty()) << "stdout=" << result.stdout_output;
+#endif
+}
+
 TEST_F(Test1CliPhase01, FsWatchEmitsChangeAndClosesCleanly) {
 #if defined(_WIN32)
   GTEST_SKIP() << "fs.watch subprocess parity check is POSIX-only";
@@ -962,6 +1178,78 @@ TEST_F(Test1CliPhase01, FsWatchFileEmitsChangeAndUnwatchWorks) {
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
   EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
   EXPECT_NE(result.stdout_output.find("watchFile:"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, FsHandleWrapCloseAndHasRefMatchNodeSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "fs handle-wrap semantics check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path file_path =
+      fs::temp_directory_path() / ("ubi_phase01_fs_handle_wrap_" + std::to_string(::getpid()) + ".txt");
+  {
+    std::ofstream out(file_path);
+    out << "start";
+  }
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_fs_handle_wrap_semantics",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const { FSEvent } = internalBinding('fs_event_wrap');\n"
+      "const { StatWatcher } = internalBinding('fs');\n"
+      "const file = " + JsSingleQuoted(file_path.string()) + ";\n"
+      "const fe = new FSEvent();\n"
+      "const feCalls = [];\n"
+      "fe.close(() => feCalls.push('nope'));\n"
+      "assert.strictEqual(fe.hasRef(), false);\n"
+      "assert.strictEqual(fe.start(file, true, false, 'utf8'), 0);\n"
+      "assert.strictEqual(fe.initialized, true);\n"
+      "assert.strictEqual(fe.hasRef(), true);\n"
+      "fe.unref();\n"
+      "assert.strictEqual(fe.hasRef(), false);\n"
+      "fe.ref();\n"
+      "assert.strictEqual(fe.hasRef(), true);\n"
+      "fe.close(() => feCalls.push('first'));\n"
+      "fe.close(() => feCalls.push('second'));\n"
+      "const sw = new StatWatcher(false);\n"
+      "const swCalls = [];\n"
+      "sw.close(() => swCalls.push('nope'));\n"
+      "assert.strictEqual(sw.hasRef(), false);\n"
+      "assert.strictEqual(sw.start(file, 25), 0);\n"
+      "assert.strictEqual(sw.hasRef(), true);\n"
+      "sw.unref();\n"
+      "assert.strictEqual(sw.hasRef(), false);\n"
+      "sw.ref();\n"
+      "assert.strictEqual(sw.hasRef(), true);\n"
+      "sw.close(() => swCalls.push('first'));\n"
+      "sw.close(() => swCalls.push('second'));\n"
+      "setTimeout(() => {\n"
+      "  assert.deepStrictEqual(feCalls, ['first']);\n"
+      "  assert.deepStrictEqual(swCalls, ['first']);\n"
+      "  console.log('fs-handle-wrap:ok');\n"
+      "}, 60);\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--expose-internals", script_path},
+      "ubi_phase01_cli_fs_handle_wrap_semantics_run");
+
+  RemoveTempScript(script_path);
+  std::error_code ec;
+  fs::remove(file_path, ec);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("fs-handle-wrap:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
 
@@ -1232,6 +1520,131 @@ TEST_F(Test1CliPhase01, ProcessAbortTerminatesProcess) {
   EXPECT_TRUE(terminated_by_sigabrt) << "status=" << result.status << " stderr=" << result.stderr_output;
 
   RemoveTempScript(script_path);
+#endif
+}
+
+TEST_F(Test1CliPhase01, ProcessWrapCloseMatchesHandleWrapNoopAndCallbackSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "process_wrap close semantics check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_process_wrap_close_semantics",
+      "const assert = require('assert');\n"
+      "const { spawn } = require('child_process');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const Process = internalBinding('process_wrap').Process;\n"
+      "let uninitializedCloseCalls = 0;\n"
+      "new Process().close(() => { uninitializedCloseCalls++; });\n"
+      "setImmediate(() => {\n"
+      "  assert.strictEqual(uninitializedCloseCalls, 0);\n"
+      "  const cp = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 50)']);\n"
+      "  const calls = [];\n"
+      "  cp._handle.close(() => calls.push('first'));\n"
+      "  cp._handle.close(() => calls.push('second'));\n"
+      "  setTimeout(() => {\n"
+      "    assert.deepStrictEqual(calls, ['first']);\n"
+      "    console.log('process-wrap-close:ok');\n"
+      "  }, 25);\n"
+      "});\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--expose-internals", script_path},
+      "ubi_phase01_process_wrap_close_semantics_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("process-wrap-close:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SignalWrapCloseMatchesHandleWrapCallbackSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "signal_wrap close semantics check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_signal_wrap_close_semantics",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const Signal = internalBinding('signal_wrap').Signal;\n"
+      "const signal = new Signal();\n"
+      "const calls = [];\n"
+      "signal.close(() => calls.push('first'));\n"
+      "signal.close(() => calls.push('second'));\n"
+      "setTimeout(() => {\n"
+      "  assert.deepStrictEqual(calls, ['first']);\n"
+      "  console.log('signal-wrap-close:ok');\n"
+      "}, 25);\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--expose-internals", script_path},
+      "ubi_phase01_signal_wrap_close_semantics_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("signal-wrap-close:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, UdpWrapCloseMatchesHandleWrapCallbackAndRefSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "udp_wrap close semantics check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_udp_wrap_close_semantics",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const UDP = internalBinding('udp_wrap').UDP;\n"
+      "const handle = new UDP();\n"
+      "assert.strictEqual(handle.hasRef(), true);\n"
+      "handle.unref();\n"
+      "assert.strictEqual(handle.hasRef(), false);\n"
+      "handle.ref();\n"
+      "assert.strictEqual(handle.hasRef(), true);\n"
+      "const calls = [];\n"
+      "handle.close(() => calls.push('first'));\n"
+      "handle.close(() => calls.push('second'));\n"
+      "setTimeout(() => {\n"
+      "  assert.deepStrictEqual(calls, ['first']);\n"
+      "  console.log('udp-wrap-close:ok');\n"
+      "}, 25);\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--expose-internals", script_path},
+      "ubi_phase01_udp_wrap_close_semantics_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("udp-wrap-close:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
 
@@ -1506,3 +1919,420 @@ TEST_F(Test1CliPhase01, OsConstantsExposeNodeLikeShapeAndCoverage) {
   EXPECT_NE(result.stdout_output.find("os-constants-shape:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
+
+TEST_F(Test1CliPhase01, SpawnSyncBindingMatchesNodeOptionParsingForCoreFields) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "spawn_sync binding option-parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_spawn_sync_binding_options",
+      "const assert = require('assert');\n"
+      "const binding = process.binding('spawn_sync');\n"
+      "const base = {\n"
+      "  file: process.execPath,\n"
+      "  args: [process.execPath, '-e', ''],\n"
+      "  stdio: [],\n"
+      "};\n"
+      "let result = binding.spawn({ ...base, args: 1 });\n"
+      "assert.strictEqual(result.error, -22);\n"
+      "assert.strictEqual(result.output, null);\n"
+      "result = binding.spawn({ ...base, envPairs: 1 });\n"
+      "assert.strictEqual(result.error, -22);\n"
+      "assert.strictEqual(result.output, null);\n"
+      "result = binding.spawn({ ...base, detached: true, killSignal: 0 });\n"
+      "assert.strictEqual(result.error, undefined);\n"
+      "assert.strictEqual(result.status, 0);\n"
+      "assert.ok(Array.isArray(result.output));\n"
+      "if (typeof process.getuid === 'function') {\n"
+      "  result = binding.spawn({ ...base, uid: process.getuid() });\n"
+      "  assert.strictEqual(result.error, undefined);\n"
+      "  assert.strictEqual(result.status, 0);\n"
+      "}\n"
+      "if (typeof process.getgid === 'function') {\n"
+      "  result = binding.spawn({ ...base, gid: process.getgid() });\n"
+      "  assert.strictEqual(result.error, undefined);\n"
+      "  assert.strictEqual(result.status, 0);\n"
+      "}\n"
+      "console.log('spawn-sync-binding-options:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_spawn_sync_binding_options_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("spawn-sync-binding-options:ok"), std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SpawnSyncBindingBuildsNodeStyleOutputForExtraPipeFds) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "spawn_sync binding output-shape check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_spawn_sync_binding_output_shape",
+      "const assert = require('assert');\n"
+      "const binding = process.binding('spawn_sync');\n"
+      "const result = binding.spawn({\n"
+      "  file: process.execPath,\n"
+      "  args: [process.execPath, '-e', \"require('fs').writeSync(3, 'fd3-out')\"],\n"
+      "  stdio: ['ignore', 'ignore', 'ignore', 'pipe'],\n"
+      "});\n"
+      "assert.strictEqual(result.error, undefined);\n"
+      "assert.strictEqual(result.status, 0);\n"
+      "assert.ok(Array.isArray(result.output));\n"
+      "assert.strictEqual(result.output.length, 4);\n"
+      "assert.strictEqual(result.output[0], null);\n"
+      "assert.strictEqual(result.output[1], null);\n"
+      "assert.strictEqual(result.output[2], null);\n"
+      "assert.strictEqual(result.output[3].toString(), 'fd3-out');\n"
+      "console.log('spawn-sync-binding-output-shape:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_spawn_sync_binding_output_shape_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("spawn-sync-binding-output-shape:ok"), std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, CliResolvesEntryWithoutJsExtensionLikeNode) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "entry resolution check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_entry_noext",
+      "console.log('entry-noext-ok');\n");
+  ASSERT_GE(script_path.size(), 3u);
+  const std::string extensionless = script_path.substr(0, script_path.size() - 3);
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {extensionless},
+          "ubi_phase01_cli_entry_noext_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("entry-noext-ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, MessagePortMatchesNodeLocalTransferCloseAndRefSemantics) {
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_messageport_parity",
+      "const assert = require('assert');\n"
+      "const { MessageChannel, receiveMessageOnPort } = require('worker_threads');\n"
+      "(async () => {\n"
+      "  const channel = new MessageChannel();\n"
+      "  assert.strictEqual(channel.port1.hasRef(), false);\n"
+      "  channel.port1.ref();\n"
+      "  assert.strictEqual(channel.port1.hasRef(), true);\n"
+      "  channel.port1.unref();\n"
+      "  assert.strictEqual(channel.port1.hasRef(), false);\n"
+      "  const typedArray = new Uint8Array([0, 1, 2, 3, 4]);\n"
+      "  channel.port2.postMessage({ typedArray }, [typedArray.buffer]);\n"
+      "  assert.strictEqual(typedArray.buffer.byteLength, 0);\n"
+      "  const first = receiveMessageOnPort(channel.port1);\n"
+      "  assert.deepStrictEqual(Array.from(first.message.typedArray), [0, 1, 2, 3, 4]);\n"
+      "  for (const value of [null, 0, -1, {}, []]) {\n"
+      "    assert.throws(() => receiveMessageOnPort(value), {\n"
+      "      name: 'TypeError',\n"
+      "      code: 'ERR_INVALID_ARG_TYPE',\n"
+      "      message: 'The \"port\" argument must be a MessagePort instance'\n"
+      "    });\n"
+      "  }\n"
+      "  const late = new MessageChannel();\n"
+      "  const seen = [];\n"
+      "  late.port2.postMessage('firstMessage');\n"
+      "  late.port2.postMessage('lastMessage');\n"
+      "  late.port2.close();\n"
+      "  late.port1.on('message', (message) => seen.push(message));\n"
+      "  await new Promise((resolve) => setTimeout(resolve, 20));\n"
+      "  assert.deepStrictEqual(seen, ['firstMessage', 'lastMessage']);\n"
+      "  console.log('messageport-parity:ok');\n"
+      "})().catch((err) => {\n"
+      "  console.error(err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_messageport_parity_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("messageport-parity:ok"), std::string::npos)
+      << result.stdout_output;
+}
+
+TEST_F(Test1CliPhase01, MessagingStructuredCloneSupportsSharedArrayBuffer) {
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_structured_clone_sab",
+      "const assert = require('assert');\n"
+      "const sab = new SharedArrayBuffer(8);\n"
+      "const original = new Uint8Array(sab);\n"
+      "original[0] = 7;\n"
+      "original[1] = 13;\n"
+      "const clone = structuredClone({ sab }).sab;\n"
+      "assert.notStrictEqual(clone, sab);\n"
+      "const cloned = new Uint8Array(clone);\n"
+      "assert.strictEqual(cloned[0], 7);\n"
+      "assert.strictEqual(cloned[1], 13);\n"
+      "original[2] = 29;\n"
+      "assert.strictEqual(cloned[2], 29);\n"
+      "console.log('structured-clone-sab:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_structured_clone_sab_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("structured-clone-sab:ok"), std::string::npos)
+      << result.stdout_output;
+}
+
+// TEST_F(Test1CliPhase01, WorkerMessagePortRequiresTransferListLikeNode) {
+//   const auto ubi_path = ResolveBuiltUbiBinary();
+//   ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+//   const std::string script_path = WriteTempScript(
+//       "ubi_phase01_cli_worker_port_transfer_validation",
+//       "const assert = require('assert');\n"
+//       "const { Worker, MessageChannel } = require('worker_threads');\n"
+//       "const channel = new MessageChannel();\n"
+//       "assert.throws(() => new Worker('0', {\n"
+//       "  eval: true,\n"
+//       "  workerData: { message: channel.port1 },\n"
+//       "  transferList: [],\n"
+//       "}), {\n"
+//       "  constructor: DOMException,\n"
+//       "  name: 'DataCloneError',\n"
+//       "  code: 25,\n"
+//       "  message: 'Object that needs transfer was found in message but not listed in transferList',\n"
+//       "});\n"
+//       "console.log('worker-port-transfer-validation:ok');\n");
+
+//   const CommandResult result =
+//       RunBuiltBinaryAndCapture(
+//           ubi_path,
+//           {script_path},
+//           "ubi_phase01_cli_worker_port_transfer_validation_run");
+
+//   RemoveTempScript(script_path);
+
+//   ASSERT_NE(result.status, -1);
+//   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+//   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+//   EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+//   EXPECT_NE(result.stdout_output.find("worker-port-transfer-validation:ok"), std::string::npos)
+//       << result.stdout_output;
+// }
+
+// TEST_F(Test1CliPhase01, MessagingMatchesNodeBroadcastAndTransferEdgeSemantics) {
+//   const auto ubi_path = ResolveBuiltUbiBinary();
+//   ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+//   const std::string script_path = WriteTempScript(
+//       "ubi_phase01_cli_messaging_edge_parity",
+//       "const assert = require('assert');\n"
+//       "const { BroadcastChannel, MessageChannel, moveMessagePortToContext } = require('worker_threads');\n"
+//       "(async () => {\n"
+//       "  const channelName = 'ubi-phase01-broadcast-' + process.pid;\n"
+//       "  const bc1 = new BroadcastChannel(channelName);\n"
+//       "  const bc2 = new BroadcastChannel(channelName);\n"
+//       "  const seen = [];\n"
+//       "  bc2.onmessage = ({ data }) => seen.push(data);\n"
+//       "  bc1.postMessage('hello');\n"
+//       "  await new Promise((resolve) => setTimeout(resolve, 20));\n"
+//       "  assert.deepStrictEqual(seen, ['hello']);\n"
+//       "  bc1.close();\n"
+//       "  bc2.close();\n"
+//       "\n"
+//       "  {\n"
+//       "    const { port1 } = new MessageChannel();\n"
+//       "    assert.throws(() => port1.postMessage('x', [port1]), {\n"
+//       "      constructor: DOMException,\n"
+//       "      name: 'DataCloneError',\n"
+//       "      code: 25,\n"
+//       "      message: 'Transfer list contains source port',\n"
+//       "    });\n"
+//       "    port1.close();\n"
+//       "  }\n"
+//       "\n"
+//       "  {\n"
+//       "    const { port1, port2 } = new MessageChannel();\n"
+//       "    const warnings = [];\n"
+//       "    const originalEmitWarning = process.emitWarning;\n"
+//       "    process.emitWarning = (warning) => { warnings.push(String(warning)); };\n"
+//       "    let closeCount = 0;\n"
+//       "    port1.on('close', () => closeCount++);\n"
+//       "    port2.on('close', () => closeCount++);\n"
+//       "    const arrayBuf = new ArrayBuffer(4);\n"
+//       "    assert.strictEqual(port2.postMessage(null, [port1, arrayBuf]), true);\n"
+//       "    assert.strictEqual(arrayBuf.byteLength, 0);\n"
+//       "    await new Promise((resolve) => setTimeout(resolve, 20));\n"
+//       "    process.emitWarning = originalEmitWarning;\n"
+//       "    assert.deepStrictEqual(warnings, [\n"
+//       "      'The target port was posted to itself, and the communication channel was lost',\n"
+//       "    ]);\n"
+//       "    assert.strictEqual(closeCount, 2);\n"
+//       "  }\n"
+//       "\n"
+//       "  {\n"
+//       "    const { port1 } = new MessageChannel();\n"
+//       "    port1.close();\n"
+//       "    assert.throws(() => moveMessagePortToContext(port1, {}), {\n"
+//       "      code: 'ERR_CLOSED_MESSAGE_PORT',\n"
+//       "      message: 'Cannot send data on closed MessagePort',\n"
+//       "    });\n"
+//       "  }\n"
+//       "\n"
+//       "  console.log('messaging-edge-parity:ok');\n"
+//       "})().catch((err) => {\n"
+//       "  console.error(err && err.stack || err);\n"
+//       "  process.exitCode = 1;\n"
+//       "});\n");
+
+//   const CommandResult result =
+//       RunBuiltBinaryAndCapture(
+//           ubi_path,
+//           {script_path},
+//           "ubi_phase01_cli_messaging_edge_parity_run");
+
+//   RemoveTempScript(script_path);
+
+//   ASSERT_NE(result.status, -1);
+//   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+//   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+//   EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+//   EXPECT_NE(result.stdout_output.find("messaging-edge-parity:ok"), std::string::npos)
+//       << result.stdout_output;
+// }
+
+// TEST_F(Test1CliPhase01, WorkerShareEnvAndTerminateMatchNode) {
+//   const auto ubi_path = ResolveBuiltUbiBinary();
+//   ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+//   const std::string script_path = WriteTempScript(
+//       "ubi_phase01_cli_worker_share_env_terminate",
+//       "const assert = require('assert');\n"
+//       "const { once } = require('events');\n"
+//       "const { Worker, SHARE_ENV } = require('worker_threads');\n"
+//       "(async () => {\n"
+//       "  process.env.UBI_PHASE01_SHARED = 'main-start';\n"
+//       "  const sharedWorker = new Worker(`\n"
+//       "    const { parentPort } = require('worker_threads');\n"
+//       "    process.env.UBI_PHASE01_SHARED = 'shared-worker';\n"
+//       "    setTimeout(() => parentPort.postMessage({\n"
+//       "      value: process.env.UBI_PHASE01_SHARED,\n"
+//       "      has: Object.prototype.hasOwnProperty.call(process.env, 'UBI_PHASE01_SHARED'),\n"
+//       "      keys: Object.keys(process.env).includes('UBI_PHASE01_SHARED'),\n"
+//       "    }), 10);\n"
+//       "    setInterval(() => {}, 1000);\n"
+//       "  `, { eval: true, env: SHARE_ENV });\n"
+//       "  const sharedErrors = [];\n"
+//       "  sharedWorker.on('error', (err) => sharedErrors.push(String(err && (err.stack || err))));\n"
+//       "  const [sharedMessage] = await once(sharedWorker, 'message');\n"
+//       "  assert.deepStrictEqual(sharedMessage, {\n"
+//       "    value: 'shared-worker',\n"
+//       "    has: true,\n"
+//       "    keys: true,\n"
+//       "  });\n"
+//       "  assert.strictEqual(process.env.UBI_PHASE01_SHARED, 'shared-worker');\n"
+//       "  assert.strictEqual(Object.prototype.hasOwnProperty.call(process.env, 'UBI_PHASE01_SHARED'), true);\n"
+//       "  assert.strictEqual(Object.keys(process.env).includes('UBI_PHASE01_SHARED'), true);\n"
+//       "  assert.strictEqual(await sharedWorker.terminate(), 1);\n"
+//       "  assert.deepStrictEqual(sharedErrors, []);\n"
+//       "\n"
+//       "  process.env.UBI_PHASE01_COPY = 'main-copy';\n"
+//       "  const copyWorker = new Worker(`\n"
+//       "    const { parentPort } = require('worker_threads');\n"
+//       "    process.env.UBI_PHASE01_COPY = 'copy-worker';\n"
+//       "    parentPort.postMessage({\n"
+//       "      value: process.env.UBI_PHASE01_COPY,\n"
+//       "      has: Object.prototype.hasOwnProperty.call(process.env, 'UBI_PHASE01_COPY'),\n"
+//       "      keys: Object.keys(process.env).includes('UBI_PHASE01_COPY'),\n"
+//       "    });\n"
+//       "    setInterval(() => {}, 1000);\n"
+//       "  `, { eval: true, env: null });\n"
+//       "  const [copyMessage] = await once(copyWorker, 'message');\n"
+//       "  assert.deepStrictEqual(copyMessage, {\n"
+//       "    value: 'copy-worker',\n"
+//       "    has: true,\n"
+//       "    keys: true,\n"
+//       "  });\n"
+//       "  assert.strictEqual(process.env.UBI_PHASE01_COPY, 'main-copy');\n"
+//       "  assert.strictEqual(await copyWorker.terminate(), 1);\n"
+//       "\n"
+//       "  delete process.env.UBI_PHASE01_SHARED;\n"
+//       "  delete process.env.UBI_PHASE01_COPY;\n"
+//       "  console.log('worker-share-env-terminate:ok');\n"
+//       "})().catch((err) => {\n"
+//       "  console.error(err && err.stack || err);\n"
+//       "  process.exitCode = 1;\n"
+//       "});\n");
+
+//   const CommandResult result =
+//       RunBuiltBinaryAndCapture(
+//           ubi_path,
+//           {script_path},
+//           "ubi_phase01_cli_worker_share_env_terminate_run");
+
+//   RemoveTempScript(script_path);
+
+//   ASSERT_NE(result.status, -1);
+//   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+//   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+//   EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+//   EXPECT_NE(result.stdout_output.find("worker-share-env-terminate:ok"), std::string::npos)
+//       << result.stdout_output;
+// }

@@ -4,6 +4,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace {
@@ -25,6 +26,37 @@ struct ErrorsStackLocation {
 };
 
 std::unordered_map<napi_env, ErrorsBindingState> g_errors_states;
+std::unordered_set<napi_env> g_errors_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnErrorsEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_errors_cleanup_hook_registered.erase(env);
+
+  auto it = g_errors_states.find(env);
+  if (it == g_errors_states.end()) return;
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  DeleteRefIfPresent(env, &it->second.prepare_stack_trace_callback_ref);
+  DeleteRefIfPresent(env, &it->second.get_source_map_error_source_ref);
+  DeleteRefIfPresent(env, &it->second.maybe_cache_generated_source_map_ref);
+  DeleteRefIfPresent(env, &it->second.enhance_fatal_stack_before_inspector_ref);
+  DeleteRefIfPresent(env, &it->second.enhance_fatal_stack_after_inspector_ref);
+  g_errors_states.erase(it);
+}
+
+void EnsureErrorsCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_errors_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnErrorsEnvCleanup, env) != napi_ok) {
+    g_errors_cleanup_hook_registered.erase(it);
+  }
+}
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
   napi_value string_value = nullptr;
@@ -42,6 +74,37 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   }
   out.resize(copied);
   return out;
+}
+
+std::string CallRefCallbackAsUtf8(napi_env env, napi_ref ref, napi_value arg) {
+  if (env == nullptr || ref == nullptr || arg == nullptr) return "";
+
+  napi_value cb = nullptr;
+  if (napi_get_reference_value(env, ref, &cb) != napi_ok || cb == nullptr) {
+    return "";
+  }
+  napi_valuetype cb_type = napi_undefined;
+  if (napi_typeof(env, cb, &cb_type) != napi_ok || cb_type != napi_function) {
+    return "";
+  }
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return "";
+  }
+
+  napi_value argv[1] = {arg};
+  napi_value result = nullptr;
+  if (napi_call_function(env, global, cb, 1, argv, &result) != napi_ok || result == nullptr) {
+    return "";
+  }
+  return ValueToUtf8(env, result);
+}
+
+std::string FormatFatalExceptionAfterInspector(napi_env env, napi_value exception) {
+  const auto it = g_errors_states.find(env);
+  if (it == g_errors_states.end()) return "";
+  return CallRefCallbackAsUtf8(env, it->second.enhance_fatal_stack_after_inspector_ref, exception);
 }
 
 napi_value MakeUndefined(napi_env env) {
@@ -107,10 +170,7 @@ napi_value ErrorsNoSideEffectsToString(napi_env env, napi_callback_info info) {
 
 void ErrorsSetRef(napi_env env, napi_ref* slot, napi_value value) {
   if (slot == nullptr) return;
-  if (*slot != nullptr) {
-    napi_delete_reference(env, *slot);
-    *slot = nullptr;
-  }
+  DeleteRefIfPresent(env, slot);
   napi_valuetype type = napi_undefined;
   if (value != nullptr && napi_typeof(env, value, &type) == napi_ok && type == napi_function) {
     napi_create_reference(env, value, 1, slot);
@@ -316,7 +376,8 @@ napi_value ErrorsGetErrorSourcePositions(napi_env env, napi_callback_info info) 
       if (ParseErrorStackForLocation(stack, &location)) {
         script_resource_name = location.script_resource_name;
         line_number = location.line_number;
-        start_column = location.start_column;
+        // JS consumers expect 0-based source columns, while stack traces use 1-based columns.
+        start_column = location.start_column > 0 ? location.start_column - 1 : 0;
 
         auto it = g_errors_states.find(env);
         const bool source_maps_enabled =
@@ -449,6 +510,7 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
 }
 
 napi_value GetOrCreateErrorsBinding(napi_env env) {
+  EnsureErrorsCleanupHook(env);
   auto& st = g_errors_states[env];
   if (st.binding_ref != nullptr) {
     napi_value existing = nullptr;
@@ -501,10 +563,7 @@ napi_value GetOrCreateErrorsBinding(napi_env env) {
   }
   if (napi_set_named_property(env, binding, "exitCodes", exit_codes) != napi_ok) return nullptr;
 
-  if (st.binding_ref != nullptr) {
-    napi_delete_reference(env, st.binding_ref);
-    st.binding_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &st.binding_ref);
   if (napi_create_reference(env, binding, 1, &st.binding_ref) != napi_ok || st.binding_ref == nullptr) {
     return nullptr;
   }
@@ -515,4 +574,8 @@ napi_value GetOrCreateErrorsBinding(napi_env env) {
 
 napi_value UbiGetOrCreateErrorsBinding(napi_env env) {
   return GetOrCreateErrorsBinding(env);
+}
+
+std::string UbiFormatFatalExceptionAfterInspector(napi_env env, napi_value exception) {
+  return FormatFatalExceptionAfterInspector(env, exception);
 }

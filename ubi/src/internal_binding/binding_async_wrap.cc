@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "internal_binding/helpers.h"
@@ -47,6 +48,41 @@ struct DestroyHookData {
 };
 
 std::unordered_map<napi_env, AsyncWrapState> g_async_wrap_states;
+std::unordered_set<napi_env> g_async_wrap_cleanup_hooks;
+
+void ResetRef(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnAsyncWrapEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_async_wrap_cleanup_hooks.erase(env);
+  auto it = g_async_wrap_states.find(env);
+  if (it == g_async_wrap_states.end()) return;
+  AsyncWrapState& state = it->second;
+  ResetRef(env, &state.binding_ref);
+  ResetRef(env, &state.async_hook_fields_ref);
+  ResetRef(env, &state.async_id_fields_ref);
+  ResetRef(env, &state.async_ids_stack_ref);
+  ResetRef(env, &state.execution_async_resources_ref);
+  ResetRef(env, &state.hooks_ref);
+  ResetRef(env, &state.callback_trampoline_ref);
+  for (napi_ref& hook_ref : state.promise_hooks) {
+    ResetRef(env, &hook_ref);
+  }
+  g_async_wrap_states.erase(it);
+}
+
+void EnsureAsyncWrapCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_async_wrap_cleanup_hooks.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnAsyncWrapEnvCleanup, env) != napi_ok) {
+    g_async_wrap_cleanup_hooks.erase(it);
+  }
+}
 
 AsyncWrapState* GetState(napi_env env) {
   auto it = g_async_wrap_states.find(env);
@@ -222,24 +258,25 @@ napi_value AsyncWrapSetCallbackTrampoline(napi_env env, napi_callback_info info)
   return Undefined(env);
 }
 
-napi_value AsyncWrapPushAsyncContext(napi_env env, napi_callback_info info) {
-  AsyncWrapState* state = GetState(env);
+void PushAsyncContextImpl(napi_env env,
+                          AsyncWrapState* state,
+                          double async_id,
+                          double trigger_id,
+                          napi_value resource) {
   uint32_t* fields = HookFields(env, state);
   double* ids = IdFields(env, state);
   size_t capacity_pairs = 0;
   double* stack = IdStack(env, state, &capacity_pairs);
-  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return Undefined(env);
-
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
-  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-
-  double async_id = 0;
-  double trigger_id = 0;
-  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
-  if (argc >= 2 && argv[1] != nullptr) napi_get_value_double(env, argv[1], &trigger_id);
+  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return;
 
   const uint32_t offset = fields[kStackLength];
+  if (resource != nullptr) {
+    napi_value resources = GetExecutionResources(env, state);
+    if (resources != nullptr) {
+      napi_set_element(env, resources, offset, resource);
+    }
+  }
+
   if (offset < capacity_pairs) {
     stack[offset * 2] = ids[kExecutionAsyncId];
     stack[offset * 2 + 1] = ids[kTriggerAsyncId];
@@ -253,22 +290,14 @@ napi_value AsyncWrapPushAsyncContext(napi_env env, napi_callback_info info) {
   fields[kStackLength] = offset + 1;
   ids[kExecutionAsyncId] = async_id;
   ids[kTriggerAsyncId] = trigger_id;
-  return Undefined(env);
 }
 
-napi_value AsyncWrapPopAsyncContext(napi_env env, napi_callback_info info) {
-  AsyncWrapState* state = GetState(env);
+bool PopAsyncContextImpl(napi_env env, AsyncWrapState* state, double async_id) {
   uint32_t* fields = HookFields(env, state);
   double* ids = IdFields(env, state);
   size_t capacity_pairs = 0;
   double* stack = IdStack(env, state, &capacity_pairs);
-  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return Undefined(env);
-
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-  double async_id = 0;
-  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
+  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return false;
 
   const uint32_t stack_length = fields[kStackLength];
   bool result = false;
@@ -307,7 +336,36 @@ napi_value AsyncWrapPopAsyncContext(napi_env env, napi_callback_info info) {
       }
     }
   }
+  return result;
+}
 
+napi_value AsyncWrapPushAsyncContext(napi_env env, napi_callback_info info) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return Undefined(env);
+
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  double async_id = 0;
+  double trigger_id = 0;
+  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
+  if (argc >= 2 && argv[1] != nullptr) napi_get_value_double(env, argv[1], &trigger_id);
+  PushAsyncContextImpl(env, state, async_id, trigger_id, nullptr);
+  return Undefined(env);
+}
+
+napi_value AsyncWrapPopAsyncContext(napi_env env, napi_callback_info info) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return Undefined(env);
+
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  double async_id = 0;
+  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
+
+  bool result = PopAsyncContextImpl(env, state, async_id);
   napi_value out = nullptr;
   napi_get_boolean(env, result, &out);
   return out != nullptr ? out : Undefined(env);
@@ -477,9 +535,11 @@ napi_value CreateProviders(napi_env env) {
   SetNamedUint32(env, out, "NONE", 0);
   SetNamedUint32(env, out, "JSSTREAM", 20);
   SetNamedUint32(env, out, "JSUDPWRAP", 21);
+  SetNamedUint32(env, out, "MESSAGEPORT", 22);
   SetNamedUint32(env, out, "PIPECONNECTWRAP", 23);
   SetNamedUint32(env, out, "PIPESERVERWRAP", 24);
   SetNamedUint32(env, out, "PIPEWRAP", 25);
+  SetNamedUint32(env, out, "PROCESSWRAP", 26);
   SetNamedUint32(env, out, "SHUTDOWNWRAP", 35);
   SetNamedUint32(env, out, "TCPCONNECTWRAP", 39);
   SetNamedUint32(env, out, "TCPSERVERWRAP", 40);
@@ -489,6 +549,7 @@ napi_value CreateProviders(napi_env env) {
   SetNamedUint32(env, out, "UDPSENDWRAP", 43);
   SetNamedUint32(env, out, "UDPWRAP", 44);
   SetNamedUint32(env, out, "WRITEWRAP", 52);
+  SetNamedUint32(env, out, "ZLIB", 53);
   return out;
 }
 
@@ -506,7 +567,23 @@ napi_value AsyncWrapGetCallbackTrampoline(napi_env env) {
   return GetRefValue(env, state->callback_trampoline_ref);
 }
 
+void AsyncWrapPushContext(napi_env env,
+                          double async_id,
+                          double trigger_async_id,
+                          napi_value resource) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return;
+  PushAsyncContextImpl(env, state, async_id, trigger_async_id, resource);
+}
+
+bool AsyncWrapPopContext(napi_env env, double async_id) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return false;
+  return PopAsyncContextImpl(env, state, async_id);
+}
+
 napi_value ResolveAsyncWrap(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureAsyncWrapCleanupHook(env);
   auto& state = g_async_wrap_states[env];
   if (state.binding_ref != nullptr) {
     napi_value existing = GetRefValue(env, state.binding_ref);

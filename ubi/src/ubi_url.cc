@@ -11,6 +11,10 @@ namespace {
 constexpr char kHexDigits[] = "0123456789ABCDEF";
 constexpr uint32_t kUrlComponentsLength = 9;
 
+struct UrlBindingState {
+  napi_ref url_components_ref = nullptr;
+};
+
 enum UrlUpdateAction : uint32_t {
   kProtocol = 0,
   kHost = 1,
@@ -23,8 +27,6 @@ enum UrlUpdateAction : uint32_t {
   kHash = 8,
   kHref = 9,
 };
-
-napi_ref g_url_components_ref = nullptr;
 
 napi_value GetUndefined(napi_env env) {
   napi_value out = nullptr;
@@ -63,9 +65,9 @@ void SetNamedString(napi_env env, napi_value obj, const char* key, std::string_v
   }
 }
 
-void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
+void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb, void* data) {
   napi_value fn = nullptr;
-  if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok && fn != nullptr) {
+  if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, data, &fn) == napi_ok && fn != nullptr) {
     napi_set_named_property(env, obj, name, fn);
   }
 }
@@ -112,10 +114,26 @@ std::string EncodePathChars(std::string_view input, bool windows) {
   return encoded;
 }
 
-napi_value GetUrlComponentsArray(napi_env env) {
-  if (g_url_components_ref == nullptr) return nullptr;
+void DeleteBindingState(napi_env env, void* data, void* /*hint*/) {
+  auto* state = static_cast<UrlBindingState*>(data);
+  if (state == nullptr) return;
+  if (state->url_components_ref != nullptr) {
+    napi_delete_reference(env, state->url_components_ref);
+    state->url_components_ref = nullptr;
+  }
+  delete state;
+}
+
+UrlBindingState* GetBindingState(napi_env env, napi_callback_info info, size_t* argc, napi_value* argv) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, argc, argv, nullptr, &data) != napi_ok) return nullptr;
+  return static_cast<UrlBindingState*>(data);
+}
+
+napi_value GetUrlComponentsArray(napi_env env, UrlBindingState* state) {
+  if (state == nullptr || state->url_components_ref == nullptr) return nullptr;
   napi_value arr = nullptr;
-  if (napi_get_reference_value(env, g_url_components_ref, &arr) != napi_ok || arr == nullptr) return nullptr;
+  if (napi_get_reference_value(env, state->url_components_ref, &arr) != napi_ok || arr == nullptr) return nullptr;
   return arr;
 }
 
@@ -126,8 +144,8 @@ void SetArrayU32(napi_env env, napi_value arr, uint32_t index, uint32_t value) {
   }
 }
 
-void UpdateComponents(napi_env env, const ada::url_components& c, ada::scheme::type type) {
-  napi_value arr = GetUrlComponentsArray(env);
+void UpdateComponents(napi_env env, UrlBindingState* state, const ada::url_components& c, ada::scheme::type type) {
+  napi_value arr = GetUrlComponentsArray(env, state);
   if (arr == nullptr) return;
   SetArrayU32(env, arr, 0, static_cast<uint32_t>(c.protocol_end));
   SetArrayU32(env, arr, 1, static_cast<uint32_t>(c.username_end));
@@ -157,7 +175,7 @@ void ThrowInvalidUrl(napi_env env, std::string_view input, const std::optional<s
 napi_value BindingDomainToASCII(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return GetUndefined(env);
+  if (GetBindingState(env, info, &argc, argv) == nullptr || argc < 1) return GetUndefined(env);
   std::string input = ValueToUtf8(env, argv[0]);
   napi_value ret = nullptr;
   if (input.empty()) {
@@ -174,7 +192,7 @@ napi_value BindingDomainToASCII(napi_env env, napi_callback_info info) {
 napi_value BindingDomainToUnicode(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return GetUndefined(env);
+  if (GetBindingState(env, info, &argc, argv) == nullptr || argc < 1) return GetUndefined(env);
   std::string input = ValueToUtf8(env, argv[0]);
   napi_value ret = nullptr;
   if (input.empty()) {
@@ -191,7 +209,7 @@ napi_value BindingDomainToUnicode(napi_env env, napi_callback_info info) {
 napi_value BindingCanParse(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
+  if (GetBindingState(env, info, &argc, argv) == nullptr || argc < 1) {
     return GetUndefined(env);
   }
   std::string input = ValueToUtf8(env, argv[0]);
@@ -211,7 +229,7 @@ napi_value BindingCanParse(napi_env env, napi_callback_info info) {
 napi_value BindingGetOrigin(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return GetUndefined(env);
+  if (GetBindingState(env, info, &argc, argv) == nullptr || argc < 1) return GetUndefined(env);
   std::string href = ValueToUtf8(env, argv[0]);
   auto parsed = ada::parse<ada::url_aggregator>(href);
   if (!parsed) {
@@ -227,7 +245,7 @@ napi_value BindingGetOrigin(napi_env env, napi_callback_info info) {
 napi_value BindingFormat(napi_env env, napi_callback_info info) {
   size_t argc = 5;
   napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return GetUndefined(env);
+  if (GetBindingState(env, info, &argc, argv) == nullptr || argc < 1) return GetUndefined(env);
 
   std::string href = ValueToUtf8(env, argv[0]);
   bool hash = ValueToBool(env, argc > 1 ? argv[1] : nullptr, true);
@@ -256,7 +274,8 @@ napi_value BindingFormat(napi_env env, napi_callback_info info) {
 napi_value BindingParse(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr, nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return GetUndefined(env);
+  UrlBindingState* state = GetBindingState(env, info, &argc, argv);
+  if (state == nullptr || argc < 1) return GetUndefined(env);
 
   std::string input = ValueToUtf8(env, argv[0]);
   bool raise_exception = ValueToBool(env, argc > 2 ? argv[2] : nullptr, false);
@@ -281,7 +300,7 @@ napi_value BindingParse(napi_env env, napi_callback_info info) {
     return GetUndefined(env);
   }
 
-  UpdateComponents(env, out->get_components(), out->type);
+  UpdateComponents(env, state, out->get_components(), out->type);
   const std::string href(out->get_href());
   napi_value ret = nullptr;
   napi_create_string_utf8(env, href.c_str(), href.size(), &ret);
@@ -291,7 +310,8 @@ napi_value BindingParse(napi_env env, napi_callback_info info) {
 napi_value BindingPathToFileURL(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr, nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return GetUndefined(env);
+  UrlBindingState* state = GetBindingState(env, info, &argc, argv);
+  if (state == nullptr || argc < 2) return GetUndefined(env);
 
   std::string input = ValueToUtf8(env, argv[0]);
   bool windows = ValueToBool(env, argv[1], false);
@@ -307,7 +327,7 @@ napi_value BindingPathToFileURL(napi_env env, napi_callback_info info) {
     if (!host.empty()) out->set_hostname(host);
   }
 
-  UpdateComponents(env, out->get_components(), out->type);
+  UpdateComponents(env, state, out->get_components(), out->type);
   const std::string href(out->get_href());
   napi_value ret = nullptr;
   napi_create_string_utf8(env, href.c_str(), href.size(), &ret);
@@ -317,7 +337,8 @@ napi_value BindingPathToFileURL(napi_env env, napi_callback_info info) {
 napi_value BindingUpdate(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr, nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 3) return GetUndefined(env);
+  UrlBindingState* state = GetBindingState(env, info, &argc, argv);
+  if (state == nullptr || argc < 3) return GetUndefined(env);
 
   std::string href = ValueToUtf8(env, argv[0]);
   uint32_t action = 0;
@@ -375,7 +396,7 @@ napi_value BindingUpdate(napi_env env, napi_callback_info info) {
     return f;
   }
 
-  UpdateComponents(env, out->get_components(), out->type);
+  UpdateComponents(env, state, out->get_components(), out->type);
   const std::string result_href(out->get_href());
   napi_value ret = nullptr;
   napi_create_string_utf8(env, result_href.c_str(), result_href.size(), &ret);
@@ -387,6 +408,12 @@ napi_value BindingUpdate(napi_env env, napi_callback_info info) {
 napi_value UbiInstallUrlBinding(napi_env env) {
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
+
+  auto* state = new UrlBindingState();
+  if (napi_wrap(env, binding, state, DeleteBindingState, nullptr, nullptr) != napi_ok) {
+    delete state;
+    return nullptr;
+  }
 
   napi_value components = nullptr;
   void* components_data = nullptr;
@@ -400,21 +427,17 @@ napi_value UbiInstallUrlBinding(napi_env env) {
     auto* values = static_cast<uint32_t*>(components_data);
     for (uint32_t i = 0; i < kUrlComponentsLength; ++i) values[i] = 0;
     napi_set_named_property(env, binding, "urlComponents", components);
-    if (g_url_components_ref != nullptr) {
-      napi_delete_reference(env, g_url_components_ref);
-      g_url_components_ref = nullptr;
-    }
-    napi_create_reference(env, components, 1, &g_url_components_ref);
+    napi_create_reference(env, components, 1, &state->url_components_ref);
   }
 
-  SetMethod(env, binding, "format", BindingFormat);
-  SetMethod(env, binding, "domainToASCII", BindingDomainToASCII);
-  SetMethod(env, binding, "domainToUnicode", BindingDomainToUnicode);
-  SetMethod(env, binding, "pathToFileURL", BindingPathToFileURL);
-  SetMethod(env, binding, "parse", BindingParse);
-  SetMethod(env, binding, "update", BindingUpdate);
-  SetMethod(env, binding, "canParse", BindingCanParse);
-  SetMethod(env, binding, "getOrigin", BindingGetOrigin);
+  SetMethod(env, binding, "format", BindingFormat, state);
+  SetMethod(env, binding, "domainToASCII", BindingDomainToASCII, state);
+  SetMethod(env, binding, "domainToUnicode", BindingDomainToUnicode, state);
+  SetMethod(env, binding, "pathToFileURL", BindingPathToFileURL, state);
+  SetMethod(env, binding, "parse", BindingParse, state);
+  SetMethod(env, binding, "update", BindingUpdate, state);
+  SetMethod(env, binding, "canParse", BindingCanParse, state);
+  SetMethod(env, binding, "getOrigin", BindingGetOrigin, state);
 
   return binding;
 }

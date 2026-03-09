@@ -106,11 +106,23 @@ assert.strictEqual(zeroFillToggle.length, 1);
 
 const encodingBinding = internalBinding('encoding_binding');
 assert.ok(encodingBinding && typeof encodingBinding === 'object');
-assert.strictEqual(typeof encodingBinding.decodeLatin1, 'function');
-assert.strictEqual(
-  encodingBinding.decodeLatin1(Buffer.from([0x41, 0xe9]), 0, 2),
-  'A\xe9',
+assert.deepStrictEqual(
+  Object.keys(encodingBinding).sort(),
+  ['decodeUTF8', 'encodeInto', 'encodeIntoResults', 'encodeUtf8String', 'toASCII', 'toUnicode'],
 );
+assert.ok(encodingBinding.encodeIntoResults instanceof Uint32Array);
+assert.strictEqual(encodingBinding.encodeIntoResults.length, 2);
+for (const key of [
+  'decodeLatin1',
+  'decodeUtf8',
+  'encodeBase64',
+  'encodeUtf8',
+  'decodeBase64',
+  'utf8ByteLength',
+  'validateUtf8',
+]) {
+  assert.ok(!(key in encodingBinding), key);
+}
 
 const symbolsBinding = internalBinding('symbols');
 assert.ok(symbolsBinding && typeof symbolsBinding === 'object');
@@ -137,6 +149,7 @@ assert.ok(utilBinding && typeof utilBinding === 'object');
 assert.strictEqual(utilBinding.constants.kPending, 0);
 assert.strictEqual(utilBinding.constants.kFulfilled, 1);
 assert.strictEqual(utilBinding.constants.kRejected, 2);
+assert.strictEqual(utilBinding.constants.kCloneable, 2);
 assert.strictEqual(typeof utilBinding.getCallerLocation, 'function');
 const loc = utilBinding.getCallerLocation();
 assert.ok(loc === undefined || (Array.isArray(loc) && loc.length === 3));
@@ -179,6 +192,13 @@ if (callSites.length > 0) {
   assert.strictEqual(typeof callSites[0].scriptId, 'string');
   assert.ok(!String(callSites[0].scriptName).includes('node:util'));
 }
+
+const messagingBinding = internalBinding('messaging');
+assert.ok(messagingBinding && typeof messagingBinding === 'object');
+const domException = new messagingBinding.DOMException('boom');
+assert.strictEqual(domException[utilBinding.privateSymbols.transfer_mode_private_symbol], utilBinding.constants.kCloneable);
+assert.strictEqual(typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_clone_symbol], 'function');
+assert.strictEqual(typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_deserialize_symbol], 'function');
 
 const proxyTarget = { a: 1 };
 const proxyHandler = {
@@ -708,6 +728,66 @@ assert.strictEqual(typeof jsUdpHandle.getProviderType, 'function');
 globalThis.__ubi_internal_binding_parity_ok = 1;
 )JS";
 
+constexpr const char* kSymbolBootstrapParityScript = R"JS(
+const assert = require('assert');
+
+const utilBinding = internalBinding('util');
+const symbolsBinding = internalBinding('symbols');
+const messagingBinding = internalBinding('messaging');
+
+const domException = new messagingBinding.DOMException('boom');
+
+assert.strictEqual(
+  domException[utilBinding.privateSymbols.transfer_mode_private_symbol],
+  utilBinding.constants.kCloneable,
+);
+assert.strictEqual(
+  typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_clone_symbol],
+  'function',
+);
+assert.strictEqual(
+  typeof messagingBinding.DOMException.prototype[symbolsBinding.messaging_deserialize_symbol],
+  'function',
+);
+
+globalThis.__ubi_symbol_bootstrap_parity_ok = 1;
+)JS";
+
+constexpr const char* kBindingCleanupRecreateScript = R"JS(
+const assert = require('assert');
+
+for (const name of [
+  'blob',
+  'config',
+  'constants',
+  'fs',
+  'fs_dir',
+  'messaging',
+  'mksnapshot',
+  'module_wrap',
+  'performance',
+  'permission',
+  'pipe_wrap',
+  'stream_wrap',
+  'symbols',
+  'tcp_wrap',
+  'tty_wrap',
+  'util',
+  'wasm_web_api',
+]) {
+  const binding = internalBinding(name);
+  assert.ok(binding && (typeof binding === 'object' || typeof binding === 'function'), name);
+}
+
+require('fs');
+require('node:buffer');
+require('node:net');
+require('node:perf_hooks');
+require('node:tls');
+
+globalThis.__ubi_binding_cleanup_recreate_ok = 1;
+)JS";
+
 }  // namespace
 
 TEST_F(Test5InternalBindingParityPhase03, WaveOneAndTwoBindingsHaveCriticalParitySurface) {
@@ -723,6 +803,46 @@ TEST_F(Test5InternalBindingParityPhase03, WaveOneAndTwoBindingsHaveCriticalParit
 
   napi_value ok_value = nullptr;
   ASSERT_EQ(napi_get_named_property(s.env, global, "__ubi_internal_binding_parity_ok", &ok_value), napi_ok);
+
+  int32_t ok = 0;
+  ASSERT_EQ(napi_get_value_int32(s.env, ok_value, &ok), napi_ok);
+  EXPECT_EQ(ok, 1);
+}
+
+TEST_F(Test5InternalBindingParityPhase03, BindingCachesCanBeDestroyedAndRecreatedAcrossEnvs) {
+  for (int i = 0; i < 2; ++i) {
+    EnvScope s(runtime_.get());
+
+    std::string error;
+    const int exit_code = UbiRunScriptSource(s.env, kBindingCleanupRecreateScript, &error);
+    EXPECT_EQ(exit_code, 0) << "iteration=" << i << " error=" << error;
+    EXPECT_TRUE(error.empty()) << "iteration=" << i << " error=" << error;
+
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+
+    napi_value ok_value = nullptr;
+    ASSERT_EQ(napi_get_named_property(s.env, global, "__ubi_binding_cleanup_recreate_ok", &ok_value), napi_ok);
+
+    int32_t ok = 0;
+    ASSERT_EQ(napi_get_value_int32(s.env, ok_value, &ok), napi_ok);
+    EXPECT_EQ(ok, 1) << "iteration=" << i;
+  }
+}
+
+TEST_F(Test5InternalBindingParityPhase03, BootstrapSymbolsShareStateAcrossBindings) {
+  EnvScope s(runtime_.get());
+
+  std::string error;
+  const int exit_code = UbiRunScriptSource(s.env, kSymbolBootstrapParityScript, &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty());
+
+  napi_value global = nullptr;
+  ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+
+  napi_value ok_value = nullptr;
+  ASSERT_EQ(napi_get_named_property(s.env, global, "__ubi_symbol_bootstrap_parity_ok", &ok_value), napi_ok);
 
   int32_t ok = 0;
   ASSERT_EQ(napi_get_value_int32(s.env, ok_value, &ok), napi_ok);

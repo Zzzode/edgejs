@@ -13,6 +13,8 @@ void UbiSetPrimordials(napi_env env, napi_value primordials);
 void UbiSetInternalBinding(napi_env env, napi_value internal_binding);
 void UbiSetPrivateSymbols(napi_env env, napi_value private_symbols);
 void UbiSetPerIsolateSymbols(napi_env env, napi_value per_isolate_symbols);
+napi_value UbiGetPrivateSymbols(napi_env env);
+napi_value UbiGetPerIsolateSymbols(napi_env env);
 napi_value UbiGetRequireFunction(napi_env env);
 napi_value UbiGetInternalBinding(napi_env env);
 bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out);

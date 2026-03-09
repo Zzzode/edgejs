@@ -251,6 +251,35 @@ unsafe extern "C" {
         env_handle: u32,
         value_id: u32,
     ) -> i32;
+    fn snapi_bridge_unofficial_set_fatal_error_callbacks(
+        env_handle: u32,
+        fatal_callback_id: u32,
+        oom_callback_id: u32,
+    ) -> i32;
+    fn snapi_bridge_unofficial_terminate_execution(env_handle: u32) -> i32;
+    fn snapi_bridge_unofficial_enqueue_microtask(env_handle: u32, callback_id: u32) -> i32;
+    fn snapi_bridge_unofficial_set_promise_reject_callback(
+        env_handle: u32,
+        callback_id: u32,
+    ) -> i32;
+    fn snapi_bridge_unofficial_get_own_non_index_properties(
+        env_handle: u32,
+        value_id: u32,
+        filter_bits: u32,
+        out_id: *mut u32,
+    ) -> i32;
+    fn snapi_bridge_unofficial_get_process_memory_info(
+        env_handle: u32,
+        heap_total_out: *mut f64,
+        heap_used_out: *mut f64,
+        external_out: *mut f64,
+        array_buffers_out: *mut f64,
+    ) -> i32;
+    fn snapi_bridge_unofficial_structured_clone(
+        env_handle: u32,
+        value_id: u32,
+        out_id: *mut u32,
+    ) -> i32;
     fn snapi_bridge_unofficial_notify_datetime_configuration_change(env_handle: u32) -> i32;
     fn snapi_bridge_unofficial_create_serdes_binding(
         env_handle: u32,
@@ -562,6 +591,7 @@ unsafe extern "C" {
         data_out: *mut u64,
         out_id: *mut u32,
     ) -> i32;
+    fn snapi_bridge_node_api_set_prototype(object_id: u32, prototype_id: u32) -> i32;
     // TypedArray
     fn snapi_bridge_create_typedarray(
         typ: i32,
@@ -1215,6 +1245,157 @@ fn guest_unofficial_napi_notify_datetime_configuration_change(
     unsafe { snapi_bridge_unofficial_notify_datetime_configuration_change(env_handle) }
 }
 
+fn guest_unofficial_napi_set_enqueue_foreground_task_callback(
+    _env: FunctionEnvMut<RuntimeEnv>,
+    _napi_env: i32,
+    _callback: i32,
+    _target: i32,
+) -> i32 {
+    // The Wasmer harness drives execution on a single host thread and does not
+    // currently bridge this callback to the native platform queue.
+    // Return napi_ok so modules that import this symbol can instantiate.
+    0
+}
+
+fn guest_unofficial_napi_set_fatal_error_callbacks(
+    _env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    fatal_callback: i32,
+    oom_callback: i32,
+) -> i32 {
+    let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
+    let fatal_id = if fatal_callback > 0 { fatal_callback as u32 } else { 0 };
+    let oom_id = if oom_callback > 0 { oom_callback as u32 } else { 0 };
+    unsafe { snapi_bridge_unofficial_set_fatal_error_callbacks(env_handle, fatal_id, oom_id) }
+}
+
+fn guest_unofficial_napi_terminate_execution(_env: FunctionEnvMut<RuntimeEnv>, napi_env: i32) -> i32 {
+    let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
+    unsafe { snapi_bridge_unofficial_terminate_execution(env_handle) }
+}
+
+fn guest_unofficial_napi_structured_clone(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    value: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
+    let value_id = if value > 0 { value as u32 } else { 0 };
+    let mut out = 0u32;
+    let status = unsafe { snapi_bridge_unofficial_structured_clone(env_handle, value_id, &mut out) };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u32(&mut env, result_ptr as u32, out);
+    }
+    status
+}
+
+fn guest_unofficial_napi_serialize_value(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    _napi_env: i32,
+    value: i32,
+    payload_out_ptr: i32,
+) -> i32 {
+    if payload_out_ptr > 0 {
+        write_guest_u32(&mut env, payload_out_ptr as u32, value.max(0) as u32);
+    }
+    0
+}
+
+fn guest_unofficial_napi_deserialize_value(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    _napi_env: i32,
+    payload: i32,
+    result_out_ptr: i32,
+) -> i32 {
+    if result_out_ptr > 0 {
+        write_guest_u32(&mut env, result_out_ptr as u32, payload.max(0) as u32);
+    }
+    0
+}
+
+fn guest_unofficial_napi_release_serialized_value(_env: FunctionEnvMut<RuntimeEnv>, _payload: i32) {}
+
+fn guest_unofficial_napi_enqueue_microtask(
+    _env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    callback: i32,
+) -> i32 {
+    let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
+    let callback_id = if callback > 0 { callback as u32 } else { 0 };
+    unsafe { snapi_bridge_unofficial_enqueue_microtask(env_handle, callback_id) }
+}
+
+fn guest_unofficial_napi_set_promise_reject_callback(
+    _env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    callback: i32,
+) -> i32 {
+    let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
+    let callback_id = if callback > 0 { callback as u32 } else { 0 };
+    unsafe { snapi_bridge_unofficial_set_promise_reject_callback(env_handle, callback_id) }
+}
+
+fn guest_unofficial_napi_get_own_non_index_properties(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    value: i32,
+    filter_bits: i32,
+    result_out_ptr: i32,
+) -> i32 {
+    let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
+    let value_id = if value > 0 { value as u32 } else { 0 };
+    let filter = if filter_bits > 0 { filter_bits as u32 } else { 0 };
+    let mut out = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_own_non_index_properties(env_handle, value_id, filter, &mut out)
+    };
+    if status == 0 && result_out_ptr > 0 {
+        write_guest_u32(&mut env, result_out_ptr as u32, out);
+    }
+    status
+}
+
+fn guest_unofficial_napi_get_process_memory_info(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    heap_total_out: i32,
+    heap_used_out: i32,
+    external_out: i32,
+    array_buffers_out: i32,
+) -> i32 {
+    let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
+    let mut heap_total = 0.0f64;
+    let mut heap_used = 0.0f64;
+    let mut external = 0.0f64;
+    let mut array_buffers = 0.0f64;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_process_memory_info(
+            env_handle,
+            &mut heap_total,
+            &mut heap_used,
+            &mut external,
+            &mut array_buffers,
+        )
+    };
+    if status != 0 {
+        return status;
+    }
+    if heap_total_out > 0 {
+        write_guest_f64(&mut env, heap_total_out as u32, heap_total);
+    }
+    if heap_used_out > 0 {
+        write_guest_f64(&mut env, heap_used_out as u32, heap_used);
+    }
+    if external_out > 0 {
+        write_guest_f64(&mut env, external_out as u32, external);
+    }
+    if array_buffers_out > 0 {
+        write_guest_f64(&mut env, array_buffers_out as u32, array_buffers);
+    }
+    0
+}
+
 fn guest_unofficial_napi_create_serdes_binding(
     mut env: FunctionEnvMut<RuntimeEnv>,
     napi_env: i32,
@@ -1228,6 +1409,7 @@ fn guest_unofficial_napi_create_serdes_binding(
     }
     status
 }
+
 
 fn guest_napi_add_env_cleanup_hook(
     _env: FunctionEnvMut<RuntimeEnv>,
@@ -3107,6 +3289,17 @@ fn guest_node_api_create_sharedarraybuffer(
     s
 }
 
+fn guest_node_api_set_prototype(
+    _env: FunctionEnvMut<RuntimeEnv>,
+    _napi_env: i32,
+    object: i32,
+    prototype: i32,
+) -> i32 {
+    let object_id = if object > 0 { object as u32 } else { 0 };
+    let prototype_id = if prototype > 0 { prototype as u32 } else { 0 };
+    unsafe { snapi_bridge_node_api_set_prototype(object_id, prototype_id) }
+}
+
 // --- TypedArray ---
 
 fn guest_napi_create_typedarray(
@@ -4598,6 +4791,44 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
         guest_unofficial_napi_notify_datetime_configuration_change
     );
     reg!(
+        "unofficial_napi_set_enqueue_foreground_task_callback",
+        guest_unofficial_napi_set_enqueue_foreground_task_callback
+    );
+    reg!(
+        "unofficial_napi_set_fatal_error_callbacks",
+        guest_unofficial_napi_set_fatal_error_callbacks
+    );
+    reg!(
+        "unofficial_napi_terminate_execution",
+        guest_unofficial_napi_terminate_execution
+    );
+    reg!("unofficial_napi_structured_clone", guest_unofficial_napi_structured_clone);
+    reg!("unofficial_napi_serialize_value", guest_unofficial_napi_serialize_value);
+    reg!(
+        "unofficial_napi_deserialize_value",
+        guest_unofficial_napi_deserialize_value
+    );
+    reg!(
+        "unofficial_napi_release_serialized_value",
+        guest_unofficial_napi_release_serialized_value
+    );
+    reg!(
+        "unofficial_napi_enqueue_microtask",
+        guest_unofficial_napi_enqueue_microtask
+    );
+    reg!(
+        "unofficial_napi_set_promise_reject_callback",
+        guest_unofficial_napi_set_promise_reject_callback
+    );
+    reg!(
+        "unofficial_napi_get_own_non_index_properties",
+        guest_unofficial_napi_get_own_non_index_properties
+    );
+    reg!(
+        "unofficial_napi_get_process_memory_info",
+        guest_unofficial_napi_get_process_memory_info
+    );
+    reg!(
         "unofficial_napi_create_serdes_binding",
         guest_unofficial_napi_create_serdes_binding
     );
@@ -4842,6 +5073,7 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
         "node_api_create_sharedarraybuffer",
         guest_node_api_create_sharedarraybuffer
     );
+    reg!("node_api_set_prototype", guest_node_api_set_prototype);
     // TypedArray
     reg!("napi_get_typedarray_info", guest_napi_get_typedarray_info);
     // DataView
@@ -4924,6 +5156,53 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
     );
 }
 
+fn guest_env_uv_cpu_info(_cpu_infos_out: i32, _count_out: i32) -> i32 {
+    -1
+}
+
+fn guest_env_uv_interface_addresses(_addresses_out: i32, _count_out: i32) -> i32 {
+    -1
+}
+
+fn guest_env_uv_free_interface_addresses(_addresses: i32, _count: i32) {}
+
+fn guest_env_uv_resident_set_memory(_rss_out: i32) -> i32 {
+    -1
+}
+
+fn guest_env_uv_get_free_memory() -> i64 {
+    0
+}
+
+fn guest_env_uv_get_total_memory() -> i64 {
+    0
+}
+
+fn guest_env_uv_get_available_memory() -> i64 {
+    0
+}
+
+fn guest_env_uv_get_constrained_memory() -> i64 {
+    0
+}
+
+fn register_env_imports(store: &mut Store, io: &mut Imports) {
+    macro_rules! reg_env {
+        ($name:expr, $func:expr) => {
+            io.define("env", $name, Function::new_typed(store, $func));
+        };
+    }
+
+    reg_env!("uv_cpu_info", guest_env_uv_cpu_info);
+    reg_env!("uv_interface_addresses", guest_env_uv_interface_addresses);
+    reg_env!("uv_free_interface_addresses", guest_env_uv_free_interface_addresses);
+    reg_env!("uv_resident_set_memory", guest_env_uv_resident_set_memory);
+    reg_env!("uv_get_free_memory", guest_env_uv_get_free_memory);
+    reg_env!("uv_get_total_memory", guest_env_uv_get_total_memory);
+    reg_env!("uv_get_available_memory", guest_env_uv_get_available_memory);
+    reg_env!("uv_get_constrained_memory", guest_env_uv_get_constrained_memory);
+}
+
 // ============================================================
 // Public API
 // ============================================================
@@ -4962,6 +5241,7 @@ pub fn run_wasm_main_i32(wasm_path: &Path) -> Result<i32> {
             "memory" => memory,
         },
     };
+    register_env_imports(&mut store, &mut import_object);
     register_napi_imports(&mut store, &func_env, &mut import_object);
 
     let instance = Instance::new(&mut store, &module, &import_object)
@@ -5085,6 +5365,7 @@ pub fn run_wasix_main_capture_stdio(
         let memory = Memory::new(&mut store, imported_memory_type)
             .context("failed to create imported WASIX memory")?;
         import_object.define("env", "memory", memory.clone());
+        register_env_imports(&mut store, &mut import_object);
 
         let func_env = FunctionEnv::new(
             &mut store,

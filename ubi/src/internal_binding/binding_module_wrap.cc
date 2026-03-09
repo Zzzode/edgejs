@@ -5,6 +5,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "internal_binding/helpers.h"
@@ -51,6 +52,7 @@ struct ModuleWrapBindingState {
 };
 
 std::unordered_map<napi_env, ModuleWrapBindingState> g_module_wrap_states;
+std::unordered_set<napi_env> g_module_wrap_cleanup_hook_registered;
 
 ModuleWrapBindingState* GetBindingState(napi_env env) {
   auto it = g_module_wrap_states.find(env);
@@ -69,6 +71,28 @@ void ResetRef(napi_env env, napi_ref* ref_ptr) {
   if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
   napi_delete_reference(env, *ref_ptr);
   *ref_ptr = nullptr;
+}
+
+void OnModuleWrapEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_module_wrap_cleanup_hook_registered.erase(env);
+
+  auto it = g_module_wrap_states.find(env);
+  if (it == g_module_wrap_states.end()) return;
+  ResetRef(env, &it->second.binding_ref);
+  ResetRef(env, &it->second.module_wrap_ctor_ref);
+  ResetRef(env, &it->second.import_module_dynamically_ref);
+  ResetRef(env, &it->second.initialize_import_meta_ref);
+  g_module_wrap_states.erase(it);
+}
+
+void EnsureModuleWrapCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_module_wrap_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnModuleWrapEnvCleanup, env) != napi_ok) {
+    g_module_wrap_cleanup_hook_registered.erase(it);
+  }
 }
 
 void SetRef(napi_env env, napi_ref* ref_ptr, napi_value value, napi_valuetype required) {
@@ -116,6 +140,56 @@ void SetNamedBool(napi_env env, napi_value obj, const char* key, bool value) {
   napi_value out = nullptr;
   if (napi_get_boolean(env, value, &out) == napi_ok && out != nullptr) {
     napi_set_named_property(env, obj, key, out);
+  }
+}
+
+std::string ValueToUtf8(napi_env env, napi_value value);
+
+std::string GetFirstSourceLine(std::string source_text) {
+  const size_t newline = source_text.find('\n');
+  if (newline != std::string::npos) {
+    source_text.resize(newline);
+  }
+  if (!source_text.empty() && source_text.back() == '\r') {
+    source_text.pop_back();
+  }
+  return source_text;
+}
+
+void DecorateModuleCompileError(napi_env env,
+                                napi_value err,
+                                const std::string& resource_name,
+                                const std::string& source_text) {
+  if (env == nullptr || err == nullptr || resource_name.empty()) return;
+
+  std::string stack_text;
+  napi_value stack = nullptr;
+  if (napi_get_named_property(env, err, "stack", &stack) == napi_ok && stack != nullptr) {
+    stack_text = ValueToUtf8(env, stack);
+  }
+  if (stack_text.empty()) {
+    stack_text = ValueToUtf8(env, err);
+  }
+  if (stack_text.empty()) return;
+
+  std::string prefix = resource_name + ":1\n";
+  const std::string first_line = GetFirstSourceLine(source_text);
+  if (!first_line.empty()) {
+    prefix += first_line;
+    prefix += "\n";
+    prefix.append(first_line.size(), ' ');
+  }
+  prefix += "\n\n";
+  if (stack_text.rfind(prefix, 0) == 0) return;
+
+  napi_value decorated_stack = nullptr;
+  const std::string full_stack = prefix + stack_text;
+  if (napi_create_string_utf8(env,
+                              full_stack.c_str(),
+                              full_stack.size(),
+                              &decorated_stack) == napi_ok &&
+      decorated_stack != nullptr) {
+    napi_set_named_property(env, err, "stack", decorated_stack);
   }
 }
 
@@ -688,15 +762,28 @@ napi_value ModuleWrapCtor(napi_env env, napi_callback_info info) {
       int32_t column_offset = 0;
       if (argc >= 4 && argv[3] != nullptr) (void)napi_get_value_int32(env, argv[3], &line_offset);
       if (argc >= 5 && argv[4] != nullptr) (void)napi_get_value_int32(env, argv[4], &column_offset);
-      (void)unofficial_napi_module_wrap_create_source_text(env,
-                                                           this_arg,
-                                                           argc >= 1 ? argv[0] : nullptr,
-                                                           argc >= 2 ? argv[1] : nullptr,
-                                                           argv[2],
-                                                           line_offset,
-                                                           column_offset,
-                                                           argc >= 6 ? argv[5] : nullptr,
-                                                           &instance->module_handle);
+      const napi_status create_status =
+          unofficial_napi_module_wrap_create_source_text(env,
+                                                         this_arg,
+                                                         argc >= 1 ? argv[0] : nullptr,
+                                                         argc >= 2 ? argv[1] : nullptr,
+                                                         argv[2],
+                                                         line_offset,
+                                                         column_offset,
+                                                         argc >= 6 ? argv[5] : nullptr,
+                                                         &instance->module_handle);
+      if (create_status != napi_ok || instance->module_handle == nullptr) {
+        napi_value err = nullptr;
+        if (napi_get_and_clear_last_exception(env, &err) == napi_ok && err != nullptr) {
+          const std::string resource_name =
+              argc >= 1 && argv[0] != nullptr ? ValueToUtf8(env, argv[0]) : "";
+          const std::string source_text = argc >= 3 && argv[2] != nullptr ? ValueToUtf8(env, argv[2]) : "";
+          DecorateModuleCompileError(env, err, resource_name, source_text);
+          napi_throw(env, err);
+        }
+        delete instance;
+        return nullptr;
+      }
       if (instance->module_handle != nullptr) {
         bool has_tla = false;
         if (unofficial_napi_module_wrap_has_top_level_await(env, instance->module_handle, &has_tla) == napi_ok) {
@@ -1161,6 +1248,7 @@ napi_value ModuleWrapThrowIfPromiseRejected(napi_env env, napi_callback_info /*i
 }  // namespace
 
 napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureModuleWrapCleanupHook(env);
   auto& state = g_module_wrap_states[env];
   if (state.binding_ref != nullptr) {
     napi_value existing = GetRefValue(env, state.binding_ref);

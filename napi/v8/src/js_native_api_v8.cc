@@ -48,11 +48,6 @@ struct napi_escapable_handle_scope__ {
   bool escaped = false;
 };
 
-struct napi_async_context__ {
-  napi_env env = nullptr;
-  v8::Global<v8::Object> resource;
-};
-
 struct napi_buffer_record__ {
   napi_env env = nullptr;
   v8::Global<v8::Object> holder;
@@ -284,22 +279,19 @@ void ExternalBackingStoreDeleter(void* data,
   delete hint;
 }
 
-bool IsOurBufferObject(napi_env env, v8::Local<v8::Object> object) {
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  return object->HasPrivate(env->context(), key).FromMaybe(false);
-}
+bool GetArrayBufferViewInfo(v8::Local<v8::Value> value, void** data, size_t* length) {
+  if (!value->IsArrayBufferView()) return false;
 
-napi_status GetBufferRecord(napi_env env, napi_value value, napi_buffer_record** out) {
-  if (!CheckEnv(env) || value == nullptr || out == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (!raw->IsObject()) return napi_invalid_arg;
-  v8::Local<v8::Object> object = raw.As<v8::Object>();
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  v8::MaybeLocal<v8::Value> maybe = object->GetPrivate(env->context(), key);
-  v8::Local<v8::Value> external;
-  if (!maybe.ToLocal(&external) || !external->IsExternal()) return napi_invalid_arg;
-  *out = static_cast<napi_buffer_record*>(external.As<v8::External>()->Value());
-  return (*out == nullptr) ? napi_invalid_arg : napi_ok;
+  v8::Local<v8::ArrayBufferView> view = value.As<v8::ArrayBufferView>();
+  std::shared_ptr<v8::BackingStore> backing_store = view->Buffer()->GetBackingStore();
+  size_t byte_length = view->ByteLength();
+
+  if (length != nullptr) *length = byte_length;
+  if (data != nullptr) {
+    uint8_t* base = static_cast<uint8_t*>(backing_store ? backing_store->Data() : nullptr);
+    *data = (base == nullptr) ? nullptr : static_cast<void*>(base + view->ByteOffset());
+  }
+  return true;
 }
 
 v8::Local<v8::Object> CreateBufferObject(napi_env env,
@@ -833,6 +825,10 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     hint->finalize_hint = finalize_hint;
     std::unique_ptr<v8::BackingStore> backing = v8::ArrayBuffer::NewBackingStore(
         external_data, byte_length, ExternalBackingStoreDeleter, hint);
+    if (!backing) {
+      delete hint;
+      return napi_generic_failure;
+    }
     out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
   }
 
@@ -1462,7 +1458,12 @@ napi_status NAPI_CDECL napi_get_dataview_info(napi_env env,
   v8::Local<v8::DataView> view = view_val.As<v8::DataView>();
   if (byte_length != nullptr) *byte_length = view->ByteLength();
   if (byte_offset != nullptr) *byte_offset = view->ByteOffset();
-  if (data != nullptr) *data = view->Buffer()->Data();
+  if (data != nullptr) {
+    const size_t offset = view->ByteOffset();
+    void* buffer_data = view->Buffer()->Data();
+    *data = (buffer_data == nullptr) ? nullptr
+                                     : static_cast<void*>(static_cast<uint8_t*>(buffer_data) + offset);
+  }
   if (arraybuffer != nullptr) {
     *arraybuffer = napi_v8_wrap_value(env, view->Buffer());
     if (*arraybuffer == nullptr) return napi_generic_failure;
@@ -1698,19 +1699,44 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
 
-  napi_value ctorValue = nullptr;
-  napi_status status =
-      napi_create_function(env, utf8name, length, constructor, data, &ctorValue);
-  if (status != napi_ok) return status;
-
   v8::Local<v8::Context> context = env->context();
-  v8::Local<v8::Function> ctor = napi_v8_unwrap_value(ctorValue).As<v8::Function>();
+  auto* payload = new (std::nothrow) CallbackPayload{env, constructor, data};
+  if (payload == nullptr) return napi_generic_failure;
+
+  const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
+  v8::Local<v8::String> name;
+  if (!v8::String::NewFromUtf8(env->isolate,
+                               utf8name,
+                               v8::NewStringType::kNormal,
+                               v8_length)
+           .ToLocal(&name)) {
+    return napi_generic_failure;
+  }
+
+  // Use a FunctionTemplate so instances created through napi_define_class()
+  // are V8 API objects, matching Node's host-object behavior for wrapped
+  // internal classes such as JSStream.
+  v8::Local<v8::FunctionTemplate> ctor_template =
+      v8::FunctionTemplate::New(env->isolate,
+                                FunctionTrampoline,
+                                v8::External::New(env->isolate, payload));
+  ctor_template->SetClassName(name);
+  ctor_template->InstanceTemplate()->SetInternalFieldCount(1);
+
+  v8::Local<v8::Function> ctor;
+  if (!ctor_template->GetFunction(context).ToLocal(&ctor)) {
+    return napi_generic_failure;
+  }
+
+  napi_value ctorValue = napi_v8_wrap_value(env, ctor);
+  if (ctorValue == nullptr) return napi_generic_failure;
   v8::Local<v8::Object> proto = ctor->Get(context, v8::String::NewFromUtf8Literal(env->isolate, "prototype"))
                                      .ToLocalChecked()
                                      .As<v8::Object>();
 
   for (size_t i = 0; i < property_count; ++i) {
     const napi_property_descriptor& desc = properties[i];
+    napi_status status = napi_ok;
     v8::Local<v8::Name> key;
     if (desc.utf8name != nullptr) {
       v8::Local<v8::String> key_str;
@@ -2844,43 +2870,6 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL napi_async_init(node_api_basic_env env,
-                                       napi_value async_resource,
-                                       napi_value async_resource_name,
-                                       napi_async_context* result) {
-  auto* napiEnv = const_cast<napi_env>(env);
-  if (!CheckEnv(napiEnv) || async_resource_name == nullptr || result == nullptr) {
-    return napi_invalid_arg;
-  }
-  v8::Local<v8::Context> context = napiEnv->context();
-  v8::Context::Scope context_scope(context);
-
-  auto* asyncContext = new (std::nothrow) napi_async_context__();
-  if (asyncContext == nullptr) return napi_generic_failure;
-  asyncContext->env = napiEnv;
-
-  v8::Local<v8::Object> resource_obj;
-  if (async_resource != nullptr) {
-    v8::Local<v8::Value> candidate = napi_v8_unwrap_value(async_resource);
-    if (candidate->IsObject()) {
-      resource_obj = candidate.As<v8::Object>();
-    }
-  }
-  if (resource_obj.IsEmpty()) {
-    resource_obj = v8::Object::New(napiEnv->isolate);
-  }
-  asyncContext->resource.Reset(napiEnv->isolate, resource_obj);
-  *result = asyncContext;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL napi_async_destroy(node_api_basic_env env, napi_async_context async_context) {
-  auto* napiEnv = const_cast<napi_env>(env);
-  if (!CheckEnv(napiEnv) || async_context == nullptr) return napi_invalid_arg;
-  delete async_context;
-  return napi_ok;
-}
-
 napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
   if (!CheckEnv(env) || err == nullptr) return napi_invalid_arg;
   env->last_exception.Reset(env->isolate, napi_v8_unwrap_value(err));
@@ -3008,11 +2997,7 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
 napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool* result) {
   if (!CheckEnv(env) || value == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (!raw->IsObject()) {
-    *result = false;
-    return napi_ok;
-  }
-  *result = IsOurBufferObject(env, raw.As<v8::Object>());
+  *result = raw->IsArrayBufferView();
   return napi_ok;
 }
 
@@ -3021,11 +3006,9 @@ napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
                                             void** data,
                                             size_t* length) {
   if (!CheckEnv(env) || value == nullptr) return napi_invalid_arg;
-  napi_buffer_record* record = nullptr;
-  napi_status status = GetBufferRecord(env, value, &record);
-  if (status != napi_ok) return napi_invalid_arg;
-  if (data != nullptr) *data = record->backing_store->Data();
-  if (length != nullptr) *length = record->backing_store->ByteLength();
+  if (!GetArrayBufferViewInfo(napi_v8_unwrap_value(value), data, length)) {
+    return napi_invalid_arg;
+  }
   return napi_ok;
 }
 
@@ -3065,12 +3048,9 @@ napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
 
 napi_status NAPI_CDECL napi_adjust_external_memory(
     node_api_basic_env basic_env, int64_t change_in_bytes, int64_t* adjusted_value) {
-  static int64_t total = 0;
   napi_env env = const_cast<napi_env>(basic_env);
   if (!CheckEnv(env) || adjusted_value == nullptr) return napi_invalid_arg;
-  total += change_in_bytes;
-  if (total < 0) total = 0;
-  *adjusted_value = total;
+  *adjusted_value = env->isolate->AdjustAmountOfExternalAllocatedMemory(change_in_bytes);
   return napi_ok;
 }
 

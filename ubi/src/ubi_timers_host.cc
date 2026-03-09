@@ -10,7 +10,9 @@
 
 #include <uv.h>
 
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
+#include "ubi_runtime_platform.h"
 
 namespace {
 
@@ -19,17 +21,19 @@ struct TimersHostState {
   napi_env env = nullptr;
   napi_ref timers_callback_ref = nullptr;
   napi_ref immediate_callback_ref = nullptr;
-  napi_ref immediate_info_ref = nullptr;
-  napi_ref timeout_info_ref = nullptr;
   uv_timer_t timer_handle{};
   uv_check_t check_handle{};
   uv_idle_t idle_handle{};
+  napi_ref immediate_info_ref = nullptr;
+  napi_ref timeout_info_ref = nullptr;
   double timer_base_ms = -1;
   bool timer_initialized = false;
   bool check_initialized = false;
   bool check_running = false;
   bool idle_initialized = false;
   bool idle_running = false;
+  bool running_timers_callback = false;
+  bool timer_rescheduled_in_callback = false;
   bool cleanup_started = false;
   uint32_t pending_handle_closes = 0;
 };
@@ -60,8 +64,13 @@ void DebugLog(const char* fmt, ...) {
   std::fprintf(stderr, "\n");
 }
 
-void StopLoopOnJsError() {
-  uv_loop_t* loop = uv_default_loop();
+uv_loop_t* GetLoop(TimersHostState* st) {
+  if (st == nullptr || st->env == nullptr) return nullptr;
+  return UbiGetEnvLoop(st->env);
+}
+
+void StopLoopOnJsError(TimersHostState* st) {
+  uv_loop_t* loop = GetLoop(st);
   if (loop != nullptr) uv_stop(loop);
 }
 
@@ -77,7 +86,7 @@ TimersHostState* GetState(napi_env env) {
 }
 
 double GetNowMs(TimersHostState* st) {
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr || st == nullptr) return 0;
   uv_update_time(loop);
   const double now = static_cast<double>(uv_now(loop));
@@ -155,6 +164,7 @@ void OnTimersEnvCleanup(void* arg) {
 
 void EnsureTimersCleanupHook(napi_env env) {
   if (env == nullptr) return;
+  (void)UbiEnsureEnvLoop(env, nullptr);
   auto [it, inserted] = g_timers_cleanup_hook_registered.emplace(env);
   if (!inserted) return;
   if (napi_add_env_cleanup_hook(env, OnTimersEnvCleanup, env) != napi_ok) {
@@ -187,48 +197,77 @@ void SetFunctionRef(napi_env env, napi_value fn, napi_ref* ref_slot) {
 bool CallImmediateCallback(TimersHostState* st);
 void ApplyImmediateRefState(TimersHostState* st, bool ref);
 
-uint32_t ImmediateCount(const TimersHostState* st) {
-  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return 0;
-  napi_value immediate_info = nullptr;
+bool GetInt32ArrayDataFromRef(napi_env env,
+                              napi_ref ref,
+                              size_t min_length,
+                              int32_t** data_out,
+                              size_t* length_out = nullptr) {
+  if (data_out == nullptr) return false;
+  *data_out = nullptr;
+  if (length_out != nullptr) *length_out = 0;
+  if (env == nullptr || ref == nullptr) return false;
+
   napi_value value = nullptr;
-  int32_t count = 0;
-  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
-      napi_get_element(st->env, immediate_info, kImmediateCount, &value) != napi_ok || value == nullptr ||
-      napi_get_value_int32(st->env, value, &count) != napi_ok) {
-    return 0;
+  if (napi_get_reference_value(env, ref, &value) != napi_ok || value == nullptr) return false;
+
+  bool is_typedarray = false;
+  if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok || !is_typedarray) return false;
+
+  napi_typedarray_type type = napi_uint8_array;
+  size_t length = 0;
+  void* data = nullptr;
+  napi_value arraybuffer = nullptr;
+  size_t offset = 0;
+  if (napi_get_typedarray_info(env, value, &type, &length, &data, &arraybuffer, &offset) != napi_ok ||
+      type != napi_int32_array || data == nullptr || length < min_length) {
+    return false;
   }
+
+  *data_out = static_cast<int32_t*>(data);
+  if (length_out != nullptr) *length_out = length;
+  return true;
+}
+
+int32_t ActiveTimeoutCount(const TimersHostState* st) {
+  int32_t* timeout_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->timeout_info_ref, 1, &timeout_info)) return 0;
+  const int32_t count = timeout_info[0];
+  return count > 0 ? count : 0;
+}
+
+uint32_t ImmediateCount(const TimersHostState* st) {
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) return 0;
+  const int32_t count = immediate_info[kImmediateCount];
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }
 
 uint32_t ImmediateRefCount(const TimersHostState* st) {
-  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return 0;
-  napi_value immediate_info = nullptr;
-  napi_value value = nullptr;
-  int32_t count = 0;
-  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
-      napi_get_element(st->env, immediate_info, kImmediateRefCount, &value) != napi_ok || value == nullptr ||
-      napi_get_value_int32(st->env, value, &count) != napi_ok) {
-    return 0;
-  }
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) return 0;
+  const int32_t count = immediate_info[kImmediateRefCount];
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }
 
 bool ImmediateHasOutstanding(const TimersHostState* st) {
-  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return false;
-  napi_value immediate_info = nullptr;
-  napi_value value = nullptr;
-  int32_t flag = 0;
-  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
-      napi_get_element(st->env, immediate_info, kImmediateHasOutstanding, &value) != napi_ok || value == nullptr ||
-      napi_get_value_int32(st->env, value, &flag) != napi_ok) {
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) {
     return false;
   }
-  return flag != 0;
+  return immediate_info[kImmediateHasOutstanding] != 0;
+}
+
+bool HasNativeImmediateTasks(const TimersHostState* st) {
+  return st != nullptr && st->env != nullptr && UbiRuntimePlatformHasImmediateTasks(st->env);
+}
+
+bool HasRefedNativeImmediateTasks(const TimersHostState* st) {
+  return st != nullptr && st->env != nullptr && UbiRuntimePlatformHasRefedImmediateTasks(st->env);
 }
 
 void EnsureTimerHandle(TimersHostState* st) {
   if (st == nullptr || st->timer_initialized) return;
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr) return;
   if (uv_timer_init(loop, &st->timer_handle) == 0) {
     st->timer_handle.data = st;
@@ -239,7 +278,7 @@ void EnsureTimerHandle(TimersHostState* st) {
 
 void EnsureCheckHandle(TimersHostState* st) {
   if (st == nullptr || st->check_initialized) return;
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr) return;
   if (uv_check_init(loop, &st->check_handle) != 0) return;
   st->check_handle.data = st;
@@ -247,16 +286,35 @@ void EnsureCheckHandle(TimersHostState* st) {
   if (uv_check_start(&st->check_handle,
                      [](uv_check_t* handle) {
                        auto* state = static_cast<TimersHostState*>(handle->data);
-                       if (state == nullptr || state->env == nullptr || ImmediateCount(state) == 0) {
+                       if (state == nullptr || state->env == nullptr) {
+                         return;
+                       }
+                       if (ImmediateCount(state) == 0 && !HasNativeImmediateTasks(state)) {
+                         if (ImmediateRefCount(state) == 0 && !HasRefedNativeImmediateTasks(state)) {
+                           ApplyImmediateRefState(state, false);
+                         }
                          return;
                        }
                        do {
+                         (void)UbiRuntimePlatformDrainImmediateTasks(state->env);
+                         if (state->env == nullptr) {
+                           return;
+                         }
+                         bool pending = false;
+                         if (napi_is_exception_pending(state->env, &pending) == napi_ok && pending) {
+                           StopLoopOnJsError(state);
+                           return;
+                         }
+                         if (ImmediateCount(state) == 0) {
+                           continue;
+                         }
                          if (!CallImmediateCallback(state)) {
                            return;
                          }
-                       } while (ImmediateHasOutstanding(state) && state->env != nullptr);
+                       } while (state->env != nullptr &&
+                                (ImmediateHasOutstanding(state) || HasNativeImmediateTasks(state)));
 
-                       if (ImmediateRefCount(state) == 0) {
+                       if (ImmediateRefCount(state) == 0 && !HasRefedNativeImmediateTasks(state)) {
                          ApplyImmediateRefState(state, false);
                        }
                      }) != 0) {
@@ -269,7 +327,7 @@ void EnsureCheckHandle(TimersHostState* st) {
 
 void EnsureIdleHandle(TimersHostState* st) {
   if (st == nullptr || st->idle_initialized) return;
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr) return;
   if (uv_idle_init(loop, &st->idle_handle) == 0) {
     st->idle_handle.data = st;
@@ -294,7 +352,7 @@ bool CallImmediateCallback(TimersHostState* st) {
   const napi_status status = UbiMakeCallback(st->env, global, cb, 0, nullptr, &ignored);
   if (status != napi_ok) {
     DebugLog("CallImmediateCallback JS error (status=%d), stopping loop turn", static_cast<int>(status));
-    StopLoopOnJsError();
+    StopLoopOnJsError(st);
     return false;
   }
   return true;
@@ -316,7 +374,7 @@ double CallTimersCallback(TimersHostState* st, double now) {
   const napi_status call_status = UbiMakeCallback(st->env, global, cb, 1, &now_value, &result);
   if (call_status != napi_ok || result == nullptr) {
     DebugLog("CallTimersCallback JS error (status=%d), stopping loop turn", static_cast<int>(call_status));
-    StopLoopOnJsError();
+    StopLoopOnJsError(st);
     return 0;
   }
 
@@ -341,7 +399,8 @@ void ApplyImmediateRefState(TimersHostState* st, bool ref) {
   EnsureCheckHandle(st);
   EnsureIdleHandle(st);
   if (!st->idle_initialized) return;
-  if (ref) {
+  const bool should_ref = ref || ImmediateRefCount(st) != 0 || HasRefedNativeImmediateTasks(st);
+  if (should_ref) {
     if (!st->idle_running && uv_idle_start(&st->idle_handle, [](uv_idle_t* /*handle*/) {}) == 0) {
       st->idle_running = true;
     }
@@ -352,6 +411,41 @@ void ApplyImmediateRefState(TimersHostState* st, bool ref) {
     }
   }
   DebugLog("toggleImmediateRef(%s)", ref ? "true" : "false");
+}
+
+void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now);
+
+bool TimerCallbackResultNeedsRefresh(TimersHostState* st, double next_expiry) {
+  if (st == nullptr || st->env == nullptr || !std::isfinite(next_expiry)) return false;
+  const bool has_refed_timeouts = ActiveTimeoutCount(st) > 0;
+  if (next_expiry > 0) return !has_refed_timeouts;
+  if (next_expiry < 0) return has_refed_timeouts;
+  return has_refed_timeouts;
+}
+
+void RunTimersCallback(uv_timer_t* handle) {
+  auto* state = static_cast<TimersHostState*>(handle->data);
+  if (state == nullptr) return;
+
+  state->running_timers_callback = true;
+  state->timer_rescheduled_in_callback = false;
+
+  double now_ms = GetNowMs(state);
+  double next = CallTimersCallback(state, now_ms);
+  if (!state->timer_rescheduled_in_callback && TimerCallbackResultNeedsRefresh(state, next)) {
+    DebugLog("refreshing stale timer callback result next=%.3f active_refed=%d",
+             next,
+             ActiveTimeoutCount(state));
+    now_ms = GetNowMs(state);
+    next = CallTimersCallback(state, now_ms);
+  }
+
+  const bool timer_rescheduled = state->timer_rescheduled_in_callback;
+  state->running_timers_callback = false;
+  state->timer_rescheduled_in_callback = false;
+  if (!timer_rescheduled) {
+    ScheduleFromNextExpiry(state, next, now_ms);
+  }
 }
 
 void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now) {
@@ -367,15 +461,7 @@ void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now)
            now,
            static_cast<unsigned long long>(timeout),
            ref ? "true" : "false");
-  uv_timer_start(&st->timer_handle,
-                 [](uv_timer_t* handle) {
-                   auto* state = static_cast<TimersHostState*>(handle->data);
-                   const double now_ms = GetNowMs(state);
-                   const double next = CallTimersCallback(state, now_ms);
-                   ScheduleFromNextExpiry(state, next, now_ms);
-                 },
-                 timeout,
-                 0);
+  uv_timer_start(&st->timer_handle, RunTimersCallback, timeout, 0);
   ApplyTimerRefState(st, ref);
 }
 
@@ -414,15 +500,10 @@ napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
 
   EnsureTimerHandle(st);
   if (st->timer_initialized) {
-    uv_timer_start(&st->timer_handle,
-                   [](uv_timer_t* handle) {
-                     auto* state = static_cast<TimersHostState*>(handle->data);
-                     const double now_ms = GetNowMs(state);
-                     const double next = CallTimersCallback(state, now_ms);
-                     ScheduleFromNextExpiry(state, next, now_ms);
-                   },
-                   static_cast<uint64_t>(duration),
-                   0);
+    if (st->running_timers_callback) {
+      st->timer_rescheduled_in_callback = true;
+    }
+    uv_timer_start(&st->timer_handle, RunTimersCallback, static_cast<uint64_t>(duration), 0);
   }
 
   napi_value undefined = nullptr;
@@ -534,28 +615,31 @@ napi_value UbiInstallTimersHostBinding(napi_env env) {
 
 int32_t UbiGetActiveTimeoutCount(napi_env env) {
   const TimersHostState* st = GetState(env);
-  if (st == nullptr || st->env == nullptr || st->timeout_info_ref == nullptr) return 0;
-  napi_value timeout_info = nullptr;
-  napi_value value = nullptr;
-  int32_t count = 0;
-  if (napi_get_reference_value(st->env, st->timeout_info_ref, &timeout_info) != napi_ok || timeout_info == nullptr ||
-      napi_get_element(st->env, timeout_info, 0, &value) != napi_ok || value == nullptr ||
-      napi_get_value_int32(st->env, value, &count) != napi_ok) {
-    return 0;
-  }
+  int32_t* timeout_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(env, st->timeout_info_ref, 1, &timeout_info)) return 0;
+  const int32_t count = timeout_info[0];
   return count > 0 ? count : 0;
 }
 
 uint32_t UbiGetActiveImmediateRefCount(napi_env env) {
   const TimersHostState* st = GetState(env);
-  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return 0;
-  napi_value immediate_info = nullptr;
-  napi_value value = nullptr;
-  int32_t count = 0;
-  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
-      napi_get_element(st->env, immediate_info, kImmediateRefCount, &value) != napi_ok || value == nullptr ||
-      napi_get_value_int32(st->env, value, &count) != napi_ok) {
-    return 0;
-  }
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(env, st->immediate_info_ref, 3, &immediate_info)) return 0;
+  const int32_t count = immediate_info[kImmediateRefCount];
   return count > 0 ? static_cast<uint32_t>(count) : 0;
+}
+
+void UbiEnsureTimersImmediatePump(napi_env env) {
+  TimersHostState* st = GetOrCreateState(env);
+  if (st == nullptr) return;
+  EnsureCheckHandle(st);
+}
+
+void UbiToggleImmediateRefFromNative(napi_env env, bool ref) {
+  TimersHostState* st = GetState(env);
+  if (st == nullptr) {
+    st = GetOrCreateState(env);
+  }
+  if (st == nullptr) return;
+  ApplyImmediateRefState(st, ref);
 }

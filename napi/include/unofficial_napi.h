@@ -16,8 +16,32 @@ NAPI_EXTERN napi_status unofficial_napi_release_env(void* scope);
 // Unofficial/test-only helper. Requests a full GC cycle for testing.
 NAPI_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
 
-// Unofficial/test-only helper. Processes pending microtasks.
+// Unofficial/test-only helper. Runs a checkpoint on the current context's
+// microtask queue.
 NAPI_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
+
+// Unofficial helper. Terminates current JS execution in the env's engine.
+// This is used for worker-style shutdown semantics where the process must
+// survive but the current env must stop executing JS immediately.
+NAPI_EXTERN napi_status unofficial_napi_terminate_execution(napi_env env);
+
+using unofficial_napi_foreground_task_callback = void (*)(napi_env env, void* data);
+using unofficial_napi_foreground_task_cleanup = void (*)(napi_env env, void* data);
+using unofficial_napi_enqueue_foreground_task_callback =
+    napi_status (*)(void* target,
+                    unofficial_napi_foreground_task_callback callback,
+                    void* data,
+                    unofficial_napi_foreground_task_cleanup cleanup,
+                    uint64_t delay_millis);
+
+// Installs the embedder-owned foreground task queue hook for a single env.
+// Engine backends use this to forward engine-originated foreground work into
+// the embedder-owned main-thread queue. Queue ownership and drain policy stay
+// outside the backend.
+NAPI_EXTERN napi_status unofficial_napi_set_enqueue_foreground_task_callback(
+    napi_env env,
+    unofficial_napi_enqueue_foreground_task_callback callback,
+    void* target);
 
 // Unofficial helper. Enqueues a JS function into V8 microtask queue.
 NAPI_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_value callback);
@@ -26,6 +50,18 @@ NAPI_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_val
 // internal/process/promises via internalBinding('task_queue').
 NAPI_EXTERN napi_status unofficial_napi_set_promise_reject_callback(napi_env env,
                                                                     napi_value callback);
+
+using unofficial_napi_fatal_error_callback =
+    void (*)(napi_env env, const char* location, const char* message);
+using unofficial_napi_oom_error_callback =
+    void (*)(napi_env env, const char* location, bool is_heap_oom, const char* detail);
+
+// Unofficial helpers for embedder-native fatal/OOM handling.
+// These callbacks run from the engine's fatal error hooks.
+NAPI_EXTERN napi_status unofficial_napi_set_fatal_error_callbacks(
+    napi_env env,
+    unofficial_napi_fatal_error_callback fatal_callback,
+    unofficial_napi_oom_error_callback oom_callback);
 
 // Unofficial helpers used by util/options parity work in ubi.
 // These expose engine-specific data that is not available in the public N-API.
@@ -60,6 +96,15 @@ NAPI_EXTERN napi_status unofficial_napi_get_constructor_name(napi_env env,
                                                              napi_value value,
                                                              napi_value* name_out);
 
+// Unofficial helper for Node's internalBinding('util').getOwnNonIndexProperties.
+// Returns the target's own property names while skipping indexed elements at the
+// engine level, matching Node's use of IndexFilter::kSkipIndices.
+NAPI_EXTERN napi_status unofficial_napi_get_own_non_index_properties(
+    napi_env env,
+    napi_value value,
+    uint32_t filter_bits,
+    napi_value* result_out);
+
 // Unofficial helper for Node's internalBinding('util').privateSymbols.
 // Returns a JS-visible private symbol value backed by the engine's hidden
 // private property machinery.
@@ -67,6 +112,29 @@ NAPI_EXTERN napi_status unofficial_napi_create_private_symbol(napi_env env,
                                                               const char* utf8description,
                                                               size_t length,
                                                               napi_value* result_out);
+
+// Unofficial helper for internalBinding('messaging').structuredClone().
+// This mirrors the engine's structured clone path closely enough to preserve
+// SharedArrayBuffer backing stores during clone/deserialization.
+NAPI_EXTERN napi_status unofficial_napi_structured_clone(
+    napi_env env,
+    napi_value value,
+    napi_value* result_out);
+
+// Unofficial helpers for env-agnostic message payload queues.
+// The returned opaque payload must be released with
+// unofficial_napi_release_serialized_value().
+NAPI_EXTERN napi_status unofficial_napi_serialize_value(
+    napi_env env,
+    napi_value value,
+    void** payload_out);
+
+NAPI_EXTERN napi_status unofficial_napi_deserialize_value(
+    napi_env env,
+    void* payload,
+    napi_value* result_out);
+
+NAPI_EXTERN void unofficial_napi_release_serialized_value(void* payload);
 
 // Unofficial helper for Node-style process.memoryUsage() parity.
 // Returns V8 heap statistics plus allocator-tracked ArrayBuffer memory.

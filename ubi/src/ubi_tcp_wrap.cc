@@ -6,10 +6,12 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <uv.h>
 
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 #include "ubi_stream_base.h"
 #include "ubi_stream_listener.h"
@@ -42,6 +44,28 @@ struct TcpBindingState {
 };
 
 std::unordered_map<napi_env, TcpBindingState> g_tcp_states;
+std::unordered_set<napi_env> g_tcp_cleanup_hook_registered;
+
+void OnTcpEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_tcp_cleanup_hook_registered.erase(env);
+
+  auto it = g_tcp_states.find(env);
+  if (it == g_tcp_states.end()) return;
+  if (it->second.tcp_ctor_ref != nullptr) napi_delete_reference(env, it->second.tcp_ctor_ref);
+  if (it->second.connect_wrap_ctor_ref != nullptr) napi_delete_reference(env, it->second.connect_wrap_ctor_ref);
+  if (it->second.tcp_binding_ref != nullptr) napi_delete_reference(env, it->second.tcp_binding_ref);
+  g_tcp_states.erase(it);
+}
+
+void EnsureTcpCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_tcp_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnTcpEnvCleanup, env) != napi_ok) {
+    g_tcp_cleanup_hook_registered.erase(it);
+  }
+}
 
 TcpBindingState* GetBindingState(napi_env env) {
   auto it = g_tcp_states.find(env);
@@ -50,6 +74,7 @@ TcpBindingState* GetBindingState(napi_env env) {
 }
 
 TcpBindingState& EnsureBindingState(napi_env env) {
+  EnsureTcpCleanupHook(env);
   return g_tcp_states[env];
 }
 
@@ -200,7 +225,8 @@ napi_value TcpCtor(napi_env env, napi_callback_info info) {
   auto* wrap = new TcpWrap();
   wrap->env = env;
   wrap->socket_type = socket_type;
-  if (uv_tcp_init(uv_default_loop(), &wrap->handle) != 0) {
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  if (loop == nullptr || uv_tcp_init(loop, &wrap->handle) != 0) {
     delete wrap;
     return UbiStreamBaseUndefined(env);
   }

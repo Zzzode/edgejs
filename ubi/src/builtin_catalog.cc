@@ -1,4 +1,5 @@
 #include "builtin_catalog.h"
+#include "ubi_process.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -11,8 +12,6 @@ namespace builtin_catalog {
 namespace fs = std::filesystem;
 
 namespace {
-
-#include "generated_builtin_ids.inc"
 
 constexpr const char* kNodePrefix = "node:";
 constexpr const char* kInternalDepsPrefix = "internal/deps/";
@@ -85,15 +84,123 @@ bool IsAllowedNodeDepsRelativePath(const fs::path& rel) {
   return false;
 }
 
+void AppendPathCandidate(std::vector<fs::path>* out, const fs::path& candidate) {
+  if (out == nullptr || candidate.empty()) return;
+  out->push_back(candidate);
+}
+
+std::vector<fs::path> NodeLibRootCandidates() {
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  std::vector<fs::path> candidates;
+
+  // Keep Wasix-style absolute mount fallback used by local fixes.
+  AppendPathCandidate(&candidates, fs::path("/node-lib"));
+
+  const fs::path exec_path = fs::path(UbiGetProcessExecPath()).lexically_normal();
+  if (!exec_path.empty()) {
+    const fs::path install_root = exec_path.parent_path().parent_path();
+    AppendPathCandidate(&candidates, install_root / "node-lib");
+  }
+
+  AppendPathCandidate(&candidates, source_root / "node-lib");
+
+  std::error_code ec;
+  const fs::path cwd = fs::current_path(ec);
+  if (!ec && !cwd.empty()) {
+    AppendPathCandidate(&candidates, cwd / "node-lib");
+    AppendPathCandidate(&candidates, cwd.parent_path() / "node-lib");
+  }
+
+  return candidates;
+}
+
+std::vector<fs::path> NodeDepsRootCandidates() {
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  std::vector<fs::path> candidates;
+
+  // Keep Wasix-style absolute mount fallback used by local fixes.
+  AppendPathCandidate(&candidates, fs::path("/node/deps"));
+
+  const fs::path exec_path = fs::path(UbiGetProcessExecPath()).lexically_normal();
+  if (!exec_path.empty()) {
+    const fs::path install_root = exec_path.parent_path().parent_path();
+    AppendPathCandidate(&candidates, install_root / "node-lib" / "internal" / "deps");
+    AppendPathCandidate(&candidates, install_root / "node" / "deps");
+  }
+
+  AppendPathCandidate(&candidates, source_root / "node" / "deps");
+
+  std::error_code ec;
+  const fs::path cwd = fs::current_path(ec);
+  if (!ec && !cwd.empty()) {
+    AppendPathCandidate(&candidates, cwd / "node" / "deps");
+    AppendPathCandidate(&candidates, cwd.parent_path() / "node" / "deps");
+  }
+  return candidates;
+}
+
+void AppendNodeLibIds(const fs::path& node_lib_root, std::vector<std::string>* ids) {
+  if (ids == nullptr || !PathExistsDirectory(node_lib_root)) return;
+  std::error_code ec;
+  for (fs::recursive_directory_iterator it(node_lib_root, ec), end; it != end && !ec; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    const fs::path path = it->path();
+    if (path.extension() != ".js") continue;
+    const fs::path rel = path.lexically_relative(node_lib_root);
+    const std::string id = StripBuiltinExtension(rel);
+    if (!id.empty()) ids->push_back(id);
+  }
+}
+
+void AppendNodeDepsIds(const fs::path& node_deps_root, std::vector<std::string>* ids) {
+  if (ids == nullptr || !PathExistsDirectory(node_deps_root)) return;
+  std::error_code ec;
+  for (const std::string& dep_root : kNodeDepsBuiltinRoots) {
+    const fs::path root = node_deps_root / dep_root;
+    if (!PathExistsDirectory(root) && !PathExistsRegularFile(root)) continue;
+    if (PathExistsRegularFile(root)) {
+      if (root.extension() == ".js" || root.extension() == ".mjs") {
+        const fs::path rel = root.lexically_relative(node_deps_root);
+        const std::string dep_id = StripBuiltinExtension(rel);
+        if (!dep_id.empty()) ids->push_back(std::string(kInternalDepsPrefix) + dep_id);
+      }
+      continue;
+    }
+    for (fs::recursive_directory_iterator it(root, ec), end; it != end && !ec; it.increment(ec)) {
+      if (!it->is_regular_file(ec)) continue;
+      const fs::path path = it->path();
+      if (path.extension() != ".js" && path.extension() != ".mjs") continue;
+      const fs::path rel = path.lexically_relative(node_deps_root);
+      const std::string dep_id = StripBuiltinExtension(rel);
+      if (dep_id.empty()) continue;
+      ids->push_back(std::string(kInternalDepsPrefix) + dep_id);
+    }
+  }
+}
+
 }  // namespace
 
 const fs::path& NodeLibRoot() {
-  static const fs::path root = fs::path("/node-lib");
+  static const fs::path root = []() {
+    const std::vector<fs::path> candidates = NodeLibRootCandidates();
+    for (const fs::path& candidate : candidates) {
+      if (PathExistsDirectory(candidate)) return fs::absolute(candidate).lexically_normal();
+    }
+    if (!candidates.empty()) return fs::absolute(candidates.front()).lexically_normal();
+    return fs::path();
+  }();
   return root;
 }
 
 const fs::path& NodeDepsRoot() {
-  static const fs::path root = fs::path("/node/deps");
+  static const fs::path root = []() {
+    const std::vector<fs::path> candidates = NodeDepsRootCandidates();
+    for (const fs::path& candidate : candidates) {
+      if (PathExistsDirectory(candidate)) return fs::absolute(candidate).lexically_normal();
+    }
+    if (!candidates.empty()) return fs::absolute(candidates.front()).lexically_normal();
+    return fs::path();
+  }();
   return root;
 }
 
@@ -154,10 +261,8 @@ bool TryGetBuiltinIdForPath(const fs::path& resolved_path, std::string* out_id) 
 const std::vector<std::string>& AllBuiltinIds() {
   static const std::vector<std::string> ids = []() {
     std::vector<std::string> out;
-    out.reserve(sizeof(kGeneratedBuiltinIds) / sizeof(kGeneratedBuiltinIds[0]));
-    for (const char* builtin_id : kGeneratedBuiltinIds) {
-      out.emplace_back(builtin_id);
-    }
+    AppendNodeLibIds(NodeLibRoot(), &out);
+    AppendNodeDepsIds(NodeDepsRoot(), &out);
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;

@@ -3,6 +3,8 @@
 
 #include "node_api.h"
 
+napi_value UbiCreatePrivateSymbolsObject(napi_env env);
+napi_value UbiCreatePerIsolateSymbolsObject(napi_env env);
 napi_value UbiInstallUtilBinding(napi_env env);
 napi_value UbiGetTypesBinding(napi_env env);
 napi_value UbiGetPrivateSymbols(napi_env env);

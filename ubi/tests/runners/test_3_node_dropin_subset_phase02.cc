@@ -954,6 +954,14 @@ TEST_F(Test3NodeDropinSubsetPhase02, NodeCompatEventEmitterMethodNamesTest) {
     EXPECT_TRUE(error.empty()) << "error=" << error;            \
   }
 
+#define DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(test_name, script_name) \
+  TEST_F(Test3NodeDropinSubsetPhase02, test_name) {              \
+    std::string error;                                            \
+    const int exit_code = RunRawNodeTestScriptInSubprocess(script_name, &error); \
+    EXPECT_EQ(exit_code, 0) << "error=" << error;                \
+    EXPECT_TRUE(error.empty()) << "error=" << error;             \
+  }
+
 #define DEFINE_RAW_NODE_SUBPROCESS_TEST(test_name, script_name) \
   TEST_F(Test3NodeDropinSubsetPhase02, test_name) {             \
     if (RawNodeScriptStartsWithFlagsHeader(script_name)) {      \
@@ -1142,7 +1150,7 @@ DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvTzFromNodeTest, "test-process-env-t
 DEFINE_RAW_NODE_TEST(RawCryptoFromNodeTest, "test-crypto.js")
 DEFINE_RAW_NODE_TEST(RawCryptoRandomFromNodeTest, "test-crypto-random.js")
 DEFINE_RAW_NODE_TEST(RawCryptoRandomuuidFromNodeTest, "test-crypto-randomuuid.js")
-// DEFINE_RAW_NODE_TEST(RawCryptoHashFromNodeTest, "test-crypto-hash.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawCryptoHashFromNodeTest, "test-crypto-hash.js")
 DEFINE_RAW_NODE_TEST(RawCryptoHmacFromNodeTest, "test-crypto-hmac.js")
 DEFINE_RAW_NODE_TEST(RawCryptoPbkdf2FromNodeTest, "test-crypto-pbkdf2.js")
 DEFINE_RAW_NODE_TEST(RawCryptoScryptFromNodeTest, "test-crypto-scrypt.js")
@@ -1150,7 +1158,16 @@ DEFINE_RAW_NODE_TEST(RawCryptoHkdfFromNodeTest, "test-crypto-hkdf.js")
 DEFINE_RAW_NODE_TEST(RawCryptoClassesFromNodeTest, "test-crypto-classes.js")
 DEFINE_RAW_NODE_TEST(RawCryptoCipherivDecipherivFromNodeTest, "test-crypto-cipheriv-decipheriv.js")
 DEFINE_RAW_NODE_TEST(RawCryptoSignVerifyFromNodeTest, "test-crypto-sign-verify.js")
-DEFINE_RAW_NODE_TEST(RawCryptoVerifyFailureFromNodeTest, "test-crypto-verify-failure.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawCryptoVerifyFailureFromNodeTest) {
+  std::string error;
+  const int exit_code = RunRawNodeTestScriptInSubprocess("test-crypto-verify-failure.js", &error, true);
+  if (exit_code != 0 &&
+      error.find("listen EPERM: operation not permitted 0.0.0.0") != std::string::npos) {
+    GTEST_SKIP() << "Skipping verify-failure raw test in restricted network environment";
+  }
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 DEFINE_RAW_NODE_TEST(RawCryptoOneShotHashFromNodeTest, "test-crypto-oneshot-hash.js")
 DEFINE_RAW_NODE_TEST(RawCryptoDefaultShakeLengthsOneShotFromNodeTest, "test-crypto-default-shake-lengths-oneshot.js")
 DEFINE_RAW_NODE_TEST(RawCryptoAsyncSignVerifyFromNodeTest, "test-crypto-async-sign-verify.js")
@@ -1170,40 +1187,40 @@ DEFINE_RAW_NODE_TEST(RawCryptoKeygenAsyncDsaKeyObjectFromNodeTest, "test-crypto-
 DEFINE_RAW_NODE_TEST(RawCryptoKeygenAsyncDsaFromNodeTest, "test-crypto-keygen-async-dsa.js")
 DEFINE_RAW_NODE_TEST(RawCryptoKeygenFromNodeTest, "test-crypto-keygen.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoAesWrapFromNodeTest, "test-crypto-aes-wrap.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoAuthenticatedStreamFromNodeTest, "test-crypto-authenticated-stream.js") // requires full AEAD stream semantics
-// DEFINE_RAW_NODE_TEST(RawTestCryptoAuthenticatedFromNodeTest, "test-crypto-authenticated.js") // requires AEAD auth tag APIs
-// DEFINE_RAW_NODE_TEST(RawTestCryptoCertificateFromNodeTest, "test-crypto-certificate.js") // crypto.Certificate not implemented
+DEFINE_RAW_NODE_TEST(RawTestCryptoAuthenticatedStreamFromNodeTest, "test-crypto-authenticated-stream.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoAuthenticatedFromNodeTest, "test-crypto-authenticated.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoCertificateFromNodeTest, "test-crypto-certificate.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoDefaultShakeLengthsFromNodeTest, "test-crypto-default-shake-lengths.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoDes3WrapFromNodeTest, "test-crypto-des3-wrap.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhConstructorFromNodeTest, "test-crypto-dh-constructor.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhCurvesFromNodeTest, "test-crypto-dh-curves.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhErrorsFromNodeTest, "test-crypto-dh-errors.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhGenerateKeysFromNodeTest, "test-crypto-dh-generate-keys.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhGroupSettersFromNodeTest, "test-crypto-dh-group-setters.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhLeakFromNodeTest, "test-crypto-dh-leak.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhModp2ViewsFromNodeTest, "test-crypto-dh-modp2-views.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhModp2FromNodeTest, "test-crypto-dh-modp2.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhOddKeyFromNodeTest, "test-crypto-dh-odd-key.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhPaddingFromNodeTest, "test-crypto-dh-padding.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhSharedFromNodeTest, "test-crypto-dh-shared.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhStatelessAsyncFromNodeTest, "test-crypto-dh-stateless-async.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhStatelessFromNodeTest, "test-crypto-dh-stateless.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoDhFromNodeTest, "test-crypto-dh.js") // DH API not implemented
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhConstructorFromNodeTest, "test-crypto-dh-constructor.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhCurvesFromNodeTest, "test-crypto-dh-curves.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhErrorsFromNodeTest, "test-crypto-dh-errors.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhGenerateKeysFromNodeTest, "test-crypto-dh-generate-keys.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhGroupSettersFromNodeTest, "test-crypto-dh-group-setters.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhLeakFromNodeTest, "test-crypto-dh-leak.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhModp2ViewsFromNodeTest, "test-crypto-dh-modp2-views.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhModp2FromNodeTest, "test-crypto-dh-modp2.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhOddKeyFromNodeTest, "test-crypto-dh-odd-key.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhPaddingFromNodeTest, "test-crypto-dh-padding.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhSharedFromNodeTest, "test-crypto-dh-shared.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhStatelessAsyncFromNodeTest, "test-crypto-dh-stateless-async.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhStatelessFromNodeTest, "test-crypto-dh-stateless.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoDhFromNodeTest, "test-crypto-dh.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoDomainFromNodeTest, "test-crypto-domain.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoDomainsFromNodeTest, "test-crypto-domains.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoEcbFromNodeTest, "test-crypto-ecb.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoEcdhConvertKeyFromNodeTest, "test-crypto-ecdh-convert-key.js") // ECDH.convertKey not implemented
+DEFINE_RAW_NODE_TEST(RawTestCryptoEcdhConvertKeyFromNodeTest, "test-crypto-ecdh-convert-key.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoEncodingValidationErrorFromNodeTest, "test-crypto-encoding-validation-error.js")
 // DEFINE_RAW_NODE_TEST(RawTestCryptoFipsFromNodeTest, "test-crypto-fips.js") // FIPS harness helper not implemented
 DEFINE_RAW_NODE_TEST(RawTestCryptoFromBinaryFromNodeTest, "test-crypto-from-binary.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoGcmExplicitShortTagFromNodeTest, "test-crypto-gcm-explicit-short-tag.js") // AEAD setAuthTag not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoGcmImplicitShortTagFromNodeTest, "test-crypto-gcm-implicit-short-tag.js") // AEAD setAuthTag not implemented
+DEFINE_RAW_NODE_TEST(RawTestCryptoGcmExplicitShortTagFromNodeTest, "test-crypto-gcm-explicit-short-tag.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoGcmImplicitShortTagFromNodeTest, "test-crypto-gcm-implicit-short-tag.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoGetcipherinfoFromNodeTest, "test-crypto-getcipherinfo.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoHashStreamPipeFromNodeTest, "test-crypto-hash-stream-pipe.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoKeyObjectsFromNodeTest, "test-crypto-key-objects.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoKeyObjectsFromNodeTest, "test-crypto-key-objects.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncEllipticCurveJwkEcFromNodeTest, "test-crypto-keygen-async-elliptic-curve-jwk-ec.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncEllipticCurveJwkRsaFromNodeTest, "test-crypto-keygen-async-elliptic-curve-jwk-rsa.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncEllipticCurveJwkFromNodeTest, "test-crypto-keygen-async-elliptic-curve-jwk.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncEllipticCurveJwkFromNodeTest, "test-crypto-keygen-async-elliptic-curve-jwk.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncEncryptedPrivateKeyDerFromNodeTest, "test-crypto-keygen-async-encrypted-private-key-der.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncEncryptedPrivateKeyFromNodeTest, "test-crypto-keygen-async-encrypted-private-key.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncExplicitEllipticCurveEncryptedP256FromNodeTest, "test-crypto-keygen-async-explicit-elliptic-curve-encrypted-p256.js")
@@ -1213,40 +1230,46 @@ DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncNamedEllipticCurveEncryptedP256From
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncNamedEllipticCurveEncryptedFromNodeTest, "test-crypto-keygen-async-named-elliptic-curve-encrypted.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenAsyncNamedEllipticCurveFromNodeTest, "test-crypto-keygen-async-named-elliptic-curve.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenDeprecationFromNodeTest, "test-crypto-keygen-deprecation.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenDhClassicFromNodeTest, "test-crypto-keygen-dh-classic.js") // DH API not implemented
-// DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenEddsaFromNodeTest, "test-crypto-keygen-eddsa.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenDhClassicFromNodeTest, "test-crypto-keygen-dh-classic.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenEddsaFromNodeTest, "test-crypto-keygen-eddsa.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenEmptyPassphraseNoErrorFromNodeTest, "test-crypto-keygen-empty-passphrase-no-error.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenEmptyPassphraseNoPromptFromNodeTest, "test-crypto-keygen-empty-passphrase-no-prompt.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenMissingOidFromNodeTest, "test-crypto-keygen-missing-oid.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenMissingOidFromNodeTest, "test-crypto-keygen-missing-oid.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenNoRsassaPssParamsFromNodeTest, "test-crypto-keygen-no-rsassa-pss-params.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenRfc801791FromNodeTest, "test-crypto-keygen-rfc8017-9-1.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoKeygenRfc8017A23FromNodeTest, "test-crypto-keygen-rfc8017-a-2-3.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoLazyTransformWritableFromNodeTest, "test-crypto-lazy-transform-writable.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoNoAlgorithmFromNodeTest, "test-crypto-no-algorithm.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoOaepZeroLengthFromNodeTest, "test-crypto-oaep-zero-length.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoOneshotHashXofFromNodeTest, "test-crypto-oneshot-hash-xof.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoNoAlgorithmFromNodeTest, "test-crypto-no-algorithm.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoOaepZeroLengthFromNodeTest, "test-crypto-oaep-zero-length.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoOneshotHashXofFromNodeTest, "test-crypto-oneshot-hash-xof.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoOpDuringProcessExitFromNodeTest, "test-crypto-op-during-process-exit.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoPaddingAes256FromNodeTest, "test-crypto-padding-aes256.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoPaddingFromNodeTest, "test-crypto-padding.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoPrimeFromNodeTest, "test-crypto-prime.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoPrivateDecryptGh32240FromNodeTest, "test-crypto-private-decrypt-gh32240.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoPsychicSignaturesFromNodeTest, "test-crypto-psychic-signatures.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoPublicdecryptFailsFirstTimeFromNodeTest, "test-crypto-publicDecrypt-fails-first-time.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoPaddingAes256FromNodeTest, "test-crypto-padding-aes256.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoPaddingFromNodeTest, "test-crypto-padding.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoPrimeFromNodeTest, "test-crypto-prime.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoPrivateDecryptGh32240FromNodeTest, "test-crypto-private-decrypt-gh32240.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoPsychicSignaturesFromNodeTest, "test-crypto-psychic-signatures.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoPublicdecryptFailsFirstTimeFromNodeTest, "test-crypto-publicDecrypt-fails-first-time.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoRandomfillsyncRegressionFromNodeTest, "test-crypto-randomfillsync-regression.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoRsaDsaFromNodeTest, "test-crypto-rsa-dsa.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoSecLevelFromNodeTest, "test-crypto-sec-level.js") // temporarily disabled: currently failing
-// DEFINE_RAW_NODE_TEST(RawTestCryptoSecretKeygenFromNodeTest, "test-crypto-secret-keygen.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoRsaDsaFromNodeTest, "test-crypto-rsa-dsa.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoSecLevelFromNodeTest, "test-crypto-sec-level.js")
+DEFINE_RAW_NODE_TEST(RawTestCryptoSecretKeygenFromNodeTest, "test-crypto-secret-keygen.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoSecureHeapFromNodeTest, "test-crypto-secure-heap.js")
-// DEFINE_RAW_NODE_TEST(RawTestCryptoStreamFromNodeTest, "test-crypto-stream.js") // temporarily disabled: currently failing
+DEFINE_RAW_NODE_TEST(RawTestCryptoStreamFromNodeTest, "test-crypto-stream.js")
 DEFINE_RAW_NODE_TEST(RawTestCryptoUpdateEncodingFromNodeTest, "test-crypto-update-encoding.js")
 DEFINE_RAW_NODE_TEST(RawTestTlsTicketInvalidArgFromNodeTest, "test-tls-ticket-invalid-arg.js")
 DEFINE_RAW_NODE_TEST(RawTestTlsSetCiphersErrorFromNodeTest, "test-tls-set-ciphers-error.js")
 DEFINE_RAW_NODE_TEST(RawTestTlsOptionsBooleanCheckFromNodeTest, "test-tls-options-boolean-check.js")
 DEFINE_RAW_NODE_TEST(RawTestTlsKeyengineInvalidArgTypeFromNodeTest, "test-tls-keyengine-invalid-arg-type.js")
-DEFINE_RAW_NODE_TEST(RawTestTlsKeyengineUnsupportedFromNodeTest, "test-tls-keyengine-unsupported.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawTestTlsKeyengineUnsupportedFromNodeTest, "test-tls-keyengine-unsupported.js")
 DEFINE_RAW_NODE_TEST(RawTestTlsClientcertengineInvalidArgTypeFromNodeTest, "test-tls-clientcertengine-invalid-arg-type.js")
-DEFINE_RAW_NODE_TEST(RawTestTlsClientcertengineUnsupportedFromNodeTest, "test-tls-clientcertengine-unsupported.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawTestTlsClientcertengineUnsupportedFromNodeTest,
+                                 "test-tls-clientcertengine-unsupported.js")
 DEFINE_RAW_NODE_TEST(RawTestTlsSessionTimeoutErrorsFromNodeTest, "test-tls-session-timeout-errors.js")
+DEFINE_RAW_NODE_TEST(RawTestTlsConnectSecureContextFromNodeTest, "test-tls-connect-secure-context.js")
+DEFINE_RAW_NODE_TEST(RawTestTlsGetcipherFromNodeTest, "test-tls-getcipher.js")
+DEFINE_RAW_NODE_TEST(RawTestTlsExportkeyingmaterialFromNodeTest, "test-tls-exportkeyingmaterial.js")
+DEFINE_RAW_NODE_TEST(RawTestTlsAddContextFromNodeTest, "test-tls-add-context.js")
+DEFINE_RAW_NODE_TEST(RawTestTlsClientResumeFromNodeTest, "test-tls-client-resume.js")
 
 DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecveFromNodeTest, "test-process-execve.js")
 DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecveValidationFromNodeTest, "test-process-execve-validation.js")
@@ -1469,6 +1492,9 @@ DEFINE_RAW_NODE_TEST(RawUrlParseQueryFromNodeTest, "test-url-parse-query.js")
 DEFINE_RAW_NODE_TEST(RawUrlPathtofileurlFromNodeTest, "test-url-pathtofileurl.js")
 DEFINE_RAW_NODE_TEST(RawUrlRelativeFromNodeTest, "test-url-relative.js")
 DEFINE_RAW_NODE_TEST(RawUrlUrltooptionsFromNodeTest, "test-url-urltooptions.js")
+DEFINE_RAW_NODE_TEST(RawUrlPatternFromNodeTest, "test-urlpattern.js")
+DEFINE_RAW_NODE_TEST(RawUrlPatternInvalidThisFromNodeTest, "test-urlpattern-invalidthis.js")
+DEFINE_RAW_NODE_TEST(RawUrlPatternTypesFromNodeTest, "test-urlpattern-types.js")
 
 // Raw Node string_decoder tests
 DEFINE_RAW_NODE_TEST(RawStringDecoderFromNodeTest, "test-string-decoder.js")
@@ -1480,25 +1506,25 @@ DEFINE_RAW_NODE_TEST(RawDnsFromNodeTest, "test-dns.js")
 DEFINE_RAW_NODE_TEST(RawDnsSetserversTypeCheckFromNodeTest, "test-dns-setservers-type-check.js")
 DEFINE_RAW_NODE_TEST(RawDnsSetserverWhenQueryingFromNodeTest, "test-dns-setserver-when-querying.js")
 DEFINE_RAW_NODE_TEST(RawDnsSetlocaladdressFromNodeTest, "test-dns-setlocaladdress.js")
-DEFINE_RAW_NODE_TEST(RawDnsSetDefaultOrderFromNodeTest, "test-dns-set-default-order.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsSetDefaultOrderFromNodeTest, "test-dns-set-default-order.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolverMaxTimeoutFromNodeTest, "test-dns-resolver-max-timeout.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolvensTypeerrorFromNodeTest, "test-dns-resolvens-typeerror.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolveanyFromNodeTest, "test-dns-resolveany.js")
 DEFINE_RAW_NODE_TEST(RawDnsResolveanyBadAncountFromNodeTest, "test-dns-resolveany-bad-ancount.js")
-DEFINE_RAW_NODE_TEST(RawDnsResolvePromisesFromNodeTest, "test-dns-resolve-promises.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsResolvePromisesFromNodeTest, "test-dns-resolve-promises.js")
 DEFINE_RAW_NODE_TEST(RawDnsPromisesExistsFromNodeTest, "test-dns-promises-exists.js")
 DEFINE_RAW_NODE_TEST(RawDnsPerfHooksFromNodeTest, "test-dns-perf_hooks.js")
 DEFINE_RAW_NODE_TEST(RawDnsMultiChannelFromNodeTest, "test-dns-multi-channel.js")
-DEFINE_RAW_NODE_TEST(RawDnsMemoryErrorFromNodeTest, "test-dns-memory-error.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupServiceFromNodeTest, "test-dns-lookupService.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsMemoryErrorFromNodeTest, "test-dns-memory-error.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupServiceFromNodeTest, "test-dns-lookupService.js")
 DEFINE_RAW_NODE_TEST(RawDnsLookupServicePromisesFromNodeTest, "test-dns-lookupService-promises.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupFromNodeTest, "test-dns-lookup.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupPromisesFromNodeTest, "test-dns-lookup-promises.js")
-DEFINE_RAW_NODE_TEST(RawDnsLookupPromisesOptionsDeprecatedFromNodeTest, "test-dns-lookup-promises-options-deprecated.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupFromNodeTest, "test-dns-lookup.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupPromisesFromNodeTest, "test-dns-lookup-promises.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsLookupPromisesOptionsDeprecatedFromNodeTest, "test-dns-lookup-promises-options-deprecated.js")
 DEFINE_RAW_NODE_TEST(RawDnsGetServerFromNodeTest, "test-dns-get-server.js")
-DEFINE_RAW_NODE_TEST(RawDnsDefaultOrderVerbatimFromNodeTest, "test-dns-default-order-verbatim.js")
-DEFINE_RAW_NODE_TEST(RawDnsDefaultOrderIpv6FromNodeTest, "test-dns-default-order-ipv6.js")
-DEFINE_RAW_NODE_TEST(RawDnsDefaultOrderIpv4FromNodeTest, "test-dns-default-order-ipv4.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsDefaultOrderVerbatimFromNodeTest, "test-dns-default-order-verbatim.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsDefaultOrderIpv6FromNodeTest, "test-dns-default-order-ipv6.js")
+DEFINE_RAW_NODE_ALLOW_FLAGS_TEST(RawDnsDefaultOrderIpv4FromNodeTest, "test-dns-default-order-ipv4.js")
 DEFINE_RAW_NODE_TEST(RawDnsChannelTimeoutFromNodeTest, "test-dns-channel-timeout.js")
 DEFINE_RAW_NODE_TEST(RawDnsChannelCancelFromNodeTest, "test-dns-channel-cancel.js")
 DEFINE_RAW_NODE_TEST(RawDnsChannelCancelPromiseFromNodeTest, "test-dns-channel-cancel-promise.js")
@@ -2439,7 +2465,11 @@ DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_closeFromNo
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_closed_channel_segfaultFromNodeTest, "parallel/test-child-process-fork-closed-channel-segfault.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_detachedFromNodeTest, "parallel/test-child-process-fork-detached.js")
 TEST_F(Test3NodeDropinSubsetPhase02, RawExpandedChildProcess_test_child_process_fork_dgramFromNodeTest) {
-  GTEST_SKIP() << "Raw child-process fork dgram passes standalone but can leak an orphan child under ctest.";
+  std::string error;
+  const int exit_code =
+      RunRawNodeTestScriptInSubprocess("parallel/test-child-process-fork-dgram.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
 }
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_exec_argvFromNodeTest, "parallel/test-child-process-fork-exec-argv.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_exec_pathFromNodeTest, "parallel/test-child-process-fork-exec-path.js")

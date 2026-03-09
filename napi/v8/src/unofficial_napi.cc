@@ -14,32 +14,41 @@
 
 #include <libplatform/libplatform.h>
 
+#include "internal/node_v8_default_flags.h"
 #include "internal/napi_v8_env.h"
+#include "ubi_v8_platform.h"
 
 namespace {
 
 struct SharedRuntime {
-  std::unique_ptr<v8::Platform> platform;
-  v8::Isolate::CreateParams params{};
-  v8::Isolate* isolate = nullptr;
+  std::unique_ptr<UbiV8Platform> platform;
   uint32_t refcount = 0;
 };
 
+class TrackingArrayBufferAllocator;
+
 struct UnofficialEnvScope {
   v8::Isolate* isolate = nullptr;
-  v8::Isolate::Scope isolate_scope;
-  v8::HandleScope handle_scope;
+  TrackingArrayBufferAllocator* allocator = nullptr;
+  std::optional<v8::Isolate::Scope> isolate_scope;
+  std::optional<v8::HandleScope> handle_scope;
   std::optional<v8::Global<v8::Context>> context;
   std::optional<v8::Context::Scope> context_scope;
   napi_env env = nullptr;
 
-  explicit UnofficialEnvScope(v8::Isolate* isolate_in)
-      : isolate(isolate_in), isolate_scope(isolate_in), handle_scope(isolate_in) {}
+  explicit UnofficialEnvScope(v8::Isolate* isolate_in, TrackingArrayBufferAllocator* allocator_in)
+      : isolate(isolate_in), allocator(allocator_in) {
+    isolate_scope.emplace(isolate_in);
+    handle_scope.emplace(isolate_in);
+  }
 
   ~UnofficialEnvScope() {
     if (context.has_value()) {
       context->Reset();
     }
+    context_scope.reset();
+    handle_scope.reset();
+    isolate_scope.reset();
   }
 };
 
@@ -48,6 +57,13 @@ SharedRuntime g_runtime;
 std::unordered_map<v8::Isolate*, napi_env> g_env_by_isolate;
 std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_callbacks;
 std::unordered_map<v8::ArrayBuffer::Allocator*, void*> g_tracking_allocators;
+
+struct FatalErrorCallbacks {
+  unofficial_napi_fatal_error_callback fatal = nullptr;
+  unofficial_napi_oom_error_callback oom = nullptr;
+};
+
+std::unordered_map<v8::Isolate*, FatalErrorCallbacks> g_fatal_error_callbacks;
 
 class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
  public:
@@ -100,43 +116,71 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
 };
 
 void ApplyDefaultV8Flags() {
-  static constexpr char kDefaultFlags[] = "--js-float16array";
-  v8::V8::SetFlagsFromString(kDefaultFlags, static_cast<int>(sizeof(kDefaultFlags) - 1));
+  v8::V8::SetFlagsFromString(
+      kNodeDefaultShippingV8Flags,
+      static_cast<int>(sizeof(kNodeDefaultShippingV8Flags) - 1));
 }
 
-napi_status AcquireRuntime(v8::Isolate** isolate_out) {
-  if (isolate_out == nullptr) return napi_invalid_arg;
+void FatalErrorCallback(const char* location, const char* message) {
+  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
+  if (isolate == nullptr) return;
+
+  unofficial_napi_fatal_error_callback callback = nullptr;
+  napi_env env = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto callback_it = g_fatal_error_callbacks.find(isolate);
+    if (callback_it != g_fatal_error_callbacks.end()) {
+      callback = callback_it->second.fatal;
+    }
+    auto env_it = g_env_by_isolate.find(isolate);
+    if (env_it != g_env_by_isolate.end()) {
+      env = env_it->second;
+    }
+  }
+  if (callback != nullptr) {
+    callback(env, location, message);
+  }
+}
+
+void OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
+  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
+  if (isolate == nullptr) return;
+
+  unofficial_napi_oom_error_callback callback = nullptr;
+  napi_env env = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto callback_it = g_fatal_error_callbacks.find(isolate);
+    if (callback_it != g_fatal_error_callbacks.end()) {
+      callback = callback_it->second.oom;
+    }
+    auto env_it = g_env_by_isolate.find(isolate);
+    if (env_it != g_env_by_isolate.end()) {
+      env = env_it->second;
+    }
+  }
+  if (callback != nullptr) {
+    callback(env, location, details.is_heap_oom, details.detail);
+  }
+}
+
+napi_status AcquireRuntime(UbiV8Platform** platform_out) {
+  if (platform_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
 
-  // Only initialize V8 and create the isolate once per process (when refcount
-  // was 0 and we don't have an isolate yet). Re-initializing causes V8 fatal
-  // "Wrong initialization order" when a second test runs after the first released.
-  if (g_runtime.refcount == 0 && g_runtime.isolate == nullptr) {
+  if (g_runtime.refcount == 0 && g_runtime.platform == nullptr) {
     ApplyDefaultV8Flags();
     v8::V8::InitializeICUDefaultLocation("");
     v8::V8::InitializeExternalStartupData("");
-    g_runtime.platform = v8::platform::NewDefaultPlatform();
+    g_runtime.platform = UbiV8Platform::Create();
     v8::V8::InitializePlatform(g_runtime.platform.get());
     v8::V8::Initialize();
-
-    auto* allocator = new TrackingArrayBufferAllocator();
-    g_runtime.params.array_buffer_allocator = allocator;
-    g_tracking_allocators[g_runtime.params.array_buffer_allocator] = allocator;
-    g_runtime.isolate = v8::Isolate::New(g_runtime.params);
-    if (g_runtime.isolate == nullptr) {
-      delete g_runtime.params.array_buffer_allocator;
-      g_runtime.params.array_buffer_allocator = nullptr;
-      g_tracking_allocators.erase(allocator);
-      g_runtime.platform.reset();
-      v8::V8::Dispose();
-      v8::V8::DisposePlatform();
-      return napi_generic_failure;
-    }
   }
 
   g_runtime.refcount++;
-  *isolate_out = g_runtime.isolate;
-  return napi_ok;
+  *platform_out = g_runtime.platform.get();
+  return *platform_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
 void ReleaseRuntime() {
@@ -209,6 +253,48 @@ v8::Local<v8::String> OneByteString(v8::Isolate* isolate, const char* value) {
       .ToLocalChecked();
 }
 
+void ThrowTypeErrorWithCode(v8::Local<v8::Context> context,
+                            v8::Isolate* isolate,
+                            const char* code,
+                            const char* message) {
+  v8::Local<v8::Value> exception = v8::Exception::TypeError(OneByteString(isolate, message));
+  if (exception->IsObject()) {
+    (void)exception.As<v8::Object>()->Set(
+        context, OneByteString(isolate, "code"), OneByteString(isolate, code));
+  }
+  isolate->ThrowException(exception);
+}
+
+v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
+                                         v8::Local<v8::ArrayBuffer> array_buffer,
+                                         size_t offset,
+                                         size_t length) {
+  v8::Isolate* isolate = context->GetIsolate();
+  v8::Local<v8::Object> global = context->Global();
+
+  v8::Local<v8::Value> buffer_ctor_value;
+  if (global->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor_value) &&
+      buffer_ctor_value->IsObject()) {
+    v8::Local<v8::Object> buffer_ctor = buffer_ctor_value.As<v8::Object>();
+    v8::Local<v8::Value> from_value;
+    if (buffer_ctor->Get(context, OneByteString(isolate, "from")).ToLocal(&from_value) &&
+        from_value->IsFunction()) {
+      v8::Local<v8::Value> argv[3] = {
+          array_buffer,
+          v8::Number::New(isolate, static_cast<double>(offset)),
+          v8::Number::New(isolate, static_cast<double>(length)),
+      };
+      v8::Local<v8::Value> maybe_buffer;
+      if (from_value.As<v8::Function>()->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
+          maybe_buffer->IsObject()) {
+        return maybe_buffer.As<v8::Object>();
+      }
+    }
+  }
+
+  return v8::Uint8Array::New(array_buffer, offset, length);
+}
+
 bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
                               const uint8_t** data_out,
                               size_t* size_out) {
@@ -227,21 +313,82 @@ bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
   return true;
 }
 
-class SerializerContext {
+class SerializerContext : public v8::ValueSerializer::Delegate {
  public:
   SerializerContext(napi_env env, v8::Local<v8::Object> wrap)
-      : env_(env), isolate_(env->isolate), serializer_(isolate_) {
+      : env_(env), isolate_(env->isolate), serializer_(isolate_, this) {
     wrap_.Reset(isolate_, wrap);
     wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
   }
 
   ~SerializerContext() { wrap_.Reset(); }
 
+  void ThrowDataCloneError(v8::Local<v8::String> message) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate_);
+
+    v8::Local<v8::Value> get_data_clone_error;
+    if (!wrap->Get(context, OneByteString(isolate_, "_getDataCloneError"))
+             .ToLocal(&get_data_clone_error) ||
+        !get_data_clone_error->IsFunction()) {
+      isolate_->ThrowException(v8::Exception::Error(message));
+      return;
+    }
+
+    v8::Local<v8::Value> argv[1] = {message};
+    v8::Local<v8::Value> error;
+    if (get_data_clone_error.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&error)) {
+      isolate_->ThrowException(error);
+    }
+  }
+
+  v8::Maybe<uint32_t> GetSharedArrayBufferId(
+      v8::Isolate* isolate,
+      v8::Local<v8::SharedArrayBuffer> shared_array_buffer) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
+
+    v8::Local<v8::Value> hook;
+    if (!wrap->Get(context, OneByteString(isolate, "_getSharedArrayBufferId")).ToLocal(&hook) ||
+        !hook->IsFunction()) {
+      return v8::ValueSerializer::Delegate::GetSharedArrayBufferId(isolate, shared_array_buffer);
+    }
+
+    v8::Local<v8::Value> argv[1] = {shared_array_buffer};
+    v8::Local<v8::Value> id;
+    if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&id)) {
+      return v8::Nothing<uint32_t>();
+    }
+    return id->Uint32Value(context);
+  }
+
+  v8::Maybe<bool> WriteHostObject(v8::Isolate* isolate, v8::Local<v8::Object> input) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
+
+    v8::Local<v8::Value> hook;
+    if (!wrap->Get(context, OneByteString(isolate, "_writeHostObject")).ToLocal(&hook)) {
+      return v8::Nothing<bool>();
+    }
+    if (!hook->IsFunction()) {
+      return v8::ValueSerializer::Delegate::WriteHostObject(isolate, input);
+    }
+
+    v8::Local<v8::Value> argv[1] = {input};
+    v8::Local<v8::Value> ret;
+    if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&ret)) {
+      return v8::Nothing<bool>();
+    }
+    return v8::Just(true);
+  }
+
   static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::Isolate* isolate = args.GetIsolate();
     if (!args.IsConstructCall()) {
-      isolate->ThrowException(v8::Exception::TypeError(
-          OneByteString(isolate, "Class constructor Serializer cannot be invoked without 'new'")));
+      ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
+                             isolate,
+                             "ERR_CONSTRUCT_CALL_REQUIRED",
+                             "Class constructor Serializer cannot be invoked without 'new'");
       return;
     }
     if (!args.Data()->IsExternal()) {
@@ -281,8 +428,8 @@ class SerializerContext {
       const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
-    (void)args;
-    // Intentionally a no-op: keep V8 default ArrayBufferView serialization.
+    const bool value = args.Length() >= 1 && args[0]->BooleanValue(ctx->isolate_);
+    ctx->serializer_.SetTreatArrayBufferViewsAsHostObjects(value);
   }
 
   static void ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -304,27 +451,8 @@ class SerializerContext {
       std::free(serialized.first);
       return;
     }
-    v8::Local<v8::ArrayBuffer> ab =
-        v8::ArrayBuffer::New(isolate, std::move(backing_store));
-    v8::Local<v8::Uint8Array> view =
-        v8::Uint8Array::New(ab, 0, serialized.second);
-
-    v8::Local<v8::Value> buffer_ctor;
-    if (context->Global()->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor) &&
-        buffer_ctor->IsFunction()) {
-      v8::Local<v8::Value> from_val;
-      if (buffer_ctor.As<v8::Object>()->Get(context, OneByteString(isolate, "from")).ToLocal(&from_val) &&
-          from_val->IsFunction()) {
-        v8::Local<v8::Value> argv[1] = {view};
-        v8::Local<v8::Value> out;
-        if (from_val.As<v8::Function>()->Call(context, buffer_ctor, 1, argv).ToLocal(&out)) {
-          args.GetReturnValue().Set(out);
-          return;
-        }
-      }
-    }
-
-    args.GetReturnValue().Set(view);
+    v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(backing_store));
+    args.GetReturnValue().Set(CreateBufferObject(context, ab, 0, serialized.second));
   }
 
   static void TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -336,8 +464,10 @@ class SerializerContext {
     if (!args[0]->Uint32Value(ctx->env_->context()).To(&id)) return;
 
     if (!args[1]->IsArrayBuffer()) {
-      ctx->isolate_->ThrowException(v8::Exception::TypeError(
-          OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer")));
+      ThrowTypeErrorWithCode(ctx->env_->context(),
+                             ctx->isolate_,
+                             "ERR_INVALID_ARG_TYPE",
+                             "arrayBuffer must be an ArrayBuffer");
       return;
     }
     ctx->serializer_.TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
@@ -379,8 +509,10 @@ class SerializerContext {
     const uint8_t* data = nullptr;
     size_t size = 0;
     if (!ReadArrayBufferViewBytes(args[0], &data, &size)) {
-      ctx->isolate_->ThrowException(v8::Exception::TypeError(
-          OneByteString(ctx->isolate_, "source must be a TypedArray or a DataView")));
+      ThrowTypeErrorWithCode(ctx->env_->context(),
+                             ctx->isolate_,
+                             "ERR_INVALID_ARG_TYPE",
+                             "source must be a TypedArray or a DataView");
       return;
     }
     ctx->serializer_.WriteRawBytes(data, size);
@@ -402,7 +534,7 @@ class SerializerContext {
   v8::ValueSerializer serializer_;
 };
 
-class DeserializerContext {
+class DeserializerContext : public v8::ValueDeserializer::Delegate {
  public:
   DeserializerContext(napi_env env,
                       v8::Local<v8::Object> wrap,
@@ -415,7 +547,7 @@ class DeserializerContext {
       data_.assign(data, data + size);
     }
     deserializer_ = std::make_unique<v8::ValueDeserializer>(
-        isolate_, data_.empty() ? nullptr : data_.data(), data_.size());
+        isolate_, data_.empty() ? nullptr : data_.data(), data_.size(), this);
 
     wrap_.Reset(isolate_, wrap);
     wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
@@ -430,11 +562,38 @@ class DeserializerContext {
     deserializer_.reset();
   }
 
+  v8::MaybeLocal<v8::Object> ReadHostObject(v8::Isolate* isolate) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
+
+    v8::Local<v8::Value> hook;
+    if (!wrap->Get(context, OneByteString(isolate, "_readHostObject")).ToLocal(&hook)) {
+      return {};
+    }
+    if (!hook->IsFunction()) {
+      return v8::ValueDeserializer::Delegate::ReadHostObject(isolate);
+    }
+
+    v8::Isolate::AllowJavascriptExecutionScope allow_js(isolate);
+    v8::Local<v8::Value> ret;
+    if (!hook.As<v8::Function>()->Call(context, wrap, 0, nullptr).ToLocal(&ret)) {
+      return {};
+    }
+    if (!ret->IsObject()) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          OneByteString(isolate, "readHostObject must return an object")));
+      return {};
+    }
+    return ret.As<v8::Object>();
+  }
+
   static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::Isolate* isolate = args.GetIsolate();
     if (!args.IsConstructCall()) {
-      isolate->ThrowException(v8::Exception::TypeError(
-          OneByteString(isolate, "Class constructor Deserializer cannot be invoked without 'new'")));
+      ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
+                             isolate,
+                             "ERR_CONSTRUCT_CALL_REQUIRED",
+                             "Class constructor Deserializer cannot be invoked without 'new'");
       return;
     }
     if (!args.Data()->IsExternal()) {
@@ -443,8 +602,10 @@ class DeserializerContext {
       return;
     }
     if (args.Length() < 1 || !args[0]->IsArrayBufferView()) {
-      isolate->ThrowException(v8::Exception::TypeError(
-          OneByteString(isolate, "buffer must be a TypedArray or a DataView")));
+      ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
+                             isolate,
+                             "ERR_INVALID_ARG_TYPE",
+                             "buffer must be a TypedArray or a DataView");
       return;
     }
 
@@ -481,12 +642,18 @@ class DeserializerContext {
     if (ctx == nullptr || !ctx->deserializer_ || args.Length() < 2) return;
     uint32_t id = 0;
     if (!args[0]->Uint32Value(ctx->env_->context()).To(&id)) return;
-    if (!args[1]->IsArrayBuffer()) {
-      ctx->isolate_->ThrowException(v8::Exception::TypeError(
-          OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer")));
+    if (args[1]->IsArrayBuffer()) {
+      ctx->deserializer_->TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
       return;
     }
-    ctx->deserializer_->TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
+    if (args[1]->IsSharedArrayBuffer()) {
+      ctx->deserializer_->TransferSharedArrayBuffer(id, args[1].As<v8::SharedArrayBuffer>());
+      return;
+    }
+    ThrowTypeErrorWithCode(ctx->env_->context(),
+                           ctx->isolate_,
+                           "ERR_INVALID_ARG_TYPE",
+                           "arrayBuffer must be an ArrayBuffer or SharedArrayBuffer");
   }
 
   static void GetWireFormatVersion(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -601,9 +768,83 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
   return target->Set(context, OneByteString(context->GetIsolate(), name), ctor).FromMaybe(false);
 }
 
+class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
+ public:
+  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate)
+      : isolate_(isolate) {}
+
+  void ThrowDataCloneError(v8::Local<v8::String> message) override {
+    isolate_->ThrowException(v8::Exception::Error(message));
+  }
+
+  v8::Maybe<uint32_t> GetSharedArrayBufferId(
+      v8::Isolate* /*isolate*/,
+      v8::Local<v8::SharedArrayBuffer> shared_array_buffer) override {
+    std::shared_ptr<v8::BackingStore> backing_store =
+        shared_array_buffer->GetBackingStore();
+    for (uint32_t i = 0; i < shared_array_buffers_.size(); ++i) {
+      if (shared_array_buffers_[i] == backing_store) {
+        return v8::Just(i);
+      }
+    }
+    shared_array_buffers_.push_back(std::move(backing_store));
+    return v8::Just(static_cast<uint32_t>(shared_array_buffers_.size() - 1));
+  }
+
+  const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers() const {
+    return shared_array_buffers_;
+  }
+
+ private:
+  v8::Isolate* isolate_ = nullptr;
+  std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers_;
+};
+
+class StructuredCloneDeserializerDelegate final : public v8::ValueDeserializer::Delegate {
+ public:
+  StructuredCloneDeserializerDelegate(
+      v8::Isolate* isolate,
+      const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers)
+      : isolate_(isolate),
+        shared_array_buffers_(shared_array_buffers) {}
+
+  v8::MaybeLocal<v8::SharedArrayBuffer> GetSharedArrayBufferFromId(
+      v8::Isolate* isolate,
+      uint32_t clone_id) override {
+    if (clone_id >= shared_array_buffers_.size()) return {};
+    return v8::SharedArrayBuffer::New(isolate, shared_array_buffers_[clone_id]);
+  }
+
+ private:
+  v8::Isolate* isolate_ = nullptr;
+  const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers_;
+};
+
+struct SerializedClonePayload {
+  std::vector<uint8_t> bytes;
+  std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers;
+};
+
 }  // namespace
 
 extern "C" {
+
+napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
+    napi_env env,
+    unofficial_napi_enqueue_foreground_task_callback callback,
+    void* target) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->enqueue_foreground_task_callback = callback;
+  env->enqueue_foreground_task_target = target;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    if (g_runtime.platform != nullptr &&
+        !g_runtime.platform->BindForegroundTaskTarget(env->isolate, env, callback, target)) {
+      return napi_generic_failure;
+    }
+  }
+  return napi_ok;
+}
 
 napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
     v8::Local<v8::Context> context, int32_t module_api_version, napi_env* result) {
@@ -623,6 +864,9 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
+    if (g_runtime.platform != nullptr) {
+      g_runtime.platform->ClearForegroundTaskTarget(env->isolate, env);
+    }
     auto env_it = g_env_by_isolate.find(env->isolate);
     if (env_it != g_env_by_isolate.end() && env_it->second == env) {
       g_env_by_isolate.erase(env_it);
@@ -632,11 +876,32 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
       cb_it->second.Reset();
       g_promise_reject_callbacks.erase(cb_it);
     }
+    g_fatal_error_callbacks.erase(env->isolate);
   }
   if (env->isolate != nullptr) {
     env->isolate->SetPromiseRejectCallback(nullptr);
+    env->isolate->SetFatalErrorHandler(nullptr);
+    env->isolate->SetOOMErrorHandler(nullptr);
   }
   delete env;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_fatal_error_callbacks(
+    napi_env env,
+    unofficial_napi_fatal_error_callback fatal_callback,
+    unofficial_napi_oom_error_callback oom_callback) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto& entry = g_fatal_error_callbacks[env->isolate];
+    entry.fatal = fatal_callback;
+    entry.oom = oom_callback;
+  }
+
+  env->isolate->SetFatalErrorHandler(fatal_callback != nullptr ? FatalErrorCallback : nullptr);
+  env->isolate->SetOOMErrorHandler(oom_callback != nullptr ? OOMErrorCallback : nullptr);
   return napi_ok;
 }
 
@@ -653,12 +918,44 @@ napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
                                                   void** scope_out) {
   if (env_out == nullptr || scope_out == nullptr) return napi_invalid_arg;
 
-  v8::Isolate* isolate = nullptr;
-  napi_status status = AcquireRuntime(&isolate);
-  if (status != napi_ok) return status;
+  UbiV8Platform* platform = nullptr;
+  napi_status status = AcquireRuntime(&platform);
+  if (status != napi_ok || platform == nullptr) return status != napi_ok ? status : napi_generic_failure;
 
-  auto* scope = new (std::nothrow) UnofficialEnvScope(isolate);
+  auto* allocator = new (std::nothrow) TrackingArrayBufferAllocator();
+  if (allocator == nullptr) {
+    ReleaseRuntime();
+    return napi_generic_failure;
+  }
+
+  v8::Isolate::CreateParams params{};
+  params.array_buffer_allocator = allocator;
+  v8::Isolate* isolate = v8::Isolate::New(params);
+  if (isolate == nullptr) {
+    delete allocator;
+    ReleaseRuntime();
+    return napi_generic_failure;
+  }
+  if (!platform->RegisterIsolate(isolate)) {
+    isolate->Dispose();
+    delete allocator;
+    ReleaseRuntime();
+    return napi_generic_failure;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    g_tracking_allocators[allocator] = allocator;
+  }
+
+  auto* scope = new (std::nothrow) UnofficialEnvScope(isolate, allocator);
   if (scope == nullptr) {
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      g_tracking_allocators.erase(allocator);
+    }
+    platform->UnregisterIsolate(isolate);
+    isolate->Dispose();
+    delete allocator;
     ReleaseRuntime();
     return napi_generic_failure;
   }
@@ -669,6 +966,13 @@ napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
   if (status != napi_ok || scope->env == nullptr) {
     delete scope;
+    {
+      std::lock_guard<std::mutex> lock(g_runtime_mu);
+      g_tracking_allocators.erase(allocator);
+    }
+    platform->UnregisterIsolate(isolate);
+    isolate->Dispose();
+    delete allocator;
     ReleaseRuntime();
     return (status == napi_ok) ? napi_generic_failure : status;
   }
@@ -687,21 +991,39 @@ napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
     status = unofficial_napi_destroy_env_instance(scope->env);
     scope->env = nullptr;
   }
+
+  v8::Isolate* isolate = scope->isolate;
+  TrackingArrayBufferAllocator* allocator = scope->allocator;
   delete scope;
+
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    if (g_runtime.platform != nullptr && isolate != nullptr) {
+      g_runtime.platform->UnregisterIsolate(isolate);
+    }
+    if (allocator != nullptr) {
+      g_tracking_allocators.erase(allocator);
+    }
+  }
+  if (isolate != nullptr) {
+    isolate->Dispose();
+  }
+  delete allocator;
   ReleaseRuntime();
   return status;
 }
 
 void DrainMicrotasksForEnv(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
-  env->isolate->PerformMicrotaskCheckpoint();
   v8::Local<v8::Context> context = env->context();
   if (!context.IsEmpty()) {
     v8::MicrotaskQueue* queue = context->GetMicrotaskQueue();
     if (queue != nullptr) {
       queue->PerformCheckpoint(env->isolate);
+      return;
     }
   }
+  env->isolate->PerformMicrotaskCheckpoint();
 }
 
 napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
@@ -715,10 +1037,142 @@ napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
 
 napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  // Keep this helper engine-agnostic in behavior: flush microtasks only.
+  // Keep this helper scoped to the current context's microtask queue.
   // Foreground task pumping is owned by higher-level runtime loop policy.
   DrainMicrotasksForEnv(env);
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  env->isolate->TerminateExecution();
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_structured_clone(
+    napi_env env,
+    napi_value value,
+    napi_value* result_out) {
+  if (env == nullptr || env->isolate == nullptr || value == nullptr || result_out == nullptr) {
+    return napi_invalid_arg;
+  }
+
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
+  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  v8::ValueSerializer serializer(isolate, &serializer_delegate);
+
+  serializer.WriteHeader();
+  if (serializer.WriteValue(context, input).IsNothing()) {
+    return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
+  }
+
+  std::pair<uint8_t*, size_t> released = serializer.Release();
+  if (released.first == nullptr) return napi_generic_failure;
+  std::unique_ptr<uint8_t, decltype(&std::free)> buffer(released.first, &std::free);
+
+  StructuredCloneDeserializerDelegate deserializer_delegate(
+      isolate, serializer_delegate.shared_array_buffers());
+  v8::ValueDeserializer deserializer(
+      isolate,
+      buffer.get(),
+      released.second,
+      &deserializer_delegate);
+
+  bool header_ok = false;
+  if (!deserializer.ReadHeader(context).To(&header_ok) || !header_ok) {
+    return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
+  }
+
+  v8::Local<v8::Value> output;
+  if (!deserializer.ReadValue(context).ToLocal(&output)) {
+    return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
+  }
+
+  *result_out = napi_v8_wrap_value(env, output);
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_serialize_value(
+    napi_env env,
+    napi_value value,
+    void** payload_out) {
+  if (env == nullptr || env->isolate == nullptr || value == nullptr || payload_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *payload_out = nullptr;
+
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
+  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  v8::ValueSerializer serializer(isolate, &serializer_delegate);
+
+  serializer.WriteHeader();
+  if (serializer.WriteValue(context, input).IsNothing()) {
+    return napi_pending_exception;
+  }
+
+  std::pair<uint8_t*, size_t> released = serializer.Release();
+  if (released.first == nullptr) return napi_generic_failure;
+
+  auto* payload = new (std::nothrow) SerializedClonePayload();
+  if (payload == nullptr) {
+    std::free(released.first);
+    return napi_generic_failure;
+  }
+  payload->bytes.assign(released.first, released.first + released.second);
+  std::free(released.first);
+  payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
+  *payload_out = payload;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_deserialize_value(
+    napi_env env,
+    void* payload_ptr,
+    napi_value* result_out) {
+  if (env == nullptr || env->isolate == nullptr || payload_ptr == nullptr || result_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *result_out = nullptr;
+
+  auto* payload = static_cast<SerializedClonePayload*>(payload_ptr);
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  StructuredCloneDeserializerDelegate deserializer_delegate(isolate, payload->shared_array_buffers);
+  v8::ValueDeserializer deserializer(
+      isolate,
+      payload->bytes.data(),
+      payload->bytes.size(),
+      &deserializer_delegate);
+
+  bool header_ok = false;
+  if (!deserializer.ReadHeader(context).To(&header_ok) || !header_ok) {
+    return napi_pending_exception;
+  }
+
+  v8::Local<v8::Value> output;
+  if (!deserializer.ReadValue(context).ToLocal(&output)) {
+    return napi_pending_exception;
+  }
+
+  *result_out = napi_v8_wrap_value(env, output);
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+void NAPI_CDECL unofficial_napi_release_serialized_value(void* payload_ptr) {
+  delete static_cast<SerializedClonePayload*>(payload_ptr);
 }
 
 napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback) {
@@ -924,6 +1378,29 @@ napi_status NAPI_CDECL unofficial_napi_get_constructor_name(napi_env env,
   return *name_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
+    napi_env env,
+    napi_value value,
+    uint32_t filter_bits,
+    napi_value* result_out) {
+  if (env == nullptr || value == nullptr || result_out == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (raw.IsEmpty() || !raw->IsObject()) return napi_invalid_arg;
+
+  v8::Local<v8::Array> properties;
+  if (!raw.As<v8::Object>()
+           ->GetPropertyNames(env->context(),
+                              v8::KeyCollectionMode::kOwnOnly,
+                              static_cast<v8::PropertyFilter>(filter_bits),
+                              v8::IndexFilter::kSkipIndices)
+           .ToLocal(&properties)) {
+    return napi_generic_failure;
+  }
+
+  *result_out = napi_v8_wrap_value(env, properties);
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
                                                              const char* utf8description,
                                                              size_t length,
@@ -1040,6 +1517,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   v8::Local<v8::FunctionTemplate> serializer_tmpl =
       v8::FunctionTemplate::New(isolate, SerializerContext::New, env_data);
   serializer_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
+  serializer_tmpl->SetClassName(OneByteString(isolate, "Serializer"));
   SetProtoMethod(isolate, serializer_tmpl, "writeHeader", SerializerContext::WriteHeader);
   SetProtoMethod(isolate, serializer_tmpl, "writeValue", SerializerContext::WriteValue);
   SetProtoMethod(isolate, serializer_tmpl, "releaseBuffer", SerializerContext::ReleaseBuffer);
@@ -1052,6 +1530,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
                  serializer_tmpl,
                  "_setTreatArrayBufferViewsAsHostObjects",
                  SerializerContext::SetTreatArrayBufferViewsAsHostObjects);
+  serializer_tmpl->ReadOnlyPrototype();
   if (!SetConstructorFunction(context, target, "Serializer", serializer_tmpl)) {
     return napi_generic_failure;
   }
@@ -1059,6 +1538,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   v8::Local<v8::FunctionTemplate> deserializer_tmpl =
       v8::FunctionTemplate::New(isolate, DeserializerContext::New, env_data);
   deserializer_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
+  deserializer_tmpl->SetClassName(OneByteString(isolate, "Deserializer"));
   SetProtoMethod(isolate, deserializer_tmpl, "readHeader", DeserializerContext::ReadHeader);
   SetProtoMethod(isolate, deserializer_tmpl, "readValue", DeserializerContext::ReadValue);
   SetProtoMethod(
@@ -1069,6 +1549,8 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   SetProtoMethod(isolate, deserializer_tmpl, "readUint64", DeserializerContext::ReadUint64);
   SetProtoMethod(isolate, deserializer_tmpl, "readDouble", DeserializerContext::ReadDouble);
   SetProtoMethod(isolate, deserializer_tmpl, "_readRawBytes", DeserializerContext::ReadRawBytes);
+  deserializer_tmpl->SetLength(1);
+  deserializer_tmpl->ReadOnlyPrototype();
   if (!SetConstructorFunction(context, target, "Deserializer", deserializer_tmpl)) {
     return napi_generic_failure;
   }

@@ -27,6 +27,7 @@ add_library(napi_v8 STATIC
   src/js_native_api_v8.cc
   src/unofficial_napi.cc
   src/unofficial_napi_contextify.cc
+  src/ubi_v8_platform.cc
 )
 
 target_include_directories(napi_v8
@@ -41,6 +42,9 @@ target_compile_definitions(napi_v8
   PUBLIC
     NAPI_EXTERN=
 )
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(napi_v8 PRIVATE -fno-rtti)
+endif()
 if(NAPI_V8_DEFINES)
   target_compile_definitions(napi_v8 PRIVATE ${NAPI_V8_DEFINES})
 endif()

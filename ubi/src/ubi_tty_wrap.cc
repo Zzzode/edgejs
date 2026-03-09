@@ -6,11 +6,13 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <unistd.h>
 #include <uv.h>
 
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_stream_base.h"
 #include "ubi_stream_wrap.h"
 
@@ -31,11 +33,35 @@ struct TtyBindingState {
 };
 
 std::unordered_map<napi_env, TtyBindingState> g_tty_states;
+std::unordered_set<napi_env> g_tty_cleanup_hook_registered;
 
-TtyBindingState& EnsureBindingState(napi_env env) { return g_tty_states[env]; }
+void OnTtyEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_tty_cleanup_hook_registered.erase(env);
 
-void SetStreamState(int idx, int32_t value) {
-  int32_t* state = UbiGetStreamBaseState();
+  auto it = g_tty_states.find(env);
+  if (it == g_tty_states.end()) return;
+  if (it->second.tty_ctor_ref != nullptr) napi_delete_reference(env, it->second.tty_ctor_ref);
+  if (it->second.binding_ref != nullptr) napi_delete_reference(env, it->second.binding_ref);
+  g_tty_states.erase(it);
+}
+
+void EnsureTtyCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_tty_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnTtyEnvCleanup, env) != napi_ok) {
+    g_tty_cleanup_hook_registered.erase(it);
+  }
+}
+
+TtyBindingState& EnsureBindingState(napi_env env) {
+  EnsureTtyCleanupHook(env);
+  return g_tty_states[env];
+}
+
+void SetStreamState(napi_env env, int idx, int32_t value) {
+  int32_t* state = UbiGetStreamBaseState(env);
   if (state == nullptr) return;
   state[idx] = value;
 }
@@ -159,7 +185,8 @@ napi_value TtyCtor(napi_env env, napi_callback_info info) {
   UbiStreamBaseInit(&wrap->base, env, &kTtyOps, kUbiProviderTtyWrap);
 
   if (fd >= 0) {
-    wrap->init_err = uv_tty_init(uv_default_loop(), &wrap->handle, fd, 0);
+    uv_loop_t* loop = UbiGetEnvLoop(env);
+    wrap->init_err = loop != nullptr ? uv_tty_init(loop, &wrap->handle, fd, 0) : UV_EINVAL;
   } else {
     wrap->init_err = UV_EINVAL;
   }
@@ -297,8 +324,8 @@ napi_value TtyWriteBuffer(napi_env env, napi_callback_info info) {
   UbiStreamBaseExtractByteSpan(env, argv[1], &data, &len, &refable, &temp_utf8);
   if (data == nullptr && len > 0) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   const int rc = SyncTtyWrite(wrap, reinterpret_cast<const char*>(data), len);
-  SetStreamState(kUbiBytesWritten, rc == 0 ? static_cast<int32_t>(len) : 0);
-  SetStreamState(kUbiLastWriteWasAsync, 0);
+  SetStreamState(env, kUbiBytesWritten, rc == 0 ? static_cast<int32_t>(len) : 0);
+  SetStreamState(env, kUbiLastWriteWasAsync, 0);
   UbiStreamBaseSetReqError(env, argv[0], rc);
   return UbiStreamBaseMakeInt32(env, rc);
 #else
@@ -333,8 +360,8 @@ napi_value TtyWriteString(napi_env env, napi_callback_info info) {
   UbiStreamBaseExtractByteSpan(env, buffer, &bytes, &len, &refable, &temp_utf8);
   if (bytes == nullptr && len > 0) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   const int rc = SyncTtyWrite(wrap, reinterpret_cast<const char*>(bytes), len);
-  SetStreamState(kUbiBytesWritten, rc == 0 ? static_cast<int32_t>(len) : 0);
-  SetStreamState(kUbiLastWriteWasAsync, 0);
+  SetStreamState(env, kUbiBytesWritten, rc == 0 ? static_cast<int32_t>(len) : 0);
+  SetStreamState(env, kUbiLastWriteWasAsync, 0);
   UbiStreamBaseSetReqError(env, argv[0], rc);
   return UbiStreamBaseMakeInt32(env, rc);
 #else
@@ -476,6 +503,18 @@ napi_value TtyWriteQueueSizeGetter(napi_env env, napi_callback_info info) {
 }
 
 }  // namespace
+
+uv_stream_t* UbiTtyWrapGetStream(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return nullptr;
+  TtyWrap* wrap = nullptr;
+  if (napi_unwrap(env, value, reinterpret_cast<void**>(&wrap)) != napi_ok || wrap == nullptr) return nullptr;
+  if (!wrap->initialized) return nullptr;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  if (handle->data != wrap || handle->type != UV_TTY) return nullptr;
+  return reinterpret_cast<uv_stream_t*>(&wrap->handle);
+}
 
 napi_value UbiInstallTtyWrapBinding(napi_env env) {
   TtyBindingState& state = EnsureBindingState(env);

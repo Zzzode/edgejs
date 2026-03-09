@@ -76,7 +76,11 @@ std::optional<std::string> FileURLToPath(std::string_view input) {
     }
   }
 
-  return ada::unicode::percent_decode(pathname, first_percent);
+  std::string decoded = ada::unicode::percent_decode(pathname, first_percent);
+  if (decoded.empty() || decoded.front() != '/') {
+    decoded.insert(decoded.begin(), '/');
+  }
+  return decoded;
 #endif
 }
 
@@ -333,7 +337,12 @@ std::string NormalizeFileURLOrPath(std::string_view path) {
     if (!file_path.has_value()) return std::string();
     normalized = std::move(file_path.value());
   }
-  normalized = NormalizeString(normalized, false, "/");
+  if (normalized.empty()) return std::string();
+  if (IsAbsoluteFilePath(normalized)) {
+    normalized = PathResolve({normalized});
+  } else {
+    normalized = NormalizeString(normalized, false, "/");
+  }
 #ifdef _WIN32
   if (IsWindowsDriveLetter(normalized)) {
     normalized[0] = ToLowerAscii(normalized[0]);

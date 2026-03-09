@@ -4,10 +4,12 @@
 
 #include "internal_binding/binding_async_wrap.h"
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 #include "ubi_module_loader.h"
 #include "ubi_runtime.h"
+#include "ubi_runtime_platform.h"
 
 namespace {
 
@@ -18,6 +20,33 @@ struct AsyncWrapCache {
 };
 
 std::unordered_map<napi_env, AsyncWrapCache> g_async_wrap_cache;
+std::unordered_set<napi_env> g_async_wrap_cleanup_hooks;
+
+void ResetRef(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnAsyncWrapEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_async_wrap_cleanup_hooks.erase(env);
+  auto it = g_async_wrap_cache.find(env);
+  if (it == g_async_wrap_cache.end()) return;
+  ResetRef(env, &it->second.binding_ref);
+  ResetRef(env, &it->second.async_id_fields_ref);
+  ResetRef(env, &it->second.queue_destroy_ref);
+  g_async_wrap_cache.erase(it);
+}
+
+void EnsureAsyncWrapCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_async_wrap_cleanup_hooks.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnAsyncWrapEnvCleanup, env) != napi_ok) {
+    g_async_wrap_cleanup_hooks.erase(it);
+  }
+}
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (env == nullptr || ref == nullptr) return nullptr;
@@ -68,6 +97,7 @@ napi_value ResolveInternalBinding(napi_env env, const char* name) {
 }
 
 AsyncWrapCache& GetCache(napi_env env) {
+  EnsureAsyncWrapCleanupHook(env);
   return g_async_wrap_cache[env];
 }
 
@@ -155,6 +185,43 @@ napi_value GetQueueDestroyFunction(napi_env env) {
   return fn;
 }
 
+void CallQueueDestroyFunction(napi_env env, int64_t async_id) {
+  if (env == nullptr || async_id <= 0) return;
+
+  napi_value binding = GetAsyncWrapBinding(env);
+  napi_value queue_destroy = GetQueueDestroyFunction(env);
+  if (binding == nullptr || queue_destroy == nullptr) return;
+
+  napi_value async_id_value = nullptr;
+  if (napi_create_int64(env, async_id, &async_id_value) != napi_ok || async_id_value == nullptr) {
+    return;
+  }
+
+  napi_value ignored = nullptr;
+  napi_value argv[1] = {async_id_value};
+  if (napi_call_function(env, binding, queue_destroy, 1, argv, &ignored) != napi_ok) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value ignored_error = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored_error);
+    }
+  }
+}
+
+struct DestroyAsyncTask {
+  int64_t async_id = -1;
+};
+
+void RunDestroyAsyncTask(napi_env env, void* data) {
+  auto* task = static_cast<DestroyAsyncTask*>(data);
+  if (task == nullptr) return;
+  CallQueueDestroyFunction(env, task->async_id);
+}
+
+void CleanupDestroyAsyncTask(napi_env /*env*/, void* data) {
+  delete static_cast<DestroyAsyncTask*>(data);
+}
+
 }  // namespace
 
 int64_t UbiAsyncWrapNextId(napi_env env) {
@@ -168,28 +235,44 @@ int64_t UbiAsyncWrapNextId(napi_env env) {
 
 int64_t UbiAsyncWrapExecutionAsyncId(napi_env env) {
   double* fields = GetAsyncIdFields(env);
-  if (fields == nullptr) return 0;
+  if (fields == nullptr) return 1;
 
   constexpr size_t kExecutionAsyncId = 0;
   constexpr size_t kDefaultTriggerAsyncId = 3;
   const int64_t execution_async_id = static_cast<int64_t>(fields[kExecutionAsyncId]);
   if (execution_async_id > 0) return execution_async_id;
   const int64_t default_trigger_async_id = static_cast<int64_t>(fields[kDefaultTriggerAsyncId]);
-  return default_trigger_async_id > 0 ? default_trigger_async_id : 0;
+  return default_trigger_async_id > 0 ? default_trigger_async_id : 1;
+}
+
+int64_t UbiAsyncWrapCurrentExecutionAsyncId(napi_env env) {
+  double* fields = GetAsyncIdFields(env);
+  if (fields == nullptr) return 0;
+
+  constexpr size_t kExecutionAsyncId = 0;
+  return static_cast<int64_t>(fields[kExecutionAsyncId]);
 }
 
 const char* UbiAsyncWrapProviderName(int32_t provider_type) {
   switch (provider_type) {
+    case kUbiProviderHttpClientRequest:
+      return "HTTPCLIENTREQUEST";
+    case kUbiProviderHttpIncomingMessage:
+      return "HTTPINCOMINGMESSAGE";
     case kUbiProviderJsStream:
       return "JSSTREAM";
     case kUbiProviderJsUdpWrap:
       return "JSUDPWRAP";
+    case kUbiProviderMessagePort:
+      return "MESSAGEPORT";
     case kUbiProviderPipeConnectWrap:
       return "PIPECONNECTWRAP";
     case kUbiProviderPipeServerWrap:
       return "PIPESERVERWRAP";
     case kUbiProviderPipeWrap:
       return "PIPEWRAP";
+    case kUbiProviderProcessWrap:
+      return "PROCESSWRAP";
     case kUbiProviderShutdownWrap:
       return "SHUTDOWNWRAP";
     case kUbiProviderTcpConnectWrap:
@@ -206,18 +289,41 @@ const char* UbiAsyncWrapProviderName(int32_t provider_type) {
       return "UDPWRAP";
     case kUbiProviderWriteWrap:
       return "WRITEWRAP";
+    case kUbiProviderZlib:
+      return "ZLIB";
     default:
       return "NONE";
   }
 }
 
-void UbiAsyncWrapEmitInit(napi_env env,
-                          int64_t async_id,
-                          int32_t provider_type,
-                          int64_t trigger_async_id,
-                          napi_value resource) {
-  if (env == nullptr || async_id <= 0) return;
+void CallHookWithAsyncId(napi_env env, napi_value hooks, const char* hook_name, int64_t async_id) {
+  if (env == nullptr || hooks == nullptr || hook_name == nullptr || async_id <= 0) return;
+  napi_value hook_fn = nullptr;
+  if (napi_get_named_property(env, hooks, hook_name, &hook_fn) != napi_ok || hook_fn == nullptr) {
+    return;
+  }
 
+  napi_valuetype fn_type = napi_undefined;
+  if (napi_typeof(env, hook_fn, &fn_type) != napi_ok || fn_type != napi_function) return;
+
+  napi_value async_id_v = nullptr;
+  napi_create_int64(env, async_id, &async_id_v);
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, hooks, hook_fn, 1, &async_id_v, &ignored) != napi_ok) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value ignored_error = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored_error);
+    }
+  }
+}
+
+void UbiAsyncWrapEmitInitString(napi_env env,
+                                int64_t async_id,
+                                const char* type,
+                                int64_t trigger_async_id,
+                                napi_value resource) {
+  if (env == nullptr || async_id <= 0 || type == nullptr) return;
   napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
   if (hooks == nullptr) return;
 
@@ -234,7 +340,7 @@ void UbiAsyncWrapEmitInit(napi_env env,
   napi_value trigger_async_id_v = nullptr;
   napi_value promise_hook_v = nullptr;
   napi_create_int64(env, async_id, &async_id_v);
-  napi_create_string_utf8(env, UbiAsyncWrapProviderName(provider_type), NAPI_AUTO_LENGTH, &type_v);
+  napi_create_string_utf8(env, type, NAPI_AUTO_LENGTH, &type_v);
   napi_create_int64(env, trigger_async_id, &trigger_async_id_v);
   napi_get_boolean(env, false, &promise_hook_v);
   napi_value argv[5] = {
@@ -254,6 +360,39 @@ void UbiAsyncWrapEmitInit(napi_env env,
   }
 }
 
+void UbiAsyncWrapEmitInit(napi_env env,
+                          int64_t async_id,
+                          int32_t provider_type,
+                          int64_t trigger_async_id,
+                          napi_value resource) {
+  UbiAsyncWrapEmitInitString(
+      env, async_id, UbiAsyncWrapProviderName(provider_type), trigger_async_id, resource);
+}
+
+void UbiAsyncWrapEmitBefore(napi_env env, int64_t async_id) {
+  napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
+  CallHookWithAsyncId(env, hooks, "before", async_id);
+}
+
+void UbiAsyncWrapEmitAfter(napi_env env, int64_t async_id) {
+  napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
+  CallHookWithAsyncId(env, hooks, "after", async_id);
+}
+
+void UbiAsyncWrapPushContext(napi_env env,
+                             int64_t async_id,
+                             int64_t trigger_async_id,
+                             napi_value resource) {
+  if (env == nullptr) return;
+  internal_binding::AsyncWrapPushContext(
+      env, static_cast<double>(async_id), static_cast<double>(trigger_async_id), resource);
+}
+
+bool UbiAsyncWrapPopContext(napi_env env, int64_t async_id) {
+  if (env == nullptr) return false;
+  return internal_binding::AsyncWrapPopContext(env, static_cast<double>(async_id));
+}
+
 napi_status UbiAsyncWrapMakeCallback(napi_env env,
                                      int64_t async_id,
                                      napi_value resource,
@@ -264,7 +403,7 @@ napi_status UbiAsyncWrapMakeCallback(napi_env env,
                                      napi_value* result,
                                      int flags) {
   if (env == nullptr || recv == nullptr || callback == nullptr) return napi_invalid_arg;
-  if (async_id <= 0) {
+  if (async_id < 0) {
     return UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
   }
 
@@ -294,24 +433,11 @@ napi_status UbiAsyncWrapMakeCallback(napi_env env,
 
 void UbiAsyncWrapQueueDestroyId(napi_env env, int64_t async_id) {
   if (env == nullptr || async_id <= 0) return;
-
-  napi_value binding = GetAsyncWrapBinding(env);
-  napi_value queue_destroy = GetQueueDestroyFunction(env);
-  if (binding == nullptr || queue_destroy == nullptr) return;
-
-  napi_value async_id_value = nullptr;
-  if (napi_create_int64(env, async_id, &async_id_value) != napi_ok || async_id_value == nullptr) {
-    return;
-  }
-
-  napi_value ignored = nullptr;
-  napi_value argv[1] = {async_id_value};
-  if (napi_call_function(env, binding, queue_destroy, 1, argv, &ignored) != napi_ok) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
-      napi_value ignored_error = nullptr;
-      napi_get_and_clear_last_exception(env, &ignored_error);
-    }
+  auto* task = new DestroyAsyncTask();
+  task->async_id = async_id;
+  if (UbiRuntimePlatformEnqueueTask(
+          env, RunDestroyAsyncTask, task, CleanupDestroyAsyncTask, kUbiRuntimePlatformTaskNone) != napi_ok) {
+    CleanupDestroyAsyncTask(env, task);
   }
 }
 

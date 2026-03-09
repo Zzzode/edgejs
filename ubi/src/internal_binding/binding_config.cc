@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 #include "ncrypto/ncrypto.h"
@@ -13,6 +14,32 @@ namespace internal_binding {
 namespace {
 
 std::unordered_map<napi_env, napi_ref> g_config_refs;
+std::unordered_set<napi_env> g_config_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnConfigEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_config_cleanup_hook_registered.erase(env);
+
+  auto it = g_config_refs.find(env);
+  if (it == g_config_refs.end()) return;
+  DeleteRefIfPresent(env, &it->second);
+  g_config_refs.erase(it);
+}
+
+void EnsureConfigCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_config_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnConfigEnvCleanup, env) != napi_ok) {
+    g_config_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
@@ -45,14 +72,6 @@ bool IsTruthy(napi_env env, napi_value value) {
   return false;
 }
 
-bool HasIntl(napi_env env) {
-  napi_value global = GetGlobal(env);
-  napi_value intl = GetNamed(env, global, "Intl");
-  if (intl == nullptr) return false;
-  napi_valuetype t = napi_undefined;
-  return napi_typeof(env, intl, &t) == napi_ok && (t == napi_object || t == napi_function);
-}
-
 bool GetProcessConfigVariable(napi_env env, const char* key) {
   napi_value global = GetGlobal(env);
   napi_value process = GetNamed(env, global, "process");
@@ -60,6 +79,15 @@ bool GetProcessConfigVariable(napi_env env, const char* key) {
   napi_value variables = GetNamed(env, config, "variables");
   napi_value value = GetNamed(env, variables, key);
   return IsTruthy(env, value);
+}
+
+bool RuntimeHasIntl(napi_env env) {
+  napi_value global = GetGlobal(env);
+  napi_value intl = GetNamed(env, global, "Intl");
+  if (intl == nullptr) return false;
+
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, intl, &type) == napi_ok && (type == napi_object || type == napi_function);
 }
 
 napi_value ConfigGetDefaultLocale(napi_env env, napi_callback_info /*info*/) {
@@ -78,6 +106,7 @@ napi_value ConfigGetDefaultLocale(napi_env env, napi_callback_info /*info*/) {
 }  // namespace
 
 napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureConfigCleanupHook(env);
   auto cached_it = g_config_refs.find(env);
   if (cached_it != g_config_refs.end() && cached_it->second != nullptr) {
     napi_value cached = nullptr;
@@ -89,9 +118,9 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
 
-  const bool has_intl = HasIntl(env);
+  const bool has_intl = RuntimeHasIntl(env);
   const bool has_inspector = false;
-  const bool has_tracing = false;
+  const bool has_tracing = true;
 #ifdef OPENSSL_VERSION_NUMBER
   const bool has_openssl = true;
 #else
@@ -131,10 +160,7 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
   }
 
   auto& ref = g_config_refs[env];
-  if (ref != nullptr) {
-    napi_delete_reference(env, ref);
-    ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &ref);
   napi_create_reference(env, out, 1, &ref);
 
   return out;

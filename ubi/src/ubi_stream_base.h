@@ -33,6 +33,7 @@ struct UbiStreamBase {
   bool user_buffer_listener_active = false;
   bool closing = false;
   bool closed = false;
+  bool eof_emitted = false;
   bool finalized = false;
   bool delete_on_close = false;
   bool destroy_notified = false;
@@ -83,6 +84,7 @@ napi_value UbiStreamBaseGetProviderType(UbiStreamBase* base);
 napi_value UbiStreamBaseAsyncReset(UbiStreamBase* base);
 napi_value UbiStreamBaseHasRefValue(UbiStreamBase* base);
 napi_value UbiStreamBaseGetWriteQueueSize(UbiStreamBase* base);
+uv_stream_t* UbiStreamBaseGetLibuvStream(napi_env env, napi_value value);
 
 napi_value UbiStreamBaseMakeInt32(napi_env env, int32_t value);
 napi_value UbiStreamBaseMakeInt64(napi_env env, int64_t value);

@@ -31,6 +31,14 @@ option(UBI_ALLOW_UNDEFINED_IMPORTS
   "Allow undefined imports at link time (useful for external runtime deps in wasm/wasix)"
   OFF
 )
+option(UBI_PREFER_REPO_LOCAL_V8
+  "Prefer the repo-local V8 dist bundle when it exists"
+  ON
+)
+set(UBI_REPO_LOCAL_V8_DIST_ROOT
+  "${PROJECT_ROOT}/v8-custom-builds/v8/out/dist"
+  CACHE PATH "Path to the repo-local V8 dist bundle used when UBI_PREFER_REPO_LOCAL_V8 is ON"
+)
 
 set(UBI_IS_WASIX_TARGET OFF)
 if(CMAKE_SYSTEM_NAME MATCHES "WASI|WASIX" OR
@@ -82,6 +90,25 @@ foreach(UBI_CODE_FILE IN LISTS UBI_PURE_SRC_FILES)
 endforeach()
 
 if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
+  if(UBI_PREFER_REPO_LOCAL_V8)
+    set(_ubi_repo_local_v8_include "${UBI_REPO_LOCAL_V8_DIST_ROOT}/include")
+    set(_ubi_repo_local_v8_library "${UBI_REPO_LOCAL_V8_DIST_ROOT}/lib/libv8.a")
+    if(EXISTS "${_ubi_repo_local_v8_include}" AND EXISTS "${_ubi_repo_local_v8_library}")
+      message(STATUS "UBI: preferring repo-local V8 bundle at ${UBI_REPO_LOCAL_V8_DIST_ROOT}")
+      set(NAPI_V8_BUILD_METHOD "local" CACHE STRING
+        "V8 resolution method: prebuilt|source|local" FORCE)
+      set(NAPI_V8_INCLUDE_DIR "${_ubi_repo_local_v8_include}" CACHE PATH
+        "Path to V8 headers" FORCE)
+      set(NAPI_V8_LIBRARY "${_ubi_repo_local_v8_library}" CACHE FILEPATH
+        "Path to V8 runtime library (monolith/static/dynamic)" FORCE)
+      set(NAPI_V8_DEFINES "V8_COMPRESS_POINTERS" CACHE STRING
+        "Semicolon-separated V8 embedder compile definitions" FORCE)
+      if(APPLE)
+        set(NAPI_V8_EXTRA_LIBS "/System/Library/Frameworks/CoreFoundation.framework" CACHE STRING
+          "Semicolon-separated extra V8 libraries (e.g. libplatform/libbase)" FORCE)
+      endif()
+    endif()
+  endif()
   set(NAPI_V8_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${NAPI_V8_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/napi-v8")
 elseif(UBI_NAPI_PROVIDER STREQUAL "imports")
@@ -111,6 +138,109 @@ set(CARES_INSTALL OFF CACHE BOOL "" FORCE)
 set(CARES_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CARES_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PROJECT_ROOT}/deps/cares" "${CMAKE_CURRENT_BINARY_DIR}/deps/cares")
+
+set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_MINIZIP_BIN OFF CACHE BOOL "" FORCE)
+set(BUILD_ZPIPE OFF CACHE BOOL "" FORCE)
+set(BUILD_MINIGZIP OFF CACHE BOOL "" FORCE)
+add_subdirectory("${PROJECT_ROOT}/deps/zlib" "${CMAKE_CURRENT_BINARY_DIR}/deps/zlib")
+if(UBI_IS_WASIX_TARGET AND TARGET zlib_bench)
+  # zlib_bench links against the shared zlib target, which fails under WASIX
+  # static-linking constraints. Keep the libraries but skip the benchmark tool.
+  set_target_properties(zlib_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+find_package(Threads REQUIRED)
+
+add_library(ubi_brotli STATIC
+  "${PROJECT_ROOT}/deps/brotli/c/common/constants.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/context.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/dictionary.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/platform.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/shared_dictionary.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/transform.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/bit_reader.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/decode.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/huffman.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/prefix.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/state.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/static_init.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/backward_references.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/backward_references_hq.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/bit_cost.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/block_splitter.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/brotli_bit_stream.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/cluster.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/command.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/compound_dictionary.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/compress_fragment.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/compress_fragment_two_pass.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/dictionary_hash.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/encode.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/encoder_dict.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/entropy_encode.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/fast_log.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/histogram.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/literal_cost.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/memory.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/metablock.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/static_dict.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/static_dict_lut.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/static_init.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/utf8_util.c"
+)
+target_include_directories(ubi_brotli
+  PUBLIC
+    "${PROJECT_ROOT}/deps/brotli/c/include"
+)
+if(APPLE)
+  target_link_libraries(ubi_brotli PUBLIC m)
+elseif(UNIX)
+  target_link_libraries(ubi_brotli PUBLIC m)
+endif()
+
+add_library(ubi_zstd STATIC
+  "${PROJECT_ROOT}/deps/zstd/lib/common/debug.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/entropy_common.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/fse_decompress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/fse_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/huf_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/huf_decompress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/pool.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/threading.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/xxhash.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/zstd_common.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/error_private.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/hist.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress_literals.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress_sequences.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress_superblock.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_double_fast.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_fast.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_lazy.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_ldm.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_opt.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_preSplit.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstdmt_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/zstd_ddict.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/zstd_decompress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/zstd_decompress_block.c"
+)
+target_include_directories(ubi_zstd
+  PUBLIC
+    "${PROJECT_ROOT}/deps/zstd/lib"
+)
+target_compile_definitions(ubi_zstd
+  PUBLIC
+    XXH_NAMESPACE=ZSTD_
+    ZSTD_MULTITHREAD
+    ZSTD_DISABLE_ASM
+)
+target_link_libraries(ubi_zstd
+  PUBLIC
+    Threads::Threads
+)
 
 if(UBI_IS_WASIX_TARGET)
   set(UBI_OPENSSL_WASIX_ROOT
@@ -193,10 +323,6 @@ add_library(ubi_node_api STATIC
   src/node_api.cc
   src/unofficial_napi_testing_until_gc.cc
 )
-if(UBI_NAPI_PROVIDER STREQUAL "imports")
-  set_source_files_properties(src/node_api.cc PROPERTIES
-    COMPILE_DEFINITIONS "NAPI_EXTERN=")
-endif()
 
 add_library(ubi_ncrypto STATIC
   "${PROJECT_ROOT}/deps/ncrypto/ncrypto.cc"
@@ -221,6 +347,7 @@ add_library(ubi_simdjson STATIC
 add_library(ubi_ada STATIC
   "${PROJECT_ROOT}/deps/ada/ada.cpp"
 )
+target_compile_definitions(ubi_ada PUBLIC ADA_USE_UNSAFE_STD_REGEX_PROVIDER)
 target_include_directories(ubi_ada
   PUBLIC
     "${PROJECT_ROOT}/deps/ada"
@@ -359,6 +486,7 @@ add_library(ubi_runtime STATIC
   src/builtin_catalog.cc
   src/ubi_runtime.cc
   src/ubi_runtime_platform_v8.cc
+  src/ubi_node_compat.cc
   src/ubi_process.cc
   src/ubi_active_resource.cc
   src/ubi_module_loader.cc
@@ -398,6 +526,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_process_methods.cc
   src/internal_binding/binding_process_wrap.cc
   src/internal_binding/binding_report.cc
+  src/internal_binding/binding_sea.cc
   src/internal_binding/binding_serdes.cc
   src/internal_binding/binding_signal_wrap.cc
   src/internal_binding/binding_spawn_sync.cc
@@ -430,6 +559,7 @@ add_library(ubi_runtime STATIC
   src/ubi_path.cc
   src/ubi_encoding.cc
   src/ubi_string_decoder.cc
+  src/ubi_handle_wrap.cc
   src/ubi_async_wrap.cc
   src/ubi_http_parser.cc
   src/ubi_js_udp_wrap.cc
@@ -448,7 +578,9 @@ add_library(ubi_runtime STATIC
   src/ubi_cares_wrap.cc
   src/ubi_udp_wrap.cc
   src/ubi_url.cc
+  src/ubi_url_pattern.cc
   src/ubi_util.cc
+  src/ubi_worker_env.cc
   src/ubi_spawn_sync.cc
   src/ubi_timers_host.cc
   src/crypto/ubi_crypto_binding.cc
@@ -476,9 +608,12 @@ target_link_libraries(ubi_runtime
     ubi_simdutf
     ubi_ada
     ubi_ncrypto
+    ubi_brotli
+    ubi_zstd
     uv_a
     c-ares::cares
     OpenSSL::Crypto
+    zlibstatic
 )
 if(APPLE)
   target_link_libraries(ubi_runtime PRIVATE icucore)

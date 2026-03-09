@@ -942,6 +942,14 @@ extern "C" int snapi_bridge_create_sharedarraybuffer(uint32_t byte_length,
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_node_api_set_prototype(uint32_t object_id,
+                                                   uint32_t prototype_id) {
+  napi_value object = LoadValue(object_id);
+  napi_value prototype = LoadValue(prototype_id);
+  if (!object || !prototype) return napi_invalid_arg;
+  return node_api_set_prototype(g_env, object, prototype);
+}
+
 extern "C" int snapi_bridge_get_arraybuffer_info(uint32_t id,
                                                  uint64_t* data_out,
                                                  uint32_t* byte_length) {
@@ -1902,6 +1910,82 @@ extern "C" int snapi_bridge_unofficial_set_continuation_preserved_embedder_data(
   napi_value value = value_id == 0 ? nullptr : LoadValue(value_id);
   if (value_id != 0 && value == nullptr) return napi_invalid_arg;
   return unofficial_napi_set_continuation_preserved_embedder_data(g_env, value);
+}
+
+extern "C" int snapi_bridge_unofficial_set_fatal_error_callbacks(
+    uint32_t env_handle,
+    uint32_t /*fatal_callback_id*/,
+    uint32_t /*oom_callback_id*/) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_env == nullptr || env_handle != kUnofficialEnvHandle) return napi_invalid_arg;
+  return unofficial_napi_set_fatal_error_callbacks(g_env, nullptr, nullptr);
+}
+
+extern "C" int snapi_bridge_unofficial_terminate_execution(uint32_t env_handle) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_env == nullptr || env_handle != kUnofficialEnvHandle) return napi_invalid_arg;
+  return unofficial_napi_terminate_execution(g_env);
+}
+
+extern "C" int snapi_bridge_unofficial_enqueue_microtask(uint32_t env_handle,
+                                                         uint32_t callback_id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_env == nullptr || env_handle != kUnofficialEnvHandle) return napi_invalid_arg;
+  napi_value callback = LoadValue(callback_id);
+  if (callback == nullptr) return napi_invalid_arg;
+  return unofficial_napi_enqueue_microtask(g_env, callback);
+}
+
+extern "C" int snapi_bridge_unofficial_set_promise_reject_callback(uint32_t env_handle,
+                                                                   uint32_t callback_id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_env == nullptr || env_handle != kUnofficialEnvHandle) return napi_invalid_arg;
+  napi_value callback = callback_id == 0 ? nullptr : LoadValue(callback_id);
+  if (callback_id != 0 && callback == nullptr) return napi_invalid_arg;
+  return unofficial_napi_set_promise_reject_callback(g_env, callback);
+}
+
+extern "C" int snapi_bridge_unofficial_get_own_non_index_properties(
+    uint32_t env_handle,
+    uint32_t value_id,
+    uint32_t filter_bits,
+    uint32_t* out_id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_env == nullptr || env_handle != kUnofficialEnvHandle) return napi_invalid_arg;
+  napi_value value = LoadValue(value_id);
+  if (value == nullptr) return napi_invalid_arg;
+  napi_value result = nullptr;
+  napi_status s =
+      unofficial_napi_get_own_non_index_properties(g_env, value, filter_bits, &result);
+  if (s != napi_ok) return s;
+  if (out_id != nullptr) *out_id = StoreValue(result);
+  return napi_ok;
+}
+
+extern "C" int snapi_bridge_unofficial_get_process_memory_info(
+    uint32_t env_handle,
+    double* heap_total_out,
+    double* heap_used_out,
+    double* external_out,
+    double* array_buffers_out) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_env == nullptr || env_handle != kUnofficialEnvHandle) return napi_invalid_arg;
+  return unofficial_napi_get_process_memory_info(
+      g_env, heap_total_out, heap_used_out, external_out, array_buffers_out);
+}
+
+extern "C" int snapi_bridge_unofficial_structured_clone(uint32_t env_handle,
+                                                        uint32_t value_id,
+                                                        uint32_t* out_id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_env == nullptr || env_handle != kUnofficialEnvHandle) return napi_invalid_arg;
+  napi_value value = LoadValue(value_id);
+  if (value == nullptr) return napi_invalid_arg;
+  napi_value result = nullptr;
+  napi_status s = unofficial_napi_structured_clone(g_env, value, &result);
+  if (s != napi_ok) return s;
+  if (out_id != nullptr) *out_id = StoreValue(result);
+  return napi_ok;
 }
 
 extern "C" int snapi_bridge_unofficial_notify_datetime_configuration_change(

@@ -1,4 +1,5 @@
 #include "crypto/ubi_crypto_binding.h"
+#include "crypto/ubi_secure_context_bridge.h"
 
 #include <algorithm>
 #include <cctype>
@@ -250,7 +251,8 @@ napi_value MakeError(napi_env env, const char* code, const char* message) {
     if (std::strcmp(err_code, "ERR_INVALID_ARG_TYPE") == 0 ||
         std::strcmp(err_code, "ERR_INVALID_ARG_VALUE") == 0 ||
         std::strcmp(err_code, "ERR_CRYPTO_INVALID_DIGEST") == 0 ||
-        std::strcmp(err_code, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE") == 0) {
+        std::strcmp(err_code, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE") == 0 ||
+        std::strcmp(err_code, "ERR_CRYPTO_INVALID_AUTH_TAG") == 0) {
       return ErrorCtorKind::kTypeError;
     }
     if (std::strcmp(err_code, "ERR_OUT_OF_RANGE") == 0 ||
@@ -323,6 +325,42 @@ void ThrowOpenSslError(napi_env env, const char* code, unsigned long err, const 
   if (effective_code != nullptr &&
       std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
       reason != nullptr &&
+      std::strstr(reason, "pss saltlen too small") != nullptr) {
+    effective_code = "ERR_OSSL_PSS_SALTLEN_TOO_SMALL";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
+      std::strstr(reason, "bad decrypt") != nullptr) {
+    effective_code = "ERR_OSSL_BAD_DECRYPT";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
+      std::strstr(reason, "wrong final block length") != nullptr) {
+    effective_code = "ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
+      std::strstr(reason, "data not multiple of block length") != nullptr) {
+    effective_code = "ERR_OSSL_DATA_NOT_MULTIPLE_OF_BLOCK_LENGTH";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
+      std::strstr(reason, "oaep decoding error") != nullptr) {
+    effective_code = "ERR_OSSL_RSA_OAEP_DECODING_ERROR";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
+      std::strstr(reason, "bignum too long") != nullptr) {
+    effective_code = "ERR_OSSL_BN_BIGNUM_TOO_LONG";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
       std::strstr(reason, "illegal or unsupported padding mode") != nullptr) {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
     effective_code = "ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE";
@@ -361,9 +399,32 @@ void ThrowError(napi_env env, const char* code, const char* message) {
   if (err != nullptr) napi_throw(env, err);
 }
 
+int OpenSslErrorPriority(unsigned long err) {
+  if (err == 0) return -1;
+  const char* reason = ERR_reason_error_string(err);
+  if (reason == nullptr) return 0;
+  if (std::strstr(reason, "bad decrypt") != nullptr) return 110;
+  if (std::strstr(reason, "wrong final block length") != nullptr) return 108;
+  if (std::strstr(reason, "data not multiple of block length") != nullptr) return 107;
+  if (std::strstr(reason, "bignum too long") != nullptr) return 106;
+  if (std::strstr(reason, "pss saltlen too small") != nullptr) return 100;
+  if (std::strstr(reason, "interrupted or cancelled") != nullptr) return 90;
+  if (std::strstr(reason, "illegal or unsupported padding mode") != nullptr) return 80;
+  return 0;
+}
+
 void ThrowLastOpenSslError(napi_env env, const char* fallback_code, const char* fallback_message) {
-  const unsigned long err = ERR_get_error();
-  ThrowOpenSslError(env, fallback_code, err, fallback_message);
+  unsigned long err = 0;
+  unsigned long selected = 0;
+  int selected_priority = -1;
+  while ((err = ERR_get_error()) != 0) {
+    const int priority = OpenSslErrorPriority(err);
+    if (selected == 0 || priority > selected_priority) {
+      selected = err;
+      selected_priority = priority;
+    }
+  }
+  ThrowOpenSslError(env, fallback_code, selected, fallback_message);
 }
 
 ncrypto::Digest ResolveDigest(const std::string& name) {
@@ -385,14 +446,6 @@ std::string CanonicalizeDigestName(const std::string& in) {
   return out;
 }
 
-struct SecureContextHolder {
-  explicit SecureContextHolder(SSL_CTX* in_ctx) : ctx(in_ctx) {}
-  ~SecureContextHolder() {
-    if (ctx != nullptr) SSL_CTX_free(ctx);
-  }
-  SSL_CTX* ctx = nullptr;
-};
-
 void SecureContextFinalizer(napi_env env, void* data, void* hint) {
   (void)env;
   (void)hint;
@@ -400,13 +453,40 @@ void SecureContextFinalizer(napi_env env, void* data, void* hint) {
   delete holder;
 }
 
-bool GetSecureContextHolder(napi_env env, napi_value value, SecureContextHolder** out) {
-  if (out == nullptr) return false;
-  *out = nullptr;
-  void* raw = nullptr;
-  if (napi_get_value_external(env, value, &raw) != napi_ok || raw == nullptr) return false;
-  *out = reinterpret_cast<SecureContextHolder*>(raw);
-  return true;
+void ResetStoredCertificate(X509** slot, X509* cert) {
+  if (slot == nullptr) return;
+  if (*slot != nullptr) {
+    X509_free(*slot);
+    *slot = nullptr;
+  }
+  if (cert != nullptr) {
+    *slot = X509_dup(cert);
+  }
+}
+
+void UpdateIssuerFromStore(SecureContextHolder* holder) {
+  if (holder == nullptr || holder->ctx == nullptr || holder->cert == nullptr) return;
+
+  ResetStoredCertificate(&holder->issuer, nullptr);
+
+  X509_STORE* store = SSL_CTX_get_cert_store(holder->ctx);
+  if (store == nullptr) return;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+  X509_STORE_CTX* store_ctx = X509_STORE_CTX_new();
+  if (store_ctx == nullptr) return;
+  if (X509_STORE_CTX_init(store_ctx, store, holder->cert, nullptr) != 1) {
+    X509_STORE_CTX_free(store_ctx);
+    return;
+  }
+
+  X509* issuer = nullptr;
+  if (X509_STORE_CTX_get1_issuer(&issuer, store_ctx, holder->cert) == 1 && issuer != nullptr) {
+    ResetStoredCertificate(&holder->issuer, issuer);
+    X509_free(issuer);
+  }
+  X509_STORE_CTX_free(store_ctx);
+#endif
 }
 
 X509* ParseX509(const uint8_t* data, size_t len);
@@ -423,6 +503,16 @@ napi_value CreateBufferCopy(napi_env env, const uint8_t* data, size_t len) {
 
 napi_value CreateBufferCopy(napi_env env, const ncrypto::DataPointer& dp) {
   return CreateBufferCopy(env, dp.get<uint8_t>(), dp.size());
+}
+
+napi_value CreateX509DerBuffer(napi_env env, X509* cert) {
+  if (cert == nullptr) return nullptr;
+  const int size = i2d_X509(cert, nullptr);
+  if (size <= 0) return nullptr;
+  std::vector<uint8_t> out(static_cast<size_t>(size));
+  unsigned char* write_ptr = out.data();
+  if (i2d_X509(cert, &write_ptr) != size) return nullptr;
+  return CreateBufferCopy(env, out.data(), out.size());
 }
 
 napi_value CryptoHashOneShot(napi_env env, napi_callback_info info) {
@@ -482,6 +572,27 @@ napi_value CryptoHashOneShotXof(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_HASH_UNKNOWN", "Unknown hash");
     return nullptr;
   }
+  const bool is_xof = (EVP_MD_flags(md.get()) & EVP_MD_FLAG_XOF) != 0;
+  if (!is_xof) {
+    const size_t digest_size = md.size();
+    if (static_cast<size_t>(out_len_i32) != digest_size) {
+      const std::string message =
+          "Output length " + std::to_string(out_len_i32) + " is invalid for " + algo +
+          ", which does not support XOF";
+      ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", message.c_str());
+      return nullptr;
+    }
+    auto out = ncrypto::hashDigest({in, in_len}, md.get());
+    if (!out) {
+      ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Hash operation failed");
+      return nullptr;
+    }
+    return CreateBufferCopy(env, out);
+  }
+  if (out_len_i32 == 0) {
+    return CreateBufferCopy(env, nullptr, 0);
+  }
+
   auto out = ncrypto::xofHashDigest({in, in_len}, md.get(), static_cast<size_t>(out_len_i32));
   if (!out) {
     ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Hash operation failed");
@@ -705,8 +816,8 @@ napi_value CryptoHkdfSync(napi_env env, napi_callback_info info) {
 }
 
 napi_value CryptoCipherTransform(napi_env env, napi_callback_info info) {
-  size_t argc = 6;
-  napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  size_t argc = 7;
+  napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 6) return nullptr;
   const std::string algo = ValueToUtf8(env, argv[0]);
   uint8_t *key = nullptr, *iv = nullptr, *input = nullptr;
@@ -730,6 +841,8 @@ napi_value CryptoCipherTransform(napi_env env, napi_callback_info info) {
   }
   bool decrypt = false;
   napi_get_value_bool(env, argv[4], &decrypt);
+  bool auto_padding = true;
+  if (argc >= 7 && argv[6] != nullptr) napi_get_value_bool(env, argv[6], &auto_padding);
 
   const ncrypto::Cipher cipher = ResolveCipher(algo);
   if (!cipher) {
@@ -747,7 +860,11 @@ napi_value CryptoCipherTransform(napi_env env, napi_callback_info info) {
 
   auto ctx = ncrypto::CipherCtxPointer::New();
   if (!ctx || !ctx.init(cipher, !decrypt, key, iv_is_null ? nullptr : iv)) {
-    ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "cipher initialization failed");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "cipher initialization failed");
+    return nullptr;
+  }
+  if (!ctx.setPadding(auto_padding)) {
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "cipher initialization failed");
     return nullptr;
   }
 
@@ -756,7 +873,7 @@ napi_value CryptoCipherTransform(napi_env env, napi_callback_info info) {
   int out2 = 0;
   if (!ctx.update({input, in_len}, out.data(), &out1, false) ||
       !ctx.update({nullptr, 0}, out.data() + out1, &out2, true)) {
-    ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "cipher operation failed");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "cipher operation failed");
     return nullptr;
   }
   return CreateBufferCopy(env, out.data(), static_cast<size_t>(out1 + out2));
@@ -1091,6 +1208,52 @@ napi_value CryptoSecureContextInit(napi_env env, napi_callback_info info) {
   return true_v;
 }
 
+napi_value CryptoSecureContextSetMinProto(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  int32_t min_version = 0;
+  if (napi_get_value_int32(env, argv[1], &min_version) != napi_ok) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "min protocol version must be an integer");
+    return nullptr;
+  }
+  if (SSL_CTX_set_min_proto_version(holder->ctx, min_version) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_PROTOCOL_VERSION", "Failed to set min protocol version");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetMaxProto(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  int32_t max_version = 0;
+  if (napi_get_value_int32(env, argv[1], &max_version) != napi_ok) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "max protocol version must be an integer");
+    return nullptr;
+  }
+  if (SSL_CTX_set_max_proto_version(holder->ctx, max_version) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_PROTOCOL_VERSION", "Failed to set max protocol version");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
 napi_value CryptoSecureContextSetOptions(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
@@ -1122,7 +1285,13 @@ napi_value CryptoSecureContextSetCiphers(napi_env env, napi_callback_info info) 
   }
   const std::string ciphers = ValueToUtf8(env, argv[1]);
   if (SSL_CTX_set_cipher_list(holder->ctx, ciphers.c_str()) != 1) {
-    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CIPHER", "Failed to set ciphers");
+    const unsigned long err = ERR_get_error();
+    if (ciphers.empty() && ERR_GET_REASON(err) == SSL_R_NO_CIPHER_MATCH) {
+      napi_value true_v = nullptr;
+      napi_get_boolean(env, true, &true_v);
+      return true_v;
+    }
+    ThrowOpenSslError(env, "ERR_TLS_INVALID_CIPHER", err, "Failed to set ciphers");
     return nullptr;
   }
   napi_value true_v = nullptr;
@@ -1175,6 +1344,10 @@ napi_value CryptoSecureContextSetCert(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   const int ok = SSL_CTX_use_certificate(holder->ctx, cert);
+  if (ok == 1) {
+    ResetStoredCertificate(&holder->cert, cert);
+    UpdateIssuerFromStore(holder);
+  }
   X509_free(cert);
   if (ok != 1) {
     ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to use certificate");
@@ -1261,6 +1434,8 @@ napi_value CryptoSecureContextAddCACert(napi_env env, napi_callback_info info) {
     ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to add CA certificate");
     return nullptr;
   }
+  (void)SSL_CTX_add_client_CA(holder->ctx, cert);
+  UpdateIssuerFromStore(holder);
   X509_free(cert);
   napi_value true_v = nullptr;
   napi_get_boolean(env, true, &true_v);
@@ -1299,6 +1474,180 @@ napi_value CryptoSecureContextAddCrl(napi_env env, napi_callback_info info) {
   napi_value true_v = nullptr;
   napi_get_boolean(env, true, &true_v);
   return true_v;
+}
+
+napi_value CryptoSecureContextAddRootCerts(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  if (SSL_CTX_set_default_verify_paths(holder->ctx) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to load default CA certificates");
+    return nullptr;
+  }
+  UpdateIssuerFromStore(holder);
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetAllowPartialTrustChain(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  X509_STORE* store = SSL_CTX_get_cert_store(holder->ctx);
+  if (store == nullptr || X509_STORE_set_flags(store, X509_V_FLAG_PARTIAL_CHAIN) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to update certificate store flags");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetSessionIdContext(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  const std::string session_id_context = ValueToUtf8(env, argv[1]);
+  const auto* data = reinterpret_cast<const unsigned char*>(session_id_context.data());
+  if (SSL_CTX_set_session_id_context(holder->ctx, data, session_id_context.size()) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to set session id context");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetSessionTimeout(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  int32_t timeout = 0;
+  if (napi_get_value_int32(env, argv[1], &timeout) != napi_ok || timeout < 0) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "session timeout must be a non-negative integer");
+    return nullptr;
+  }
+  SSL_CTX_set_timeout(holder->ctx, static_cast<long>(timeout));
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetTicketKeys(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  uint8_t* data = nullptr;
+  size_t len = 0;
+  if (!GetBufferBytes(env, argv[1], &data, &len) || len != 48) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "ticket keys must be a 48-byte Buffer");
+    return nullptr;
+  }
+  holder->ticket_keys.assign(data, data + len);
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetSigalgs(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  const std::string sigalgs = ValueToUtf8(env, argv[1]);
+  if (sigalgs.empty() || SSL_CTX_set1_sigalgs_list(holder->ctx, sigalgs.c_str()) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to set signature algorithms");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetECDHCurve(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  const std::string curve = ValueToUtf8(env, argv[1]);
+  if (curve.empty() || curve == "auto") {
+    napi_value true_v = nullptr;
+    napi_get_boolean(env, true, &true_v);
+    return true_v;
+  }
+  if (SSL_CTX_set1_curves_list(holder->ctx, curve.c_str()) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to set ECDH curve");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextGetCertificate(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  napi_value out = CreateX509DerBuffer(env, holder->cert);
+  if (out == nullptr) {
+    napi_get_null(env, &out);
+  }
+  return out;
+}
+
+napi_value CryptoSecureContextGetIssuer(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  napi_value out = CreateX509DerBuffer(env, holder->issuer);
+  if (out == nullptr) {
+    napi_get_null(env, &out);
+  }
+  return out;
 }
 
 EVP_PKEY* ParsePrivateKeyWithPassphrase(const uint8_t* data,
@@ -1607,25 +1956,46 @@ napi_value CryptoGetAsymmetricKeyDetails(napi_env env, napi_callback_info info) 
     }
 
     if (pkey_type == EVP_PKEY_RSA_PSS) {
-      char hash_name[64];
-      size_t hash_name_len = 0;
-      if (EVP_PKEY_get_utf8_string_param(
-              pkey, OSSL_PKEY_PARAM_RSA_DIGEST, hash_name, sizeof(hash_name), &hash_name_len) == 1 &&
-          hash_name_len > 0) {
-        set_string("hashAlgorithm", normalize_digest_name(std::string(hash_name, hash_name_len)));
-      }
+      RSA* rsa = EVP_PKEY_get1_RSA(pkey);
+      if (rsa != nullptr) {
+        const RSA_PSS_PARAMS* params = RSA_get0_pss_params(rsa);
+        if (params != nullptr) {
+          std::string hash_algorithm = "sha1";
+          if (params->hashAlgorithm != nullptr) {
+            const ASN1_OBJECT* hash_obj = nullptr;
+            X509_ALGOR_get0(&hash_obj, nullptr, nullptr, params->hashAlgorithm);
+            if (hash_obj != nullptr) {
+              hash_algorithm = normalize_digest_name(OBJ_nid2ln(OBJ_obj2nid(hash_obj)));
+            }
+          }
 
-      char mgf1_name[64];
-      size_t mgf1_name_len = 0;
-      if (EVP_PKEY_get_utf8_string_param(
-              pkey, OSSL_PKEY_PARAM_RSA_MGF1_DIGEST, mgf1_name, sizeof(mgf1_name), &mgf1_name_len) == 1 &&
-          mgf1_name_len > 0) {
-        set_string("mgf1HashAlgorithm", normalize_digest_name(std::string(mgf1_name, mgf1_name_len)));
-      }
+          std::string mgf1_hash_algorithm = hash_algorithm;
+          if (params->maskGenAlgorithm != nullptr) {
+            const ASN1_OBJECT* mgf_obj = nullptr;
+            X509_ALGOR_get0(&mgf_obj, nullptr, nullptr, params->maskGenAlgorithm);
+            if (mgf_obj != nullptr && OBJ_obj2nid(mgf_obj) == NID_mgf1 && params->maskHash != nullptr) {
+              const ASN1_OBJECT* mgf1_hash_obj = nullptr;
+              X509_ALGOR_get0(&mgf1_hash_obj, nullptr, nullptr, params->maskHash);
+              if (mgf1_hash_obj != nullptr) {
+                mgf1_hash_algorithm = normalize_digest_name(OBJ_nid2ln(OBJ_obj2nid(mgf1_hash_obj)));
+              }
+            }
+          }
 
-      int salt_len = -1;
-      if (EVP_PKEY_get_int_param(pkey, OSSL_PKEY_PARAM_RSA_PSS_SALTLEN, &salt_len) == 1 && salt_len >= 0) {
-        set_int32("saltLength", salt_len);
+          int64_t salt_len = 20;
+          if (params->saltLength != nullptr) {
+            if (ASN1_INTEGER_get_int64(&salt_len, params->saltLength) != 1) {
+              salt_len = -1;
+            }
+          }
+
+          set_string("hashAlgorithm", hash_algorithm);
+          set_string("mgf1HashAlgorithm", mgf1_hash_algorithm);
+          if (salt_len >= 0) {
+            set_int32("saltLength", static_cast<int32_t>(salt_len));
+          }
+        }
+        RSA_free(rsa);
       }
     }
   } else if (pkey_type == EVP_PKEY_DSA) {
@@ -1717,6 +2087,11 @@ napi_value CryptoPublicEncrypt(napi_env env, napi_callback_info info) {
       hash_type == napi_string) {
     oaep_hash = ValueToUtf8(env, argv[6]);
   }
+  const EVP_MD* oaep_md = (padding == RSA_PKCS1_OAEP_PADDING) ? EVP_get_digestbyname(oaep_hash.c_str()) : nullptr;
+  if (padding == RSA_PKCS1_OAEP_PADDING && oaep_md == nullptr) {
+    ThrowError(env, "ERR_OSSL_EVP_INVALID_DIGEST", "Invalid digest used");
+    return nullptr;
+  }
   uint8_t* label = nullptr;
   size_t label_len = 0;
   bool has_label = (argc >= 8 && argv[7] != nullptr && GetBufferBytes(env, argv[7], &label, &label_len));
@@ -1742,12 +2117,11 @@ napi_value CryptoPublicEncrypt(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   if (padding == RSA_PKCS1_OAEP_PADDING) {
-    const EVP_MD* md = EVP_get_digestbyname(oaep_hash.c_str());
-    if (md == nullptr || EVP_PKEY_CTX_set_rsa_oaep_md(ctx, md) != 1 ||
-        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md) != 1) {
+    if (EVP_PKEY_CTX_set_rsa_oaep_md(ctx, oaep_md) != 1 ||
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, oaep_md) != 1) {
       EVP_PKEY_CTX_free(ctx);
       EVP_PKEY_free(pkey);
-      ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_DIGEST", "Invalid OAEP digest");
+      ThrowLastOpenSslError(env, "ERR_OSSL_EVP_INVALID_DIGEST", "Invalid digest used");
       return nullptr;
     }
     if (has_label && label_len > 0) {
@@ -1787,6 +2161,53 @@ napi_value CryptoPublicEncrypt(napi_env env, napi_callback_info info) {
   return CreateBufferCopy(env, out.data(), out_len);
 }
 
+napi_value CryptoPrivateEncrypt(napi_env env, napi_callback_info info) {
+  size_t argc = 8;
+  napi_value argv[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 5) return nullptr;
+  std::vector<uint8_t> owned_key;
+  uint8_t* key_bytes = nullptr;
+  size_t key_len = 0;
+  uint8_t* input = nullptr;
+  size_t in_len = 0;
+  if (!GetKeyBytes(env, argv[0], &owned_key, &key_bytes, &key_len) ||
+      !GetBufferBytes(env, argv[4], &input, &in_len)) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "key and buffer must be Buffers or strings");
+    return nullptr;
+  }
+
+  std::string passphrase;
+  bool has_passphrase = false;
+  if (argc >= 4 && argv[3] != nullptr && !ReadPassphrase(env, argv[3], &passphrase, &has_passphrase)) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "Invalid key passphrase");
+    return nullptr;
+  }
+
+  int32_t padding = RSA_PKCS1_PADDING;
+  if (argc >= 6 && argv[5] != nullptr) napi_get_value_int32(env, argv[5], &padding);
+
+  EVP_PKEY* pkey = ParsePrivateKeyWithPassphrase(key_bytes, key_len, passphrase, has_passphrase);
+  if (pkey == nullptr) {
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid private key");
+    return nullptr;
+  }
+  RSA* rsa = EVP_PKEY_get1_RSA(pkey);
+  EVP_PKEY_free(pkey);
+  if (rsa == nullptr) {
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid private key");
+    return nullptr;
+  }
+
+  std::vector<uint8_t> out(static_cast<size_t>(RSA_size(rsa)));
+  const int written = RSA_private_encrypt(static_cast<int>(in_len), input, out.data(), rsa, padding);
+  RSA_free(rsa);
+  if (written < 0) {
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "privateEncrypt failed");
+    return nullptr;
+  }
+  return CreateBufferCopy(env, out.data(), static_cast<size_t>(written));
+}
+
 napi_value CryptoPrivateDecrypt(napi_env env, napi_callback_info info) {
   size_t argc = 8;
   napi_value argv[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -1809,6 +2230,11 @@ napi_value CryptoPrivateDecrypt(napi_env env, napi_callback_info info) {
       napi_typeof(env, argv[6], &hash_type) == napi_ok &&
       hash_type == napi_string) {
     oaep_hash = ValueToUtf8(env, argv[6]);
+  }
+  const EVP_MD* oaep_md = (padding == RSA_PKCS1_OAEP_PADDING) ? EVP_get_digestbyname(oaep_hash.c_str()) : nullptr;
+  if (padding == RSA_PKCS1_OAEP_PADDING && oaep_md == nullptr) {
+    ThrowError(env, "ERR_OSSL_EVP_INVALID_DIGEST", "Invalid digest used");
+    return nullptr;
   }
   uint8_t* label = nullptr;
   size_t label_len = 0;
@@ -1835,12 +2261,11 @@ napi_value CryptoPrivateDecrypt(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   if (padding == RSA_PKCS1_OAEP_PADDING) {
-    const EVP_MD* md = EVP_get_digestbyname(oaep_hash.c_str());
-    if (md == nullptr || EVP_PKEY_CTX_set_rsa_oaep_md(ctx, md) != 1 ||
-        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md) != 1) {
+    if (EVP_PKEY_CTX_set_rsa_oaep_md(ctx, oaep_md) != 1 ||
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, oaep_md) != 1) {
       EVP_PKEY_CTX_free(ctx);
       EVP_PKEY_free(pkey);
-      ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_DIGEST", "Invalid OAEP digest");
+      ThrowLastOpenSslError(env, "ERR_OSSL_EVP_INVALID_DIGEST", "Invalid digest used");
       return nullptr;
     }
     if (has_label && label_len > 0) {
@@ -1880,6 +2305,54 @@ napi_value CryptoPrivateDecrypt(napi_env env, napi_callback_info info) {
   return CreateBufferCopy(env, out.data(), out_len);
 }
 
+napi_value CryptoPublicDecrypt(napi_env env, napi_callback_info info) {
+  size_t argc = 8;
+  napi_value argv[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 5) return nullptr;
+  std::vector<uint8_t> owned_key;
+  uint8_t* key_bytes = nullptr;
+  size_t key_len = 0;
+  uint8_t* input = nullptr;
+  size_t in_len = 0;
+  if (!GetKeyBytes(env, argv[0], &owned_key, &key_bytes, &key_len) ||
+      !GetBufferBytes(env, argv[4], &input, &in_len)) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "key and buffer must be Buffers or strings");
+    return nullptr;
+  }
+
+  std::string passphrase;
+  bool has_passphrase = false;
+  if (argc >= 4 && argv[3] != nullptr && !ReadPassphrase(env, argv[3], &passphrase, &has_passphrase)) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "Invalid key passphrase");
+    return nullptr;
+  }
+
+  int32_t padding = RSA_PKCS1_PADDING;
+  if (argc >= 6 && argv[5] != nullptr) napi_get_value_int32(env, argv[5], &padding);
+
+  EVP_PKEY* pkey = ParsePublicKeyOrCert(key_bytes, key_len);
+  if (pkey == nullptr) pkey = ParsePrivateKeyWithPassphrase(key_bytes, key_len, passphrase, has_passphrase);
+  if (pkey == nullptr) {
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid public key");
+    return nullptr;
+  }
+  RSA* rsa = EVP_PKEY_get1_RSA(pkey);
+  EVP_PKEY_free(pkey);
+  if (rsa == nullptr) {
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid public key");
+    return nullptr;
+  }
+
+  std::vector<uint8_t> out(static_cast<size_t>(RSA_size(rsa)));
+  const int written = RSA_public_decrypt(static_cast<int>(in_len), input, out.data(), rsa, padding);
+  RSA_free(rsa);
+  if (written < 0) {
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "publicDecrypt failed");
+    return nullptr;
+  }
+  return CreateBufferCopy(env, out.data(), static_cast<size_t>(written));
+}
+
 napi_value CryptoCipherTransformAead(napi_env env, napi_callback_info info) {
   size_t argc = 8;
   napi_value argv[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -1917,6 +2390,9 @@ napi_value CryptoCipherTransformAead(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_UNKNOWN_CIPHER", "Unknown cipher");
     return nullptr;
   }
+  const ncrypto::Cipher resolved = ResolveCipher(algo);
+  const bool is_ccm = resolved && resolved.isCcmMode();
+  const bool is_ocb = resolved && resolved.isOcbMode();
   EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
   if (ctx == nullptr) {
     ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to create cipher context");
@@ -1924,10 +2400,15 @@ napi_value CryptoCipherTransformAead(napi_env env, napi_callback_info info) {
   }
   int ok = EVP_CipherInit_ex(ctx, cipher, nullptr, nullptr, nullptr, decrypt ? 0 : 1);
   if (ok == 1) ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, static_cast<int>(iv_len), nullptr);
+  if (ok == 1 && (is_ccm || is_ocb) && requested_tag_len > 0) {
+    void* tag_ptr = (is_ccm && decrypt && auth_tag != nullptr) ? auth_tag : nullptr;
+    ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, requested_tag_len, tag_ptr);
+  }
   if (ok == 1) ok = EVP_CipherInit_ex(ctx, nullptr, nullptr, key, iv, decrypt ? 0 : 1);
   int tmp_len = 0;
+  if (ok == 1 && is_ccm) ok = EVP_CipherUpdate(ctx, nullptr, &tmp_len, nullptr, static_cast<int>(in_len));
   if (ok == 1 && aad_len > 0) ok = EVP_CipherUpdate(ctx, nullptr, &tmp_len, aad, static_cast<int>(aad_len));
-  if (ok == 1 && decrypt && auth_tag != nullptr) {
+  if (ok == 1 && decrypt && auth_tag != nullptr && !is_ccm) {
     ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, static_cast<int>(auth_tag_len), auth_tag);
   }
   std::vector<uint8_t> out(in_len + 32);
@@ -1946,7 +2427,12 @@ napi_value CryptoCipherTransformAead(napi_env env, napi_callback_info info) {
   }
   EVP_CIPHER_CTX_free(ctx);
   if (ok != 1) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "AEAD cipher operation failed");
+    if (decrypt) {
+      ERR_clear_error();
+      ThrowError(env, "ERR_CRYPTO_INVALID_STATE", "Unsupported state or unable to authenticate data");
+    } else {
+      ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "AEAD cipher operation failed");
+    }
     return nullptr;
   }
   napi_value result = nullptr;
@@ -2081,6 +2567,71 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
     return nullptr;
   }
+  int effective_padding = padding;
+  if (is_rsa_family && effective_padding == 0 && pkey_type == EVP_PKEY_RSA_PSS) {
+    // RSA-PSS keys require PSS padding even when callers omit padding.
+    effective_padding = RSA_PKCS1_PSS_PADDING;
+  }
+  if (is_rsa_family && !null_digest) {
+    std::vector<uint8_t> digest;
+    const int digest_len = EVP_MD_get_size(md.get());
+    bool ok = digest_len > 0 &&
+              EVP_DigestInit_ex(mctx, md.get(), nullptr) == 1 &&
+              EVP_DigestUpdate(mctx, data, data_len) == 1;
+    if (ok) {
+      unsigned int written = 0;
+      digest.resize(static_cast<size_t>(digest_len));
+      ok = EVP_DigestFinal_ex(mctx, digest.data(), &written) == 1;
+      if (ok) digest.resize(written);
+    }
+    EVP_MD_CTX_free(mctx);
+    if (!ok) {
+      EVP_PKEY_free(pkey);
+      ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "sign failed");
+      return nullptr;
+    }
+
+    EVP_PKEY_CTX* sign_ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    ok = sign_ctx != nullptr && EVP_PKEY_sign_init(sign_ctx) == 1;
+    if (ok && effective_padding != 0) {
+      ok = EVP_PKEY_CTX_set_rsa_padding(sign_ctx, effective_padding) == 1;
+      if (ok && effective_padding == RSA_PKCS1_PSS_PADDING && salt_len != INT32_MIN) {
+        ok = EVP_PKEY_CTX_set_rsa_pss_saltlen(sign_ctx, salt_len) == 1;
+      }
+    }
+    if (ok) {
+      ok = EVP_PKEY_CTX_set_signature_md(sign_ctx, md.get()) == 1;
+    }
+
+    size_t sig_len = 0;
+    std::vector<uint8_t> sig;
+    if (ok) ok = EVP_PKEY_sign(sign_ctx, nullptr, &sig_len, digest.data(), digest.size()) == 1;
+    if (ok) {
+      sig.resize(sig_len);
+      ok = EVP_PKEY_sign(sign_ctx, sig.data(), &sig_len, digest.data(), digest.size()) == 1;
+    }
+    if (sign_ctx != nullptr) EVP_PKEY_CTX_free(sign_ctx);
+
+    if (!ok) {
+      EVP_PKEY_free(pkey);
+      ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "sign failed");
+      return nullptr;
+    }
+
+    if (dsa_sig_enc == 1 && (pkey_type == EVP_PKEY_EC || pkey_type == EVP_PKEY_DSA)) {
+      const size_t part_len = GetDsaSigPartLengthFromPkey(pkey);
+      std::vector<uint8_t> p1363;
+      if (part_len == 0 || !DerSignatureToP1363(sig.data(), sig_len, part_len, &p1363)) {
+        EVP_PKEY_free(pkey);
+        ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Malformed signature");
+        return nullptr;
+      }
+      sig = std::move(p1363);
+      sig_len = sig.size();
+    }
+    EVP_PKEY_free(pkey);
+    return CreateBufferCopy(env, sig.data(), sig_len);
+  }
   EVP_PKEY_CTX* pctx = nullptr;
   bool ok = false;
 #ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
@@ -2117,11 +2668,6 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
   }
   ok = EVP_DigestSignInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
 #endif
-  int effective_padding = padding;
-  if (is_rsa_family && effective_padding == 0 && pkey_type == EVP_PKEY_RSA_PSS) {
-    // RSA-PSS keys require PSS padding even when callers omit padding.
-    effective_padding = RSA_PKCS1_PSS_PADDING;
-  }
   if (ok && pctx != nullptr && is_rsa_family && effective_padding != 0) {
     ok = EVP_PKEY_CTX_set_rsa_padding(pctx, effective_padding) == 1;
     if (ok && effective_padding == RSA_PKCS1_PSS_PADDING && salt_len != INT32_MIN) {
@@ -2309,6 +2855,58 @@ napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
     return nullptr;
   }
+  int effective_padding = padding;
+  if (is_rsa_family && effective_padding == 0 && pkey_type == EVP_PKEY_RSA_PSS) {
+    effective_padding = RSA_PKCS1_PSS_PADDING;
+  }
+  if (is_rsa_family && !null_digest) {
+    std::vector<uint8_t> digest;
+    const int digest_len = EVP_MD_get_size(md.get());
+    bool ok = digest_len > 0 &&
+              EVP_DigestInit_ex(mctx, md.get(), nullptr) == 1 &&
+              EVP_DigestUpdate(mctx, data, data_len) == 1;
+    if (ok) {
+      unsigned int written = 0;
+      digest.resize(static_cast<size_t>(digest_len));
+      ok = EVP_DigestFinal_ex(mctx, digest.data(), &written) == 1;
+      if (ok) digest.resize(written);
+    }
+    EVP_MD_CTX_free(mctx);
+    if (!ok) {
+      EVP_PKEY_free(pkey);
+      ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "verify failed");
+      return nullptr;
+    }
+
+    EVP_PKEY_CTX* verify_ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    ok = verify_ctx != nullptr && EVP_PKEY_verify_init(verify_ctx) == 1;
+    if (ok && effective_padding != 0) {
+      ok = EVP_PKEY_CTX_set_rsa_padding(verify_ctx, effective_padding) == 1;
+      if (ok && effective_padding == RSA_PKCS1_PSS_PADDING && salt_len != INT32_MIN) {
+        ok = EVP_PKEY_CTX_set_rsa_pss_saltlen(verify_ctx, salt_len) == 1;
+      }
+    }
+    if (ok) {
+      ok = EVP_PKEY_CTX_set_signature_md(verify_ctx, md.get()) == 1;
+    }
+
+    int vr = 0;
+    if (ok) {
+      vr = EVP_PKEY_verify(verify_ctx, sig, sig_len, digest.data(), digest.size());
+    }
+    if (verify_ctx != nullptr) EVP_PKEY_CTX_free(verify_ctx);
+    EVP_PKEY_free(pkey);
+
+    if (!ok) {
+      ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "verify failed");
+      return nullptr;
+    }
+    if (vr != 1) ERR_clear_error();
+
+    napi_value out = nullptr;
+    napi_get_boolean(env, vr == 1, &out);
+    return out;
+  }
   EVP_PKEY_CTX* pctx = nullptr;
   bool ok = false;
 #ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
@@ -2345,10 +2943,6 @@ napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
   }
   ok = EVP_DigestVerifyInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
 #endif
-  int effective_padding = padding;
-  if (is_rsa_family && effective_padding == 0 && pkey_type == EVP_PKEY_RSA_PSS) {
-    effective_padding = RSA_PKCS1_PSS_PADDING;
-  }
   if (ok && pctx != nullptr && is_rsa_family && effective_padding != 0) {
     ok = EVP_PKEY_CTX_set_rsa_padding(pctx, effective_padding) == 1;
     if (ok && effective_padding == RSA_PKCS1_PSS_PADDING && salt_len != INT32_MIN) {
@@ -2414,6 +3008,8 @@ napi_value InstallCryptoBinding(napi_env env) {
   SetMethod(env, binding, "parseCrl", CryptoParseCrl);
   SetMethod(env, binding, "secureContextCreate", CryptoSecureContextCreate);
   SetMethod(env, binding, "secureContextInit", CryptoSecureContextInit);
+  SetMethod(env, binding, "secureContextSetMinProto", CryptoSecureContextSetMinProto);
+  SetMethod(env, binding, "secureContextSetMaxProto", CryptoSecureContextSetMaxProto);
   SetMethod(env, binding, "secureContextSetOptions", CryptoSecureContextSetOptions);
   SetMethod(env, binding, "secureContextSetCiphers", CryptoSecureContextSetCiphers);
   SetMethod(env, binding, "secureContextSetCipherSuites", CryptoSecureContextSetCipherSuites);
@@ -2421,12 +3017,23 @@ napi_value InstallCryptoBinding(napi_env env) {
   SetMethod(env, binding, "secureContextSetKey", CryptoSecureContextSetKey);
   SetMethod(env, binding, "secureContextAddCACert", CryptoSecureContextAddCACert);
   SetMethod(env, binding, "secureContextAddCrl", CryptoSecureContextAddCrl);
+  SetMethod(env, binding, "secureContextAddRootCerts", CryptoSecureContextAddRootCerts);
+  SetMethod(env, binding, "secureContextSetAllowPartialTrustChain", CryptoSecureContextSetAllowPartialTrustChain);
+  SetMethod(env, binding, "secureContextSetSessionIdContext", CryptoSecureContextSetSessionIdContext);
+  SetMethod(env, binding, "secureContextSetSessionTimeout", CryptoSecureContextSetSessionTimeout);
+  SetMethod(env, binding, "secureContextSetTicketKeys", CryptoSecureContextSetTicketKeys);
+  SetMethod(env, binding, "secureContextSetSigalgs", CryptoSecureContextSetSigalgs);
+  SetMethod(env, binding, "secureContextSetECDHCurve", CryptoSecureContextSetECDHCurve);
+  SetMethod(env, binding, "secureContextGetCertificate", CryptoSecureContextGetCertificate);
+  SetMethod(env, binding, "secureContextGetIssuer", CryptoSecureContextGetIssuer);
   SetMethod(env, binding, "signOneShot", CryptoSignOneShot);
   SetMethod(env, binding, "verifyOneShot", CryptoVerifyOneShot);
   SetMethod(env, binding, "getAsymmetricKeyDetails", CryptoGetAsymmetricKeyDetails);
   SetMethod(env, binding, "getAsymmetricKeyType", CryptoGetAsymmetricKeyType);
   SetMethod(env, binding, "publicEncrypt", CryptoPublicEncrypt);
   SetMethod(env, binding, "privateDecrypt", CryptoPrivateDecrypt);
+  SetMethod(env, binding, "privateEncrypt", CryptoPrivateEncrypt);
+  SetMethod(env, binding, "publicDecrypt", CryptoPublicDecrypt);
   SetMethod(env, binding, "cipherTransformAead", CryptoCipherTransformAead);
 
   return binding;

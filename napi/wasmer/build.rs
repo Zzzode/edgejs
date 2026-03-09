@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
+    println!("cargo:rerun-if-changed=../v8/src/ubi_v8_platform.cc");
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
@@ -44,6 +45,7 @@ fn main() {
     build
         .cpp(true)
         .flag_if_supported("-std=c++20")
+        .flag_if_supported("-fno-rtti")
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
         .include(&v8_include)
@@ -52,6 +54,7 @@ fn main() {
         .file("src/napi_bridge_init.cc")
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
         .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap())
+        .file(napi_v8_src.join("ubi_v8_platform.cc").to_str().unwrap())
         .file(
             napi_v8_src
                 .join("unofficial_napi_contextify.cc")

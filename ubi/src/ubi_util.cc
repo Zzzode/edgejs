@@ -13,15 +13,19 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <unordered_set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 namespace {
 
@@ -33,7 +37,52 @@ constexpr int32_t kExitInfoKExiting = 0;
 constexpr int32_t kExitInfoKExitCode = 1;
 constexpr int32_t kExitInfoKHasExitCode = 2;
 
-constexpr uint32_t kMaxArrayIndex = 4294967294u;
+constexpr std::array<std::pair<const char*, const char*>, 20> kPrivateSymbolNames = {{
+    {"arrow_message_private_symbol", "node:arrowMessage"},
+    {"contextify_context_private_symbol", "node:contextify:context"},
+    {"decorated_private_symbol", "node:decorated"},
+    {"transfer_mode_private_symbol", "node:transfer_mode"},
+    {"host_defined_option_symbol", "node:host_defined_option_symbol"},
+    {"js_transferable_wrapper_private_symbol", "node:js_transferable_wrapper"},
+    {"entry_point_module_private_symbol", "node:entry_point_module"},
+    {"entry_point_promise_private_symbol", "node:entry_point_promise"},
+    {"module_source_private_symbol", "node:module_source"},
+    {"module_export_names_private_symbol", "node:module_export_names"},
+    {"module_circular_visited_private_symbol", "node:module_circular_visited"},
+    {"module_export_private_symbol", "node:module_export"},
+    {"module_first_parent_private_symbol", "node:module_first_parent"},
+    {"module_last_parent_private_symbol", "node:module_last_parent"},
+    {"napi_type_tag", "node:napi:type_tag"},
+    {"napi_wrapper", "node:napi:wrapper"},
+    {"untransferable_object_private_symbol", "node:untransferableObject"},
+    {"exit_info_private_symbol", "node:exit_info_private_symbol"},
+    {"promise_trace_id", "node:promise_trace_id"},
+    {"source_map_data_private_symbol", "node:source_map_data_private_symbol"},
+}};
+
+constexpr std::array<std::pair<const char*, const char*>, 21> kPerIsolateSymbolNames = {{
+    {"fs_use_promises_symbol", "fs_use_promises_symbol"},
+    {"async_id_symbol", "async_id_symbol"},
+    {"constructor_key_symbol", "constructor_key_symbol"},
+    {"handle_onclose_symbol", "handle_onclose"},
+    {"no_message_symbol", "no_message_symbol"},
+    {"messaging_deserialize_symbol", "messaging_deserialize_symbol"},
+    {"imported_cjs_symbol", "imported_cjs_symbol"},
+    {"messaging_transfer_symbol", "messaging_transfer_symbol"},
+    {"messaging_clone_symbol", "messaging_clone_symbol"},
+    {"messaging_transfer_list_symbol", "messaging_transfer_list_symbol"},
+    {"oninit_symbol", "oninit"},
+    {"owner_symbol", "owner_symbol"},
+    {"onpskexchange_symbol", "onpskexchange"},
+    {"resource_symbol", "resource_symbol"},
+    {"trigger_async_id_symbol", "trigger_async_id_symbol"},
+    {"source_text_module_default_hdo", "source_text_module_default_hdo"},
+    {"vm_context_no_contextify", "vm_context_no_contextify"},
+    {"vm_dynamic_import_default_internal", "vm_dynamic_import_default_internal"},
+    {"vm_dynamic_import_main_context_default", "vm_dynamic_import_main_context_default"},
+    {"vm_dynamic_import_missing_flag", "vm_dynamic_import_missing_flag"},
+    {"vm_dynamic_import_no_callback", "vm_dynamic_import_no_callback"},
+}};
 
 struct LazyPropertyData {
   std::string module_id;
@@ -43,25 +92,38 @@ struct LazyPropertyData {
 
 std::vector<std::unique_ptr<LazyPropertyData>> g_lazy_property_data;
 std::unordered_map<napi_env, napi_ref> g_types_binding_refs;
-std::unordered_map<napi_env, napi_ref> g_private_symbols_refs;
+std::unordered_set<napi_env> g_types_binding_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnTypesBindingEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_types_binding_cleanup_hook_registered.erase(env);
+
+  auto it = g_types_binding_refs.find(env);
+  if (it == g_types_binding_refs.end()) return;
+  DeleteRefIfPresent(env, &it->second);
+  g_types_binding_refs.erase(it);
+}
+
+void EnsureTypesBindingCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_types_binding_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnTypesBindingEnvCleanup, env) != napi_ok) {
+    g_types_binding_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (env == nullptr || ref == nullptr) return nullptr;
-  napi_value out = nullptr;
-  if (napi_get_reference_value(env, ref, &out) != napi_ok || out == nullptr) return nullptr;
-  return out;
-}
-
-void ResetRef(napi_env env, napi_ref* slot, napi_value value) {
-  if (env == nullptr || slot == nullptr) return;
-  if (*slot != nullptr) {
-    napi_delete_reference(env, *slot);
-    *slot = nullptr;
-  }
-  if (value == nullptr) return;
-  napi_valuetype type = napi_undefined;
-  if (napi_typeof(env, value, &type) != napi_ok || type == napi_undefined) return;
-  napi_create_reference(env, value, 1, slot);
+  napi_value value = nullptr;
+  if (napi_get_reference_value(env, ref, &value) != napi_ok || value == nullptr) return nullptr;
+  return value;
 }
 
 napi_value Undefined(napi_env env) {
@@ -94,6 +156,30 @@ bool SetString(napi_env env, napi_value target, const char* key, const char* val
   napi_value v = nullptr;
   return napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &v) == napi_ok && v != nullptr &&
          SetNamedProperty(env, target, key, v);
+}
+
+bool CreateNullPrototypeObject(napi_env env, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (napi_create_object(env, out) != napi_ok || *out == nullptr) return false;
+  return node_api_set_prototype(env, *out, Null(env)) == napi_ok;
+}
+
+template <size_t N, typename CreateFn>
+napi_value CreateSymbolObject(napi_env env,
+                              const std::array<std::pair<const char*, const char*>, N>& entries,
+                              CreateFn&& create_symbol) {
+  napi_value out = nullptr;
+  if (!CreateNullPrototypeObject(env, &out)) return nullptr;
+
+  for (const auto& [key, description] : entries) {
+    napi_value sym = nullptr;
+    if (!create_symbol(description, &sym) || sym == nullptr || !SetNamedProperty(env, out, key, sym)) {
+      return nullptr;
+    }
+  }
+
+  return out;
 }
 
 napi_value GetNamedProperty(napi_env env, napi_value obj, const char* key) {
@@ -159,6 +245,34 @@ napi_value CallFunction(napi_env env,
   return out;
 }
 
+void ClearPendingException(napi_env env) {
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return;
+  napi_value ignored = nullptr;
+  (void)napi_get_and_clear_last_exception(env, &ignored);
+}
+
+bool TryCallFunction(napi_env env,
+                     napi_value this_arg,
+                     napi_value fn,
+                     size_t argc,
+                     napi_value* argv,
+                     napi_value* result_out) {
+  if (result_out != nullptr) *result_out = nullptr;
+  if (this_arg == nullptr) this_arg = Undefined(env);
+  if (!IsFunction(env, fn)) return false;
+
+  napi_value out = nullptr;
+  const napi_status status = napi_call_function(env, this_arg, fn, argc, argv, &out);
+  if (status != napi_ok) {
+    ClearPendingException(env);
+    return false;
+  }
+
+  if (result_out != nullptr) *result_out = out;
+  return true;
+}
+
 napi_value NewInstance(napi_env env, napi_value ctor, size_t argc, napi_value* argv) {
   if (!IsFunction(env, ctor)) return nullptr;
   napi_value out = nullptr;
@@ -179,18 +293,6 @@ bool MapSet(napi_env env, napi_value map, napi_value key, napi_value value) {
   return CallFunction(env, map, set_fn, 2, argv) != nullptr;
 }
 
-bool IsArrayIndexString(std::string_view key) {
-  if (key.empty()) return false;
-  if (key.size() > 1 && key.front() == '0') return false;
-  uint64_t value = 0;
-  for (char ch : key) {
-    if (!std::isdigit(static_cast<unsigned char>(ch))) return false;
-    value = value * 10 + static_cast<unsigned>(ch - '0');
-    if (value > kMaxArrayIndex) return false;
-  }
-  return true;
-}
-
 bool ValueToTagEquals(napi_env env, napi_value value, const char* expected) {
   napi_value object_ctor = GetGlobalNamed(env, "Object");
   napi_value object_prototype = GetNamedProperty(env, object_ctor, "prototype");
@@ -201,13 +303,68 @@ bool ValueToTagEquals(napi_env env, napi_value value, const char* expected) {
   return ToUtf8(env, out) == expected;
 }
 
-bool ValueInstanceOfGlobalCtor(napi_env env, napi_value value, const char* ctor_name) {
+bool ValuePassesPrototypeMethodBrandCheck(napi_env env,
+                                          napi_value value,
+                                          const char* ctor_name,
+                                          const char* method_name,
+                                          napi_valuetype expected_type) {
   if (!IsObjectLike(env, value)) return false;
+
   napi_value ctor = GetGlobalNamed(env, ctor_name);
-  if (!IsFunction(env, ctor)) return false;
-  bool result = false;
-  if (napi_instanceof(env, value, ctor, &result) != napi_ok) return false;
-  return result;
+  napi_value prototype = GetNamedProperty(env, ctor, "prototype");
+  napi_value method = GetNamedProperty(env, prototype, method_name);
+  if (!IsFunction(env, method)) return false;
+
+  napi_value result = nullptr;
+  if (!TryCallFunction(env, value, method, 0, nullptr, &result) || result == nullptr) {
+    return false;
+  }
+
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, result, &type) == napi_ok && type == expected_type;
+}
+
+bool ValuePassesPrototypeGetterBrandCheck(napi_env env,
+                                          napi_value value,
+                                          const char* ctor_name,
+                                          const char* property_name,
+                                          napi_valuetype expected_type) {
+  if (!IsObjectLike(env, value)) return false;
+
+  napi_value object_ctor = GetGlobalNamed(env, "Object");
+  napi_value get_own_property_descriptor = GetNamedProperty(env, object_ctor, "getOwnPropertyDescriptor");
+  napi_value ctor = GetGlobalNamed(env, ctor_name);
+  napi_value prototype = GetNamedProperty(env, ctor, "prototype");
+  if (!IsFunction(env, get_own_property_descriptor) || prototype == nullptr) return false;
+
+  napi_value property_name_value = nullptr;
+  if (napi_create_string_utf8(env, property_name, NAPI_AUTO_LENGTH, &property_name_value) != napi_ok ||
+      property_name_value == nullptr) {
+    return false;
+  }
+
+  napi_value descriptor_argv[2] = {prototype, property_name_value};
+  napi_value descriptor = nullptr;
+  if (!TryCallFunction(env,
+                       object_ctor,
+                       get_own_property_descriptor,
+                       2,
+                       descriptor_argv,
+                       &descriptor) ||
+      !IsObjectLike(env, descriptor)) {
+    return false;
+  }
+
+  napi_value getter = GetNamedProperty(env, descriptor, "get");
+  if (!IsFunction(env, getter)) return false;
+
+  napi_value result = nullptr;
+  if (!TryCallFunction(env, value, getter, 0, nullptr, &result) || result == nullptr) {
+    return false;
+  }
+
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, result, &type) == napi_ok && type == expected_type;
 }
 
 bool IsInternalScriptName(std::string_view script_name) {
@@ -255,7 +412,20 @@ napi_value GuessHandleType(napi_env env, napi_callback_info info) {
     }
     return Undefined(env);
   }
-  const uv_handle_type t = uv_guess_handle(static_cast<uv_file>(fd));
+  uv_handle_type t = uv_guess_handle(static_cast<uv_file>(fd));
+#ifndef _WIN32
+  if (fd == 0 && t == UV_FILE) {
+    struct stat fd_stat {};
+    struct stat null_stat {};
+    if (fstat(fd, &fd_stat) == 0 &&
+        stat("/dev/null", &null_stat) == 0 &&
+        S_ISCHR(fd_stat.st_mode) &&
+        S_ISCHR(null_stat.st_mode) &&
+        fd_stat.st_rdev == null_stat.st_rdev) {
+      t = UV_NAMED_PIPE;
+    }
+  }
+#endif
   napi_value result = nullptr;
   if (napi_create_uint32(env, GetUVHandleTypeCode(t), &result) != napi_ok || result == nullptr) {
     return Undefined(env);
@@ -514,12 +684,7 @@ napi_value GetOwnNonIndexPropertiesCallback(napi_env env, napi_callback_info inf
   }
 
   napi_value keys = nullptr;
-  if (napi_get_all_property_names(env,
-                                  source,
-                                  napi_key_own_only,
-                                  static_cast<napi_key_filter>(filter_bits),
-                                  napi_key_numbers_to_strings,
-                                  &keys) != napi_ok ||
+  if (unofficial_napi_get_own_non_index_properties(env, source, filter_bits, &keys) != napi_ok ||
       keys == nullptr) {
     return Undefined(env);
   }
@@ -543,7 +708,6 @@ napi_value GetOwnNonIndexPropertiesCallback(napi_env env, napi_callback_info inf
     }
 
     const std::string text = ToUtf8(env, key);
-    if (IsArrayIndexString(text)) continue;
     // internalBinding() is bootstrap-only in Node and should not leak into
     // REPL/global completion surfaces.
     if (source_is_global &&
@@ -922,54 +1086,35 @@ bool DefineMethod(napi_env env, napi_value target, const char* name, napi_callba
   return SetNamedProperty(env, target, name, fn);
 }
 
-napi_value GetOrCreatePrivateSymbols(napi_env env) {
-  auto it = g_private_symbols_refs.find(env);
-  if (it != g_private_symbols_refs.end()) {
-    if (napi_value existing = GetRefValue(env, it->second); existing != nullptr) return existing;
-  }
+napi_value CreatePrivateSymbolsObject(napi_env env) {
+  return CreateSymbolObject(
+      env,
+      kPrivateSymbolNames,
+      [&](const char* description, napi_value* out) {
+        return unofficial_napi_create_private_symbol(env, description, NAPI_AUTO_LENGTH, out) == napi_ok;
+      });
+}
 
-  napi_value private_symbols = nullptr;
-  if (napi_create_object(env, &private_symbols) != napi_ok || private_symbols == nullptr) return nullptr;
-
-  const std::array<std::pair<const char*, const char*>, 20> symbol_names = {{
-      {"arrow_message_private_symbol", "node:arrowMessage"},
-      {"contextify_context_private_symbol", "node:contextify:context"},
-      {"decorated_private_symbol", "node:decorated"},
-      {"transfer_mode_private_symbol", "node:transfer_mode"},
-      {"host_defined_option_symbol", "node:host_defined_option_symbol"},
-      {"js_transferable_wrapper_private_symbol", "node:js_transferable_wrapper"},
-      {"entry_point_module_private_symbol", "node:entry_point_module"},
-      {"entry_point_promise_private_symbol", "node:entry_point_promise"},
-      {"module_source_private_symbol", "node:module_source"},
-      {"module_export_names_private_symbol", "node:module_export_names"},
-      {"module_circular_visited_private_symbol", "node:module_circular_visited"},
-      {"module_export_private_symbol", "node:module_export"},
-      {"module_first_parent_private_symbol", "node:module_first_parent"},
-      {"module_last_parent_private_symbol", "node:module_last_parent"},
-      {"napi_type_tag", "node:napi:type_tag"},
-      {"napi_wrapper", "node:napi:wrapper"},
-      {"untransferable_object_private_symbol", "node:untransferableObject"},
-      {"exit_info_private_symbol", "node:exit_info_private_symbol"},
-      {"promise_trace_id", "node:promise_trace_id"},
-      {"source_map_data_private_symbol", "node:source_map_data_private_symbol"},
-  }};
-
-  for (const auto& [key, description] : symbol_names) {
-    napi_value sym = nullptr;
-    if (unofficial_napi_create_private_symbol(env, description, NAPI_AUTO_LENGTH, &sym) != napi_ok ||
-        sym == nullptr) {
-      return nullptr;
-    }
-    if (!SetNamedProperty(env, private_symbols, key, sym)) return nullptr;
-  }
-
-  ResetRef(env, &g_private_symbols_refs[env], private_symbols);
-  return private_symbols;
+napi_value CreatePerIsolateSymbolsObject(napi_env env) {
+  return CreateSymbolObject(
+      env,
+      kPerIsolateSymbolNames,
+      [&](const char* description, napi_value* out) {
+        napi_value desc = nullptr;
+        return napi_create_string_utf8(env, description, NAPI_AUTO_LENGTH, &desc) == napi_ok &&
+               desc != nullptr &&
+               napi_create_symbol(env, desc, out) == napi_ok;
+      });
 }
 
 bool InstallPrivateSymbols(napi_env env, napi_value binding) {
-  napi_value private_symbols = GetOrCreatePrivateSymbols(env);
-  if (private_symbols == nullptr) return false;
+  napi_value private_symbols = UbiGetPrivateSymbols(env);
+  if (private_symbols == nullptr) {
+    private_symbols = CreatePrivateSymbolsObject(env);
+    if (private_symbols == nullptr) return false;
+    UbiSetPrivateSymbols(env, private_symbols);
+  }
+
   return SetNamedProperty(env, binding, "privateSymbols", private_symbols);
 }
 
@@ -1061,21 +1206,21 @@ bool RunTypeCheck(napi_env env, TypeCheckKind kind, napi_value value) {
     case TypeCheckKind::kArgumentsObject:
       return ValueToTagEquals(env, value, "[object Arguments]");
     case TypeCheckKind::kBooleanObject:
-      return ValueToTagEquals(env, value, "[object Boolean]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "Boolean", "valueOf", napi_boolean);
     case TypeCheckKind::kNumberObject:
-      return ValueToTagEquals(env, value, "[object Number]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "Number", "valueOf", napi_number);
     case TypeCheckKind::kStringObject:
-      return ValueToTagEquals(env, value, "[object String]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "String", "valueOf", napi_string);
     case TypeCheckKind::kSymbolObject:
-      return ValueToTagEquals(env, value, "[object Symbol]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "Symbol", "valueOf", napi_symbol);
     case TypeCheckKind::kBigIntObject:
-      return ValueToTagEquals(env, value, "[object BigInt]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "BigInt", "valueOf", napi_bigint);
     case TypeCheckKind::kNativeError: {
       bool out = false;
       return napi_is_error(env, value, &out) == napi_ok && out;
     }
     case TypeCheckKind::kRegExp:
-      return ValueToTagEquals(env, value, "[object RegExp]");
+      return ValuePassesPrototypeGetterBrandCheck(env, value, "RegExp", "source", napi_string);
     case TypeCheckKind::kAsyncFunction:
       return ValueToTagEquals(env, value, "[object AsyncFunction]");
     case TypeCheckKind::kGeneratorFunction:
@@ -1088,17 +1233,17 @@ bool RunTypeCheck(napi_env env, TypeCheckKind kind, napi_value value) {
       return napi_is_promise(env, value, &out) == napi_ok && out;
     }
     case TypeCheckKind::kMap:
-      return ValueInstanceOfGlobalCtor(env, value, "Map");
+      return ValueToTagEquals(env, value, "[object Map]");
     case TypeCheckKind::kSet:
-      return ValueInstanceOfGlobalCtor(env, value, "Set");
+      return ValueToTagEquals(env, value, "[object Set]");
     case TypeCheckKind::kMapIterator:
       return ValueToTagEquals(env, value, "[object Map Iterator]");
     case TypeCheckKind::kSetIterator:
       return ValueToTagEquals(env, value, "[object Set Iterator]");
     case TypeCheckKind::kWeakMap:
-      return ValueInstanceOfGlobalCtor(env, value, "WeakMap");
+      return ValueToTagEquals(env, value, "[object WeakMap]");
     case TypeCheckKind::kWeakSet:
-      return ValueInstanceOfGlobalCtor(env, value, "WeakSet");
+      return ValueToTagEquals(env, value, "[object WeakSet]");
     case TypeCheckKind::kArrayBuffer: {
       bool out = false;
       return napi_is_arraybuffer(env, value, &out) == napi_ok && out;
@@ -1155,6 +1300,7 @@ bool DefineTypePredicate(napi_env env, napi_value target, const char* name, Type
 }
 
 bool InstallTypesBinding(napi_env env) {
+  EnsureTypesBindingCleanupHook(env);
   napi_value types = nullptr;
   if (napi_create_object(env, &types) != napi_ok || types == nullptr) return false;
 
@@ -1189,9 +1335,8 @@ bool InstallTypesBinding(napi_env env) {
   }
 
   auto it = g_types_binding_refs.find(env);
-  if (it != g_types_binding_refs.end() && it->second != nullptr) {
-    napi_delete_reference(env, it->second);
-    it->second = nullptr;
+  if (it != g_types_binding_refs.end()) {
+    DeleteRefIfPresent(env, &it->second);
   }
   napi_ref ref = nullptr;
   if (napi_create_reference(env, types, 1, &ref) != napi_ok || ref == nullptr) return false;
@@ -1201,13 +1346,22 @@ bool InstallTypesBinding(napi_env env) {
 
 }  // namespace
 
+napi_value UbiCreatePrivateSymbolsObject(napi_env env) {
+  return CreatePrivateSymbolsObject(env);
+}
+
+napi_value UbiCreatePerIsolateSymbolsObject(napi_env env) {
+  return CreatePerIsolateSymbolsObject(env);
+}
+
 napi_value UbiInstallUtilBinding(napi_env env) {
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
 
-  if (!InstallPrivateSymbols(env, binding)) return nullptr;
-  if (!InstallConstants(env, binding)) return nullptr;
-  if (!InstallShouldAbortToggle(env, binding)) return nullptr;
+  if (!InstallPrivateSymbols(env, binding) || !InstallConstants(env, binding) ||
+      !InstallShouldAbortToggle(env, binding)) {
+    return nullptr;
+  }
 
   if (!DefineMethod(env, binding, "isInsideNodeModules", IsInsideNodeModulesCallback) ||
       !DefineMethod(env, binding, "defineLazyProperties", DefineLazyPropertiesCallback) ||
@@ -1226,6 +1380,7 @@ napi_value UbiInstallUtilBinding(napi_env env) {
       !DefineMethod(env, binding, "guessHandleType", GuessHandleType)) {
     return nullptr;
   }
+
   return binding;
 }
 
@@ -1238,8 +1393,4 @@ napi_value UbiGetTypesBinding(napi_env env) {
   it = g_types_binding_refs.find(env);
   if (it == g_types_binding_refs.end()) return nullptr;
   return GetRefValue(env, it->second);
-}
-
-napi_value UbiGetPrivateSymbols(napi_env env) {
-  return GetOrCreatePrivateSymbols(env);
 }
