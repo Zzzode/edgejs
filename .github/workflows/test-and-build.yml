@@ -172,10 +172,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          target_ref="$(gh repo view "${TARGET_REPO}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+          if [[ -z "${target_ref}" ]]; then
+            echo "Failed to resolve default branch for ${TARGET_REPO}" >&2
+            exit 1
+          fi
           if ! gh release view "${RELEASE_TAG}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
             gh release create "${RELEASE_TAG}" \
               --repo "${TARGET_REPO}" \
-              --target "${GITHUB_SHA}" \
+              --target "${target_ref}" \
               --title "${RELEASE_NAME}" \
               --notes-file release-notes.md \
               --prerelease \
