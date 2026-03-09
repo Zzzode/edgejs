@@ -2,9 +2,12 @@
 
 #include <array>
 #include <cctype>
+#include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <inttypes.h>
 #include <limits>
 #include <memory>
 #include <string>
@@ -570,6 +573,10 @@ const char* MapOpenSslErrorCode(unsigned long err) {
   const char* library = ERR_lib_error_string(err);
   const char* reason = ERR_reason_error_string(err);
   if (reason != nullptr &&
+      std::strcmp(reason, "invalid digest") == 0) {
+    return "ERR_OSSL_INVALID_DIGEST";
+  }
+  if (reason != nullptr &&
       std::strcmp(reason, "bad decrypt") == 0) {
     return "ERR_OSSL_BAD_DECRYPT";
   }
@@ -939,12 +946,83 @@ int RawKeyNidFromName(const std::string& name) {
   if (name == "Ed448") return EVP_PKEY_ED448;
   if (name == "X25519") return EVP_PKEY_X25519;
   if (name == "X448") return EVP_PKEY_X448;
+#if OPENSSL_WITH_PQC
+  if (name == "ML-DSA-44") return EVP_PKEY_ML_DSA_44;
+  if (name == "ML-DSA-65") return EVP_PKEY_ML_DSA_65;
+  if (name == "ML-DSA-87") return EVP_PKEY_ML_DSA_87;
+  if (name == "ML-KEM-512") return EVP_PKEY_ML_KEM_512;
+  if (name == "ML-KEM-768") return EVP_PKEY_ML_KEM_768;
+  if (name == "ML-KEM-1024") return EVP_PKEY_ML_KEM_1024;
+#endif
   return NID_undef;
 }
 
+int AsymmetricKeyId(const EVP_PKEY* pkey) {
+  return ncrypto::EVPKeyPointer::id(pkey);
+}
+
+#if OPENSSL_WITH_PQC
+const char* PqcAsymmetricKeyTypeName(int id) {
+  switch (id) {
+    case EVP_PKEY_ML_DSA_44:
+      return "ml-dsa-44";
+    case EVP_PKEY_ML_DSA_65:
+      return "ml-dsa-65";
+    case EVP_PKEY_ML_DSA_87:
+      return "ml-dsa-87";
+    case EVP_PKEY_ML_KEM_512:
+      return "ml-kem-512";
+    case EVP_PKEY_ML_KEM_768:
+      return "ml-kem-768";
+    case EVP_PKEY_ML_KEM_1024:
+      return "ml-kem-1024";
+    case EVP_PKEY_SLH_DSA_SHA2_128S:
+      return "slh-dsa-sha2-128s";
+    case EVP_PKEY_SLH_DSA_SHA2_128F:
+      return "slh-dsa-sha2-128f";
+    case EVP_PKEY_SLH_DSA_SHA2_192S:
+      return "slh-dsa-sha2-192s";
+    case EVP_PKEY_SLH_DSA_SHA2_192F:
+      return "slh-dsa-sha2-192f";
+    case EVP_PKEY_SLH_DSA_SHA2_256S:
+      return "slh-dsa-sha2-256s";
+    case EVP_PKEY_SLH_DSA_SHA2_256F:
+      return "slh-dsa-sha2-256f";
+    case EVP_PKEY_SLH_DSA_SHAKE_128S:
+      return "slh-dsa-shake-128s";
+    case EVP_PKEY_SLH_DSA_SHAKE_128F:
+      return "slh-dsa-shake-128f";
+    case EVP_PKEY_SLH_DSA_SHAKE_192S:
+      return "slh-dsa-shake-192s";
+    case EVP_PKEY_SLH_DSA_SHAKE_192F:
+      return "slh-dsa-shake-192f";
+    case EVP_PKEY_SLH_DSA_SHAKE_256S:
+      return "slh-dsa-shake-256s";
+    case EVP_PKEY_SLH_DSA_SHAKE_256F:
+      return "slh-dsa-shake-256f";
+    default:
+      return nullptr;
+  }
+}
+
+const char* MlDsaAlgorithmName(int id) {
+  switch (id) {
+    case EVP_PKEY_ML_DSA_44:
+      return "ML-DSA-44";
+    case EVP_PKEY_ML_DSA_65:
+      return "ML-DSA-65";
+    case EVP_PKEY_ML_DSA_87:
+      return "ML-DSA-87";
+    default:
+      return nullptr;
+  }
+}
+#endif
+
 std::string AsymmetricKeyTypeName(const EVP_PKEY* pkey) {
   if (pkey == nullptr) return "";
-  switch (EVP_PKEY_base_id(pkey)) {
+  const int id = AsymmetricKeyId(pkey);
+  switch (id) {
     case EVP_PKEY_RSA:
       return "rsa";
     case EVP_PKEY_RSA_PSS:
@@ -963,6 +1041,29 @@ std::string AsymmetricKeyTypeName(const EVP_PKEY* pkey) {
       return "x25519";
     case EVP_PKEY_X448:
       return "x448";
+#if OPENSSL_WITH_PQC
+    case EVP_PKEY_ML_DSA_44:
+    case EVP_PKEY_ML_DSA_65:
+    case EVP_PKEY_ML_DSA_87:
+    case EVP_PKEY_ML_KEM_512:
+    case EVP_PKEY_ML_KEM_768:
+    case EVP_PKEY_ML_KEM_1024:
+    case EVP_PKEY_SLH_DSA_SHA2_128S:
+    case EVP_PKEY_SLH_DSA_SHA2_128F:
+    case EVP_PKEY_SLH_DSA_SHA2_192S:
+    case EVP_PKEY_SLH_DSA_SHA2_192F:
+    case EVP_PKEY_SLH_DSA_SHA2_256S:
+    case EVP_PKEY_SLH_DSA_SHA2_256F:
+    case EVP_PKEY_SLH_DSA_SHAKE_128S:
+    case EVP_PKEY_SLH_DSA_SHAKE_128F:
+    case EVP_PKEY_SLH_DSA_SHAKE_192S:
+    case EVP_PKEY_SLH_DSA_SHAKE_192F:
+    case EVP_PKEY_SLH_DSA_SHAKE_256S:
+    case EVP_PKEY_SLH_DSA_SHAKE_256F: {
+      const char* name = PqcAsymmetricKeyTypeName(id);
+      return name == nullptr ? "" : name;
+    }
+#endif
     default:
       return "";
   }
@@ -3675,6 +3776,142 @@ napi_value KeyObjectInitEDRaw(napi_env env, napi_callback_info info) {
   return out != nullptr ? out : Undefined(env);
 }
 
+napi_value KeyObjectInitPqcRaw(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  if (wrap == nullptr || argc < 3) return Undefined(env);
+  ResetKeyObjectNativeKey(wrap);
+
+#if OPENSSL_WITH_PQC
+  int32_t key_type = kKeyTypePublic;
+  napi_get_value_int32(env, argv[2], &key_type);
+  const std::string name = GetStringValue(env, argv[0]);
+  const std::vector<uint8_t> key_data = ValueToBytes(env, argv[1]);
+  const int nid = RawKeyNidFromName(name);
+  ncrypto::EVPKeyPointer pkey = key_type == kKeyTypePrivate
+                                    ? ncrypto::EVPKeyPointer::NewRawSeed(
+                                          nid,
+                                          ncrypto::Buffer<const unsigned char>{
+                                              .data = key_data.data(),
+                                              .len = key_data.size(),
+                                          })
+                                    : ncrypto::EVPKeyPointer::NewRawPublic(
+                                          nid,
+                                          ncrypto::Buffer<const unsigned char>{
+                                              .data = key_data.data(),
+                                              .len = key_data.size(),
+                                          });
+
+  bool ok = static_cast<bool>(pkey);
+  if (ok) {
+    wrap->key_type = key_type;
+    wrap->key_passphrase.clear();
+    wrap->has_key_passphrase = false;
+    wrap->key_data =
+        key_type == kKeyTypePrivate ? ExportPrivateDerPkcs8(pkey.get()) : ExportPublicDerSpki(pkey.get());
+    ok = !wrap->key_data.empty();
+  }
+
+  napi_value out = nullptr;
+  napi_get_boolean(env, ok, &out);
+  return out != nullptr ? out : Undefined(env);
+#else
+  napi_value out = nullptr;
+  napi_get_boolean(env, false, &out);
+  return out != nullptr ? out : Undefined(env);
+#endif
+}
+
+napi_value KeyObjectRawPublicKey(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  if (wrap == nullptr || wrap->key_type == kKeyTypeSecret) return Undefined(env);
+
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
+  if (pkey == nullptr) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key"));
+    return nullptr;
+  }
+
+  size_t raw_len = 0;
+  if (EVP_PKEY_get_raw_public_key(pkey, nullptr, &raw_len) != 1 || raw_len == 0) {
+    EVP_PKEY_free(pkey);
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get raw public key"));
+    return nullptr;
+  }
+
+  std::vector<uint8_t> raw(raw_len);
+  if (EVP_PKEY_get_raw_public_key(pkey, raw.data(), &raw_len) != 1) {
+    EVP_PKEY_free(pkey);
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get raw public key"));
+    return nullptr;
+  }
+  EVP_PKEY_free(pkey);
+  raw.resize(raw_len);
+  return BytesToBuffer(env, raw);
+}
+
+napi_value KeyObjectRawSeed(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, this_arg);
+  if (wrap == nullptr || wrap->key_type != kKeyTypePrivate) return Undefined(env);
+
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
+  if (pkey == nullptr) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key"));
+    return nullptr;
+  }
+
+#if OPENSSL_WITH_PQC
+  const int key_id = AsymmetricKeyId(pkey);
+  const char* param_name = nullptr;
+  size_t seed_len = 0;
+  switch (key_id) {
+    case EVP_PKEY_ML_DSA_44:
+    case EVP_PKEY_ML_DSA_65:
+    case EVP_PKEY_ML_DSA_87:
+      param_name = OSSL_PKEY_PARAM_ML_DSA_SEED;
+      seed_len = 32;
+      break;
+    case EVP_PKEY_ML_KEM_512:
+    case EVP_PKEY_ML_KEM_768:
+    case EVP_PKEY_ML_KEM_1024:
+      param_name = OSSL_PKEY_PARAM_ML_KEM_SEED;
+      seed_len = 64;
+      break;
+    default:
+      break;
+  }
+
+  if (param_name == nullptr || seed_len == 0) {
+    EVP_PKEY_free(pkey);
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get raw seed"));
+    return nullptr;
+  }
+
+  std::vector<uint8_t> seed(seed_len);
+  if (EVP_PKEY_get_octet_string_param(pkey, param_name, seed.data(), seed.size(), &seed_len) != 1 || seed_len == 0) {
+    EVP_PKEY_free(pkey);
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get raw seed"));
+    return nullptr;
+  }
+  EVP_PKEY_free(pkey);
+  seed.resize(seed_len);
+  return BytesToBuffer(env, seed);
+#else
+  EVP_PKEY_free(pkey);
+  napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get raw seed"));
+  return nullptr;
+#endif
+}
+
 napi_value KeyObjectCheckEcKeyData(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
@@ -4642,6 +4879,58 @@ std::vector<uint8_t> ExportPublicDerSpki(EVP_PKEY* pkey) {
   return out;
 }
 
+std::vector<uint8_t> ExportEcPublicDerSpkiUncompressed(EVP_PKEY* pkey) {
+  std::vector<uint8_t> out;
+  if (pkey == nullptr || EVP_PKEY_base_id(pkey) != EVP_PKEY_EC) return out;
+
+  EC_KEY* source = EVP_PKEY_get1_EC_KEY(pkey);
+  if (source == nullptr) return out;
+
+  const EC_GROUP* group = EC_KEY_get0_group(source);
+  const EC_POINT* point = EC_KEY_get0_public_key(source);
+  if (group == nullptr || point == nullptr) {
+    EC_KEY_free(source);
+    return out;
+  }
+
+  const point_conversion_form_t form = POINT_CONVERSION_UNCOMPRESSED;
+  const size_t octets_len = EC_POINT_point2oct(group, point, form, nullptr, 0, nullptr);
+  if (octets_len == 0) {
+    EC_KEY_free(source);
+    return out;
+  }
+
+  std::vector<uint8_t> octets(octets_len);
+  if (EC_POINT_point2oct(group, point, form, octets.data(), octets.size(), nullptr) != octets_len) {
+    EC_KEY_free(source);
+    return out;
+  }
+
+  EC_KEY* exported = EC_KEY_new();
+  EC_POINT* uncompressed = EC_POINT_new(group);
+  if (exported == nullptr || uncompressed == nullptr || EC_KEY_set_group(exported, group) != 1 ||
+      EC_POINT_oct2point(group, uncompressed, octets.data(), octets.size(), nullptr) != 1 ||
+      EC_KEY_set_public_key(exported, uncompressed) != 1) {
+    if (uncompressed != nullptr) EC_POINT_free(uncompressed);
+    if (exported != nullptr) EC_KEY_free(exported);
+    EC_KEY_free(source);
+    return out;
+  }
+
+  EC_KEY_set_conv_form(exported, form);
+  EVP_PKEY* normalized = EVP_PKEY_new();
+  if (normalized != nullptr && EVP_PKEY_assign_EC_KEY(normalized, exported) == 1) {
+    exported = nullptr;
+    out = ExportPublicDerSpki(normalized);
+  }
+
+  if (normalized != nullptr) EVP_PKEY_free(normalized);
+  if (exported != nullptr) EC_KEY_free(exported);
+  if (uncompressed != nullptr) EC_POINT_free(uncompressed);
+  EC_KEY_free(source);
+  return out;
+}
+
 std::vector<uint8_t> ExportPrivateDerPkcs8(EVP_PKEY* pkey) {
   std::vector<uint8_t> out;
   BIO* bio = BIO_new(BIO_s_mem());
@@ -4876,7 +5165,7 @@ napi_value ExportJwkPublic(napi_env env,
   napi_value jwk = nullptr;
   if (napi_create_object(env, &jwk) != napi_ok || jwk == nullptr) return Undefined(env);
 
-  const int base = EVP_PKEY_base_id(pkey);
+  const int base = AsymmetricKeyId(pkey);
   if (base == EVP_PKEY_RSA || base == EVP_PKEY_RSA_PSS) {
     BIGNUM* n = nullptr;
     BIGNUM* e = nullptr;
@@ -4971,6 +5260,28 @@ napi_value ExportJwkPublic(napi_env env,
     return jwk;
   }
 
+#if OPENSSL_WITH_PQC
+  if (const char* alg = MlDsaAlgorithmName(base)) {
+    size_t raw_len = 0;
+    if (EVP_PKEY_get_raw_public_key(pkey, nullptr, &raw_len) != 1 || raw_len == 0) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "Failed to export ML-DSA key as JWK";
+      return nullptr;
+    }
+    std::vector<uint8_t> raw(raw_len);
+    if (EVP_PKEY_get_raw_public_key(pkey, raw.data(), &raw_len) != 1) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "Failed to export ML-DSA key as JWK";
+      return nullptr;
+    }
+    raw.resize(raw_len);
+    SetObjectString(env, jwk, "kty", "AKP");
+    SetObjectString(env, jwk, "alg", alg);
+    SetObjectString(env, jwk, "pub", Base64UrlEncode(raw));
+    return jwk;
+  }
+#endif
+
   *error_code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
   *error_message = "Unsupported JWK Key Type.";
   return nullptr;
@@ -4984,7 +5295,7 @@ napi_value ExportJwkPrivate(napi_env env,
   napi_value jwk = ExportJwkPublic(env, pkey, error_code, error_message, curve_name_hint);
   if (jwk == nullptr) return nullptr;
 
-  const int base = EVP_PKEY_base_id(pkey);
+  const int base = AsymmetricKeyId(pkey);
   if (base == EVP_PKEY_RSA || base == EVP_PKEY_RSA_PSS) {
     BIGNUM* d = nullptr;
     BIGNUM* p = nullptr;
@@ -5059,6 +5370,22 @@ napi_value ExportJwkPrivate(napi_env env,
     SetObjectString(env, jwk, "d", Base64UrlEncode(raw));
     return jwk;
   }
+
+#if OPENSSL_WITH_PQC
+  if (MlDsaAlgorithmName(base) != nullptr) {
+    std::vector<uint8_t> seed(32);
+    size_t seed_len = seed.size();
+    if (EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_ML_DSA_SEED, seed.data(), seed_len, &seed_len) != 1 ||
+        seed_len == 0) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "key does not have an available seed";
+      return nullptr;
+    }
+    seed.resize(seed_len);
+    SetObjectString(env, jwk, "priv", Base64UrlEncode(seed));
+    return jwk;
+  }
+#endif
 
   *error_code = "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE";
   *error_message = "Unsupported JWK Key Type.";
@@ -5546,6 +5873,248 @@ napi_value BuildGeneratedKeyPairResult(napi_env env,
   return BuildJobResult(env, nullptr, keys);
 }
 
+bool GetSecretKeyFromHandle(napi_env env,
+                            napi_value handle,
+                            std::vector<uint8_t>* out_key,
+                            std::string* error_code,
+                            std::string* error_message) {
+  if (out_key == nullptr || error_code == nullptr || error_message == nullptr) return false;
+  KeyObjectWrap* wrap = UnwrapKeyObject(env, handle);
+  if (wrap == nullptr) {
+    *error_code = "ERR_INVALID_ARG_TYPE";
+    *error_message = "Invalid key handle";
+    return false;
+  }
+  if (wrap->key_type != kKeyTypeSecret) {
+    *error_code = "ERR_CRYPTO_INVALID_KEYTYPE";
+    *error_message = "Invalid key type";
+    return false;
+  }
+  *out_key = wrap->key_data;
+  return true;
+}
+
+EVP_PKEY* GetAsymmetricKeyFromValue(napi_env env,
+                                    napi_value key_value,
+                                    napi_value key_passphrase_value,
+                                    bool require_private,
+                                    std::string* error_code,
+                                    std::string* error_message) {
+  if (error_code == nullptr || error_message == nullptr) return nullptr;
+  if (KeyObjectWrap* wrap = UnwrapKeyObject(env, key_value)) {
+    if (require_private && wrap->key_type != kKeyTypePrivate) {
+      *error_code = "ERR_CRYPTO_INVALID_KEYTYPE";
+      *error_message = "Invalid key type";
+      return nullptr;
+    }
+    EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
+    if (pkey == nullptr) {
+      *error_code = "ERR_CRYPTO_OPERATION_FAILED";
+      *error_message = "Failed to parse key";
+    }
+    return pkey;
+  }
+
+  const std::vector<uint8_t> key_bytes = ValueToBytes(env, key_value);
+  if (key_bytes.empty()) {
+    *error_code = "ERR_INVALID_ARG_TYPE";
+    *error_message = "Invalid key";
+    return nullptr;
+  }
+
+  const bool has_passphrase = !IsNullOrUndefinedValue(env, key_passphrase_value);
+  const std::vector<uint8_t> passphrase = has_passphrase ? ValueToBytes(env, key_passphrase_value)
+                                                         : std::vector<uint8_t>{};
+  EVP_PKEY* pkey = nullptr;
+  if (require_private) {
+    pkey = ParsePrivateKeyBytesWithPassphrase(
+        key_bytes.data(), key_bytes.size(), passphrase.data(), passphrase.size(), has_passphrase);
+  } else {
+    pkey = ParseAnyKeyBytes(key_bytes, passphrase, has_passphrase);
+  }
+  if (pkey == nullptr) {
+    SetPreferredOpenSslError(error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
+  }
+  return pkey;
+}
+
+bool CaptureCallFailureAsJobResult(napi_env env,
+                                   const char* fallback_code,
+                                   const char* fallback_message,
+                                   napi_value* out_result) {
+  if (out_result == nullptr) return false;
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    napi_value err = nullptr;
+    napi_get_and_clear_last_exception(env, &err);
+    *out_result = BuildJobResult(env, err, Undefined(env));
+    return true;
+  }
+  *out_result = BuildJobErrorResult(env, fallback_code, fallback_message);
+  return true;
+}
+
+std::string AesAlgorithmNameFromVariant(int32_t variant) {
+  switch (variant) {
+    case 0:
+      return "aes-128-ctr";
+    case 1:
+      return "aes-192-ctr";
+    case 2:
+      return "aes-256-ctr";
+    case 3:
+      return "aes-128-cbc";
+    case 4:
+      return "aes-192-cbc";
+    case 5:
+      return "aes-256-cbc";
+    case 6:
+      return "aes-128-gcm";
+    case 7:
+      return "aes-192-gcm";
+    case 8:
+      return "aes-256-gcm";
+    case 9:
+      return "id-aes128-wrap";
+    case 10:
+      return "id-aes192-wrap";
+    case 11:
+      return "id-aes256-wrap";
+    case 12:
+      return "aes-128-ocb";
+    case 13:
+      return "aes-192-ocb";
+    case 14:
+      return "aes-256-ocb";
+    default:
+      return "";
+  }
+}
+
+bool IsAesCtrVariant(int32_t variant) {
+  return variant >= 0 && variant <= 2;
+}
+
+bool IsAesWrapVariant(int32_t variant) {
+  return variant >= 9 && variant <= 11;
+}
+
+bool IsAesAeadVariant(int32_t variant) {
+  return (variant >= 6 && variant <= 8) || (variant >= 12 && variant <= 14);
+}
+
+ncrypto::Cipher AesCtrCipherFromVariant(int32_t variant) {
+  switch (variant) {
+    case 0:
+      return ncrypto::Cipher::AES_128_CTR;
+    case 1:
+      return ncrypto::Cipher::AES_192_CTR;
+    case 2:
+      return ncrypto::Cipher::AES_256_CTR;
+    default:
+      return ncrypto::Cipher();
+  }
+}
+
+template <typename T>
+T AesCeilDiv(T a, T b) {
+  return a == 0 ? 0 : 1 + (a - 1) / b;
+}
+
+ncrypto::BignumPointer GetAesCtrCounter(const std::vector<uint8_t>& counter_block, uint32_t length_bits) {
+  const unsigned int remainder = (length_bits % CHAR_BIT);
+  const unsigned char* data = counter_block.data();
+  if (remainder == 0) {
+    const unsigned int byte_length = length_bits / CHAR_BIT;
+    return ncrypto::BignumPointer(data + counter_block.size() - byte_length, byte_length);
+  }
+
+  const unsigned int byte_length = AesCeilDiv(length_bits, static_cast<uint32_t>(CHAR_BIT));
+  std::vector<unsigned char> counter(data + counter_block.size() - byte_length, data + counter_block.size());
+  counter[0] &= ~(0xFF << remainder);
+  return ncrypto::BignumPointer(counter.data(), counter.size());
+}
+
+std::vector<unsigned char> GetAesCtrWrappedCounterBlock(const std::vector<uint8_t>& counter_block,
+                                                        uint32_t length_bits) {
+  const unsigned int length_bytes = length_bits / CHAR_BIT;
+  const unsigned int remainder = length_bits % CHAR_BIT;
+  std::vector<unsigned char> next(counter_block.begin(), counter_block.end());
+  const size_t index = next.size() - length_bytes;
+  std::memset(next.data() + index, 0, length_bytes);
+  if (remainder) next[index - 1] &= 0xFF << remainder;
+  return next;
+}
+
+bool RunAesCtrChunk(const std::vector<uint8_t>& key,
+                    int32_t variant,
+                    int32_t cipher_mode,
+                    const uint8_t* counter,
+                    const uint8_t* input,
+                    size_t input_len,
+                    uint8_t* output) {
+  const ncrypto::Cipher cipher = AesCtrCipherFromVariant(variant);
+  if (!cipher) return false;
+  auto ctx = ncrypto::CipherCtxPointer::New();
+  if (!ctx) return false;
+  const bool encrypt = cipher_mode == 0;
+  if (!ctx.init(cipher, encrypt, key.data(), counter)) return false;
+
+  int out_len = 0;
+  int final_len = 0;
+  const ncrypto::Buffer<const unsigned char> in_buffer{input, input_len};
+  if (input_len > 0 && !ctx.update(in_buffer, output, &out_len)) return false;
+  if (!ctx.update({}, output + out_len, &final_len, true)) return false;
+  return static_cast<size_t>(out_len + final_len) == input_len;
+}
+
+bool RunAesCtrCipher(const std::vector<uint8_t>& key,
+                     int32_t variant,
+                     int32_t cipher_mode,
+                     const std::vector<uint8_t>& counter_block,
+                     uint32_t length_bits,
+                     const std::vector<uint8_t>& input,
+                     std::vector<uint8_t>* output) {
+  if (output == nullptr || counter_block.size() != 16 || length_bits == 0 || length_bits > 128) return false;
+  auto num_counters = ncrypto::BignumPointer::NewLShift(length_bits);
+  if (!num_counters) return false;
+  auto current_counter = GetAesCtrCounter(counter_block, length_bits);
+  if (!current_counter) return false;
+  auto num_output = ncrypto::BignumPointer::New();
+  if (!num_output || !num_output.setWord(AesCeilDiv(input.size(), static_cast<size_t>(16)))) return false;
+  if (num_output > num_counters) return false;
+  auto remaining_until_reset = ncrypto::BignumPointer::NewSub(num_counters, current_counter);
+  if (!remaining_until_reset) return false;
+
+  output->assign(input.size(), 0);
+  if (remaining_until_reset >= num_output) {
+    return RunAesCtrChunk(
+        key, variant, cipher_mode, counter_block.data(), input.data(), input.size(), output->data());
+  }
+
+  const BN_ULONG input_size_part1 = remaining_until_reset.getWord() * 16;
+  if (!RunAesCtrChunk(
+          key, variant, cipher_mode, counter_block.data(), input.data(), input_size_part1, output->data())) {
+    return false;
+  }
+  const std::vector<unsigned char> wrapped_counter = GetAesCtrWrappedCounterBlock(counter_block, length_bits);
+  return RunAesCtrChunk(key,
+                        variant,
+                        cipher_mode,
+                        wrapped_counter.data(),
+                        input.data() + input_size_part1,
+                        input.size() - input_size_part1,
+                        output->data() + input_size_part1);
+}
+
+napi_value BuildArrayBufferJobResult(napi_env env, napi_value value) {
+  return BuildJobResult(env, nullptr, CopyAsArrayBuffer(env, value));
+}
+
+napi_value BuildArrayBufferJobResult(napi_env env, const std::vector<uint8_t>& value) {
+  return BuildJobResult(env, nullptr, CreateArrayBufferCopy(env, value));
+}
+
 napi_value FinalizeJobRunResult(napi_env env, napi_value this_arg, JobWrap* wrap, napi_value result) {
   if (wrap != nullptr && wrap->mode == kCryptoJobAsync) {
     InvokeJobOnDone(env, this_arg, result);
@@ -6006,6 +6575,815 @@ napi_value ECDHBitsJobRun(napi_env env, napi_callback_info info) {
   return DeriveBitsJobRun(env, this_arg, wrap, "Invalid ECDH bits arguments", "ECDH bits generation failed");
 }
 
+napi_value HmacJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 4) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid HMAC arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int32_t mode = GetInt32Value(env, GetRefValue(env, wrap->args[0]), kSignJobModeSign);
+  const std::string digest = GetStringValue(env, GetRefValue(env, wrap->args[1]));
+  std::vector<uint8_t> key;
+  std::string error_code;
+  std::string error_message;
+  if (!GetSecretKeyFromHandle(env, GetRefValue(env, wrap->args[2]), &key, &error_code, &error_message)) {
+    napi_value result = BuildJobErrorResult(env, error_code.c_str(), error_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value binding = GetBinding(env);
+  if (binding == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Crypto binding unavailable");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value digest_value = nullptr;
+  napi_create_string_utf8(env, digest.c_str(), NAPI_AUTO_LENGTH, &digest_value);
+  napi_value key_value = BytesToBuffer(env, key);
+  napi_value data_value = BytesToBuffer(env, ValueToBytes(env, GetRefValue(env, wrap->args[3])));
+  napi_value call_argv[3] = {
+      digest_value != nullptr ? digest_value : Undefined(env),
+      key_value != nullptr ? key_value : Undefined(env),
+      data_value != nullptr ? data_value : Undefined(env),
+  };
+  napi_value signature_value = nullptr;
+  if (!CallBindingMethod(env, binding, "hmacOneShot", 3, call_argv, &signature_value) || signature_value == nullptr) {
+    napi_value result = nullptr;
+    CaptureCallFailureAsJobResult(env, "ERR_CRYPTO_OPERATION_FAILED", "HMAC operation failed", &result);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  if (mode == kSignJobModeVerify) {
+    const std::vector<uint8_t> expected = ValueToBytes(env, GetRefValue(env, wrap->args[4]));
+    const std::vector<uint8_t> actual = ValueToBytes(env, signature_value);
+    const bool ok = expected.size() == actual.size() &&
+                    (expected.empty() || CRYPTO_memcmp(expected.data(), actual.data(), expected.size()) == 0);
+    napi_value out = nullptr;
+    napi_get_boolean(env, ok, &out);
+    return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, out));
+  }
+
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, signature_value));
+}
+
+napi_value KmacJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 6) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid KMAC arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+#if OPENSSL_VERSION_MAJOR >= 3
+  const int32_t mode = GetInt32Value(env, GetRefValue(env, wrap->args[0]), kSignJobModeSign);
+  std::vector<uint8_t> key;
+  std::string error_code;
+  std::string error_message;
+  if (!GetSecretKeyFromHandle(env, GetRefValue(env, wrap->args[1]), &key, &error_code, &error_message)) {
+    napi_value result = BuildJobErrorResult(env, error_code.c_str(), error_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const std::string algorithm = GetStringValue(env, GetRefValue(env, wrap->args[2]));
+  const std::vector<uint8_t> customization = ValueToBytes(env, GetRefValue(env, wrap->args[3]));
+  const uint32_t output_len = static_cast<uint32_t>(GetInt32Value(env, GetRefValue(env, wrap->args[4]), 0));
+  const std::vector<uint8_t> data = ValueToBytes(env, GetRefValue(env, wrap->args[5]));
+  const std::vector<uint8_t> expected = ValueToBytes(env, GetRefValue(env, wrap->args[6]));
+
+  if (output_len == 0) {
+    if (mode == kSignJobModeVerify) {
+      napi_value out = nullptr;
+      napi_get_boolean(env, expected.empty(), &out);
+      return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, out));
+    }
+    return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, std::vector<uint8_t>{}));
+  }
+
+  const char* algorithm_name = nullptr;
+  if (algorithm == "KMAC128") {
+    algorithm_name = OSSL_MAC_NAME_KMAC128;
+  } else if (algorithm == "KMAC256") {
+    algorithm_name = OSSL_MAC_NAME_KMAC256;
+  } else {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported KMAC algorithm");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  auto mac = ncrypto::EVPMacPointer::Fetch(algorithm_name);
+  auto mac_ctx = mac ? ncrypto::EVPMacCtxPointer::New(mac.get()) : ncrypto::EVPMacCtxPointer();
+  if (!mac_ctx) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "KMAC operation failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  size_t length_param = output_len;
+  OSSL_PARAM params[3];
+  size_t params_count = 0;
+  params[params_count++] = OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &length_param);
+  if (!customization.empty()) {
+    params[params_count++] = OSSL_PARAM_construct_octet_string(
+        OSSL_MAC_PARAM_CUSTOM, const_cast<unsigned char*>(customization.data()), customization.size());
+  }
+  params[params_count] = OSSL_PARAM_construct_end();
+
+  if (!mac_ctx.init({key.data(), key.size()}, params) || !mac_ctx.update({data.data(), data.size()})) {
+    napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "KMAC operation failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  ncrypto::DataPointer mac_output = mac_ctx.final(output_len);
+  if (!mac_output) {
+    napi_value result = BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "KMAC operation failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  std::vector<uint8_t> actual(static_cast<const uint8_t*>(mac_output.get()),
+                              static_cast<const uint8_t*>(mac_output.get()) + mac_output.size());
+
+  if (mode == kSignJobModeVerify) {
+    const bool ok = expected.size() == actual.size() &&
+                    (expected.empty() || CRYPTO_memcmp(expected.data(), actual.data(), expected.size()) == 0);
+    napi_value out = nullptr;
+    napi_get_boolean(env, ok, &out);
+    return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, out));
+  }
+
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, actual));
+#else
+  napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported crypto constructor");
+  return FinalizeJobRunResult(env, this_arg, wrap, result);
+#endif
+}
+
+napi_value DHKeyExportJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 2) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid DH export arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  KeyObjectWrap* key_wrap = UnwrapKeyObject(env, GetRefValue(env, wrap->args[1]));
+  if (key_wrap == nullptr || key_wrap->key_type == kKeyTypeSecret) {
+    napi_value result = BuildJobErrorResult(env, "ERR_INVALID_ARG_TYPE", "Invalid key handle");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  const int32_t format = GetInt32Value(env, GetRefValue(env, wrap->args[0]), 0);
+
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(key_wrap);
+  if (pkey == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  KeyEncodingSelection encoding;
+  napi_value exported = nullptr;
+  std::string error_code;
+  std::string error_message;
+  if (format == 1) {
+    if (key_wrap->key_type != kKeyTypePrivate) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    encoding.has_private_encoding = true;
+    encoding.private_format = kKeyFormatDER;
+    encoding.private_type = kKeyEncodingPKCS8;
+    if (!ExportPrivateKeyValue(env, pkey, encoding, "", &exported, &error_code, &error_message)) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "DH export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+  } else if (format == 2) {
+    if (key_wrap->key_type != kKeyTypePublic) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    encoding.has_public_encoding = true;
+    encoding.public_format = kKeyFormatDER;
+    encoding.public_type = kKeyEncodingSPKI;
+    if (!ExportPublicKeyValue(env, pkey, encoding, "", &exported, &error_code, &error_message)) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "DH export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+  } else {
+    EVP_PKEY_free(pkey);
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported export format");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  EVP_PKEY_free(pkey);
+
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, exported));
+}
+
+napi_value ECKeyExportJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 2) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid EC export arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  KeyObjectWrap* key_wrap = UnwrapKeyObject(env, GetRefValue(env, wrap->args[1]));
+  if (key_wrap == nullptr || key_wrap->key_type == kKeyTypeSecret) {
+    napi_value result = BuildJobErrorResult(env, "ERR_INVALID_ARG_TYPE", "Invalid key handle");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  const int32_t format = GetInt32Value(env, GetRefValue(env, wrap->args[0]), 0);
+
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(key_wrap);
+  if (pkey == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int base = EVP_PKEY_base_id(pkey);
+  std::string error_code;
+  std::string error_message;
+  if (format == 0) {
+    if (key_wrap->key_type != kKeyTypePublic) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+
+    if (base == EVP_PKEY_EC) {
+      EC_KEY* ec = EVP_PKEY_get1_EC_KEY(pkey);
+      const EC_GROUP* group = ec != nullptr ? EC_KEY_get0_group(ec) : nullptr;
+      const EC_POINT* point = ec != nullptr ? EC_KEY_get0_public_key(ec) : nullptr;
+      const point_conversion_form_t form = POINT_CONVERSION_UNCOMPRESSED;
+      const size_t need =
+          (group != nullptr && point != nullptr) ? EC_POINT_point2oct(group, point, form, nullptr, 0, nullptr) : 0;
+      std::vector<uint8_t> out(need);
+      const size_t have = need == 0 ? 0 : EC_POINT_point2oct(group, point, form, out.data(), out.size(), nullptr);
+      if (ec != nullptr) EC_KEY_free(ec);
+      EVP_PKEY_free(pkey);
+      if (have == 0) {
+        napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "EC export failed");
+        return FinalizeJobRunResult(env, this_arg, wrap, result);
+      }
+      out.resize(have);
+      return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, out));
+    }
+
+    if (base == EVP_PKEY_ED25519 || base == EVP_PKEY_ED448 || base == EVP_PKEY_X25519 || base == EVP_PKEY_X448) {
+      size_t len = 0;
+      if (EVP_PKEY_get_raw_public_key(pkey, nullptr, &len) != 1 || len == 0) {
+        EVP_PKEY_free(pkey);
+        napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "EC export failed");
+        return FinalizeJobRunResult(env, this_arg, wrap, result);
+      }
+      std::vector<uint8_t> out(len);
+      if (EVP_PKEY_get_raw_public_key(pkey, out.data(), &len) != 1) {
+        EVP_PKEY_free(pkey);
+        napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "EC export failed");
+        return FinalizeJobRunResult(env, this_arg, wrap, result);
+      }
+      EVP_PKEY_free(pkey);
+      out.resize(len);
+      return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, out));
+    }
+
+    EVP_PKEY_free(pkey);
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  if (format == 3) {
+    napi_value exported = key_wrap->key_type == kKeyTypePrivate
+                              ? ExportJwkPrivate(env, pkey, &error_code, &error_message, "")
+                              : ExportJwkPublic(env, pkey, &error_code, &error_message, "");
+    EVP_PKEY_free(pkey);
+    if (exported == nullptr) {
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "EC export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, exported));
+  }
+
+  KeyEncodingSelection encoding;
+  napi_value exported = nullptr;
+  if (format == 1) {
+    if (key_wrap->key_type != kKeyTypePrivate) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    encoding.has_private_encoding = true;
+    encoding.private_format = kKeyFormatDER;
+    encoding.private_type = kKeyEncodingPKCS8;
+    if (!ExportPrivateKeyValue(env, pkey, encoding, "", &exported, &error_code, &error_message)) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "EC export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+  } else if (format == 2) {
+    if (key_wrap->key_type != kKeyTypePublic) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    if (base == EVP_PKEY_EC) {
+      std::vector<uint8_t> out = ExportEcPublicDerSpkiUncompressed(pkey);
+      EVP_PKEY_free(pkey);
+      if (out.empty()) {
+        napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "EC export failed");
+        return FinalizeJobRunResult(env, this_arg, wrap, result);
+      }
+      return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, out));
+    }
+    encoding.has_public_encoding = true;
+    encoding.public_format = kKeyFormatDER;
+    encoding.public_type = kKeyEncodingSPKI;
+    if (!ExportPublicKeyValue(env, pkey, encoding, "", &exported, &error_code, &error_message)) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "EC export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+  } else {
+    EVP_PKEY_free(pkey);
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported export format");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  EVP_PKEY_free(pkey);
+
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, exported));
+}
+
+napi_value RSAKeyExportJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 2) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid RSA export arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  KeyObjectWrap* key_wrap = UnwrapKeyObject(env, GetRefValue(env, wrap->args[1]));
+  if (key_wrap == nullptr || key_wrap->key_type == kKeyTypeSecret) {
+    napi_value result = BuildJobErrorResult(env, "ERR_INVALID_ARG_TYPE", "Invalid key handle");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  const int32_t format = GetInt32Value(env, GetRefValue(env, wrap->args[0]), 0);
+  const int32_t variant = GetInt32Value(env, GetRefValue(env, wrap->args[2]), kKeyVariantRSA_SSA_PKCS1_v1_5);
+
+  EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(key_wrap);
+  if (pkey == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int base = EVP_PKEY_base_id(pkey);
+  std::string error_code;
+  std::string error_message;
+  if (format == 0) {
+    EVP_PKEY_free(pkey);
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported export format");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  if (format == 3) {
+    if (base == EVP_PKEY_RSA_PSS && variant != kKeyVariantRSA_PSS) {
+      EVP_PKEY_free(pkey);
+      napi_value result =
+          BuildJobErrorResult(env, "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE", "Unsupported JWK Key Type.");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    napi_value exported = key_wrap->key_type == kKeyTypePrivate
+                              ? ExportJwkPrivate(env, pkey, &error_code, &error_message, "")
+                              : ExportJwkPublic(env, pkey, &error_code, &error_message, "");
+    EVP_PKEY_free(pkey);
+    if (exported == nullptr) {
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "RSA export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, exported));
+  }
+
+  KeyEncodingSelection encoding;
+  napi_value exported = nullptr;
+  if (format == 1) {
+    if (key_wrap->key_type != kKeyTypePrivate) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    encoding.has_private_encoding = true;
+    encoding.private_format = kKeyFormatDER;
+    encoding.private_type = kKeyEncodingPKCS8;
+    if (!ExportPrivateKeyValue(env, pkey, encoding, "", &exported, &error_code, &error_message)) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "RSA export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+  } else if (format == 2) {
+    if (key_wrap->key_type != kKeyTypePublic) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_KEYTYPE", "Invalid key type");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    encoding.has_public_encoding = true;
+    encoding.public_format = kKeyFormatDER;
+    encoding.public_type = kKeyEncodingSPKI;
+    if (!ExportPublicKeyValue(env, pkey, encoding, "", &exported, &error_code, &error_message)) {
+      EVP_PKEY_free(pkey);
+      napi_value result = BuildJobErrorResult(
+          env, error_code.empty() ? "ERR_CRYPTO_OPERATION_FAILED" : error_code.c_str(),
+          error_message.empty() ? "RSA export failed" : error_message);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+  } else {
+    EVP_PKEY_free(pkey);
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported export format");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  EVP_PKEY_free(pkey);
+
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, exported));
+}
+
+napi_value AESCipherJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 4) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid AES arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int32_t cipher_mode = GetInt32Value(env, GetRefValue(env, wrap->args[0]), 0);
+  std::vector<uint8_t> key;
+  std::string error_code;
+  std::string error_message;
+  if (!GetSecretKeyFromHandle(env, GetRefValue(env, wrap->args[1]), &key, &error_code, &error_message)) {
+    napi_value result = BuildJobErrorResult(env, error_code.c_str(), error_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const std::vector<uint8_t> input = ValueToBytes(env, GetRefValue(env, wrap->args[2]));
+  const int32_t variant = GetInt32Value(env, GetRefValue(env, wrap->args[3]), -1);
+  if (variant < 0) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported AES variant");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  if (IsAesCtrVariant(variant)) {
+    const std::vector<uint8_t> counter = ValueToBytes(env, GetRefValue(env, wrap->args[4]));
+    const uint32_t length_bits = static_cast<uint32_t>(GetInt32Value(env, GetRefValue(env, wrap->args[5]), 0));
+    std::vector<uint8_t> output;
+    if (!RunAesCtrCipher(key, variant, cipher_mode, counter, length_bits, input, &output)) {
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "AES-CTR operation failed");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, output));
+  }
+
+  const std::string algorithm = AesAlgorithmNameFromVariant(variant);
+  if (algorithm.empty()) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported AES variant");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value binding = GetBinding(env);
+  if (binding == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Crypto binding unavailable");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value algorithm_value = nullptr;
+  napi_create_string_utf8(env, algorithm.c_str(), NAPI_AUTO_LENGTH, &algorithm_value);
+  napi_value key_value = BytesToBuffer(env, key);
+  napi_value input_value = BytesToBuffer(env, input);
+  napi_value decrypt_value = nullptr;
+  napi_get_boolean(env, cipher_mode != 0, &decrypt_value);
+
+  if (IsAesAeadVariant(variant)) {
+    const std::vector<uint8_t> iv = ValueToBytes(env, GetRefValue(env, wrap->args[4]));
+    const std::vector<uint8_t> aad = ValueToBytes(env, GetRefValue(env, wrap->args[6]));
+    napi_value iv_value = BytesToBuffer(env, iv);
+    napi_value aad_value = BytesToBuffer(env, aad);
+    napi_value auth_tag_value = Undefined(env);
+    int32_t auth_tag_len = 16;
+    if (cipher_mode == 0) {
+      auth_tag_len = GetInt32Value(env, GetRefValue(env, wrap->args[5]), 16);
+    } else {
+      const std::vector<uint8_t> auth_tag = ValueToBytes(env, GetRefValue(env, wrap->args[5]));
+      auth_tag_value = BytesToBuffer(env, auth_tag);
+      auth_tag_len = static_cast<int32_t>(auth_tag.size());
+    }
+    napi_value auth_tag_len_value = nullptr;
+    napi_create_int32(env, auth_tag_len, &auth_tag_len_value);
+    napi_value call_argv[8] = {
+        algorithm_value != nullptr ? algorithm_value : Undefined(env),
+        key_value != nullptr ? key_value : Undefined(env),
+        iv_value != nullptr ? iv_value : Undefined(env),
+        input_value != nullptr ? input_value : Undefined(env),
+        decrypt_value != nullptr ? decrypt_value : Undefined(env),
+        aad_value != nullptr ? aad_value : Undefined(env),
+        auth_tag_value != nullptr ? auth_tag_value : Undefined(env),
+        auth_tag_len_value != nullptr ? auth_tag_len_value : Undefined(env),
+    };
+    napi_value output_info = nullptr;
+    if (!CallBindingMethod(env, binding, "cipherTransformAead", 8, call_argv, &output_info) ||
+        output_info == nullptr) {
+      napi_value result = nullptr;
+      CaptureCallFailureAsJobResult(env, "ERR_CRYPTO_OPERATION_FAILED", "AES cipher operation failed", &result);
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+
+    napi_value output_value = nullptr;
+    if (napi_get_named_property(env, output_info, "output", &output_value) != napi_ok || output_value == nullptr) {
+      napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "AES cipher operation failed");
+      return FinalizeJobRunResult(env, this_arg, wrap, result);
+    }
+    std::vector<uint8_t> output = ValueToBytes(env, output_value);
+    if (cipher_mode == 0) {
+      napi_value tag_value = nullptr;
+      if (napi_get_named_property(env, output_info, "authTag", &tag_value) == napi_ok && tag_value != nullptr &&
+          !IsUndefined(env, tag_value)) {
+        const std::vector<uint8_t> tag = ValueToBytes(env, tag_value);
+        output.insert(output.end(), tag.begin(), tag.end());
+      }
+    }
+    return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, output));
+  }
+
+  const std::vector<uint8_t> iv = IsAesWrapVariant(variant)
+                                      ? std::vector<uint8_t>{0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6}
+                                      : ValueToBytes(env, GetRefValue(env, wrap->args[4]));
+  napi_value iv_value = BytesToBuffer(env, iv);
+  napi_value auto_padding = nullptr;
+  napi_get_boolean(env, true, &auto_padding);
+  napi_value call_argv[7] = {
+      algorithm_value != nullptr ? algorithm_value : Undefined(env),
+      key_value != nullptr ? key_value : Undefined(env),
+      iv_value != nullptr ? iv_value : Undefined(env),
+      input_value != nullptr ? input_value : Undefined(env),
+      decrypt_value != nullptr ? decrypt_value : Undefined(env),
+      Undefined(env),
+      auto_padding != nullptr ? auto_padding : Undefined(env),
+  };
+  napi_value output_value = nullptr;
+  if (!CallBindingMethod(env, binding, "cipherTransform", 7, call_argv, &output_value) || output_value == nullptr) {
+    napi_value result = nullptr;
+    CaptureCallFailureAsJobResult(env, "ERR_CRYPTO_OPERATION_FAILED", "AES cipher operation failed", &result);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, output_value));
+}
+
+napi_value ChaCha20Poly1305CipherJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 5) {
+    napi_value result = BuildJobErrorResult(
+        env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid ChaCha20-Poly1305 arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const int32_t cipher_mode = GetInt32Value(env, GetRefValue(env, wrap->args[0]), 0);
+  std::vector<uint8_t> key;
+  std::string error_code;
+  std::string error_message;
+  if (!GetSecretKeyFromHandle(env, GetRefValue(env, wrap->args[1]), &key, &error_code, &error_message)) {
+    napi_value result = BuildJobErrorResult(env, error_code.c_str(), error_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const std::vector<uint8_t> input = ValueToBytes(env, GetRefValue(env, wrap->args[2]));
+  const std::vector<uint8_t> iv = ValueToBytes(env, GetRefValue(env, wrap->args[3]));
+  const std::vector<uint8_t> aad = ValueToBytes(env, GetRefValue(env, wrap->args[5]));
+
+  napi_value binding = GetBinding(env);
+  if (binding == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Crypto binding unavailable");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value algorithm_value = nullptr;
+  napi_create_string_utf8(env, "chacha20-poly1305", NAPI_AUTO_LENGTH, &algorithm_value);
+  napi_value key_value = BytesToBuffer(env, key);
+  napi_value iv_value = BytesToBuffer(env, iv);
+  napi_value input_value = BytesToBuffer(env, input);
+  napi_value decrypt_value = nullptr;
+  napi_get_boolean(env, cipher_mode != 0, &decrypt_value);
+  napi_value aad_value = BytesToBuffer(env, aad);
+  napi_value auth_tag_value = Undefined(env);
+  int32_t auth_tag_len = 16;
+  if (cipher_mode == 0) {
+    auth_tag_len = GetInt32Value(env, GetRefValue(env, wrap->args[4]), 16);
+  } else {
+    const std::vector<uint8_t> auth_tag = ValueToBytes(env, GetRefValue(env, wrap->args[4]));
+    auth_tag_value = BytesToBuffer(env, auth_tag);
+    auth_tag_len = static_cast<int32_t>(auth_tag.size());
+  }
+  napi_value auth_tag_len_value = nullptr;
+  napi_create_int32(env, auth_tag_len, &auth_tag_len_value);
+  napi_value call_argv[8] = {
+      algorithm_value != nullptr ? algorithm_value : Undefined(env),
+      key_value != nullptr ? key_value : Undefined(env),
+      iv_value != nullptr ? iv_value : Undefined(env),
+      input_value != nullptr ? input_value : Undefined(env),
+      decrypt_value != nullptr ? decrypt_value : Undefined(env),
+      aad_value != nullptr ? aad_value : Undefined(env),
+      auth_tag_value != nullptr ? auth_tag_value : Undefined(env),
+      auth_tag_len_value != nullptr ? auth_tag_len_value : Undefined(env),
+  };
+  napi_value output_info = nullptr;
+  if (!CallBindingMethod(env, binding, "cipherTransformAead", 8, call_argv, &output_info) || output_info == nullptr) {
+    napi_value result = nullptr;
+    CaptureCallFailureAsJobResult(
+        env, "ERR_CRYPTO_OPERATION_FAILED", "ChaCha20-Poly1305 operation failed", &result);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value output_value = nullptr;
+  if (napi_get_named_property(env, output_info, "output", &output_value) != napi_ok || output_value == nullptr) {
+    napi_value result =
+        BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "ChaCha20-Poly1305 operation failed");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+  std::vector<uint8_t> output = ValueToBytes(env, output_value);
+  if (cipher_mode == 0) {
+    napi_value tag_value = nullptr;
+    if (napi_get_named_property(env, output_info, "authTag", &tag_value) == napi_ok && tag_value != nullptr &&
+        !IsUndefined(env, tag_value)) {
+      const std::vector<uint8_t> tag = ValueToBytes(env, tag_value);
+      output.insert(output.end(), tag.begin(), tag.end());
+    }
+  }
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, output));
+}
+
+napi_value Argon2JobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 9) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid Argon2 arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L && !defined(OPENSSL_NO_ARGON2)
+  const std::vector<uint8_t> pass = ValueToBytes(env, GetRefValue(env, wrap->args[0]));
+  const std::vector<uint8_t> salt = ValueToBytes(env, GetRefValue(env, wrap->args[1]));
+  const uint32_t lanes = static_cast<uint32_t>(GetInt32Value(env, GetRefValue(env, wrap->args[2]), 0));
+  const uint32_t keylen = static_cast<uint32_t>(GetInt32Value(env, GetRefValue(env, wrap->args[3]), 0));
+  const uint32_t memcost = static_cast<uint32_t>(GetInt32Value(env, GetRefValue(env, wrap->args[4]), 0));
+  const uint32_t iter = static_cast<uint32_t>(GetInt32Value(env, GetRefValue(env, wrap->args[5]), 0));
+  const std::vector<uint8_t> secret = ValueToBytes(env, GetRefValue(env, wrap->args[6]));
+  const std::vector<uint8_t> ad = ValueToBytes(env, GetRefValue(env, wrap->args[7]));
+  const int32_t type = GetInt32Value(env, GetRefValue(env, wrap->args[8]), 2);
+
+  ncrypto::Argon2Type argon_type = ncrypto::Argon2Type::ARGON2ID;
+  if (type == 0) {
+    argon_type = ncrypto::Argon2Type::ARGON2D;
+  } else if (type == 1) {
+    argon_type = ncrypto::Argon2Type::ARGON2I;
+  }
+
+  ncrypto::DataPointer output = ncrypto::argon2({reinterpret_cast<const char*>(pass.data()), pass.size()},
+                                                {salt.data(), salt.size()},
+                                                lanes,
+                                                keylen,
+                                                memcost,
+                                                iter,
+                                                0x13,
+                                                {secret.data(), secret.size()},
+                                                {ad.data(), ad.size()},
+                                                argon_type);
+  if (!output && keylen != 0) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_INVALID_ARGON2_PARAMS", "Invalid Argon2 parameters");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  std::vector<uint8_t> out;
+  if (output) {
+    out.assign(static_cast<const uint8_t*>(output.get()),
+               static_cast<const uint8_t*>(output.get()) + output.size());
+  }
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildArrayBufferJobResult(env, out));
+#else
+  napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_ARGON2_NOT_SUPPORTED", "Argon2 is not supported");
+  return FinalizeJobRunResult(env, this_arg, wrap, result);
+#endif
+}
+
+napi_value KEMEncapsulateJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.empty()) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid KEM arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+#if OPENSSL_VERSION_MAJOR >= 3
+  std::string error_code;
+  std::string error_message;
+  EVP_PKEY* pkey = GetAsymmetricKeyFromValue(
+      env, GetRefValue(env, wrap->args[0]), GetRefValue(env, wrap->args[3]), false, &error_code, &error_message);
+  if (pkey == nullptr) {
+    napi_value result = BuildJobErrorResult(env, error_code.c_str(), error_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  ncrypto::EVPKeyPointer key_ptr(pkey);
+  auto kem_result = ncrypto::KEM::Encapsulate(key_ptr);
+  if (!kem_result) {
+    napi_value result =
+        BuildJobOpenSslErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to perform encapsulation");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  napi_value out = nullptr;
+  napi_create_array_with_length(env, 2, &out);
+  if (out == nullptr) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to allocate result");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  std::vector<uint8_t> shared_key(static_cast<const uint8_t*>(kem_result->shared_key.get()),
+                                  static_cast<const uint8_t*>(kem_result->shared_key.get()) +
+                                      kem_result->shared_key.size());
+  std::vector<uint8_t> ciphertext(static_cast<const uint8_t*>(kem_result->ciphertext.get()),
+                                  static_cast<const uint8_t*>(kem_result->ciphertext.get()) +
+                                      kem_result->ciphertext.size());
+  napi_set_element(env, out, 0, BytesToBuffer(env, shared_key));
+  napi_set_element(env, out, 1, BytesToBuffer(env, ciphertext));
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, out));
+#else
+  napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_KEM_NOT_SUPPORTED", "KEM is not supported");
+  return FinalizeJobRunResult(env, this_arg, wrap, result);
+#endif
+}
+
+napi_value KEMDecapsulateJobRun(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  JobWrap* wrap = UnwrapJob(env, this_arg);
+  if (wrap == nullptr || wrap->args.size() < 5) {
+    napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Invalid KEM arguments");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+#if OPENSSL_VERSION_MAJOR >= 3
+  std::string error_code;
+  std::string error_message;
+  EVP_PKEY* pkey = GetAsymmetricKeyFromValue(
+      env, GetRefValue(env, wrap->args[0]), GetRefValue(env, wrap->args[3]), true, &error_code, &error_message);
+  if (pkey == nullptr) {
+    napi_value result = BuildJobErrorResult(env, error_code.c_str(), error_message);
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  const std::vector<uint8_t> ciphertext = ValueToBytes(env, GetRefValue(env, wrap->args[4]));
+  ncrypto::EVPKeyPointer key_ptr(pkey);
+  ncrypto::DataPointer output = ncrypto::KEM::Decapsulate(key_ptr, {ciphertext.data(), ciphertext.size()});
+  if (!output) {
+    napi_value result = wrap->mode == kCryptoJobAsync
+                            ? BuildJobErrorResult(env, "ERR_CRYPTO_OPERATION_FAILED", "Deriving bits failed")
+                            : BuildJobOpenSslErrorResult(
+                                  env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to perform decapsulation");
+    return FinalizeJobRunResult(env, this_arg, wrap, result);
+  }
+
+  std::vector<uint8_t> out(static_cast<const uint8_t*>(output.get()),
+                           static_cast<const uint8_t*>(output.get()) + output.size());
+  return FinalizeJobRunResult(env, this_arg, wrap, BuildJobResult(env, nullptr, BytesToBuffer(env, out)));
+#else
+  napi_value result = BuildJobErrorResult(env, "ERR_CRYPTO_KEM_NOT_SUPPORTED", "KEM is not supported");
+  return FinalizeJobRunResult(env, this_arg, wrap, result);
+#endif
+}
+
 napi_value RandomBytesJobRun(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
@@ -6045,6 +7423,17 @@ napi_value PBKDF2JobRun(napi_env env, napi_callback_info info) {
       digest != nullptr ? digest : Undefined(env),
   };
   napi_value result = RunSyncCall(env, this_arg, "pbkdf2Sync", argsv);
+  if (result != nullptr && !IsUndefined(env, result)) {
+    napi_value err = nullptr;
+    napi_value value = nullptr;
+    if (napi_get_element(env, result, 0, &err) == napi_ok &&
+        napi_get_element(env, result, 1, &value) == napi_ok &&
+        err != nullptr) {
+      if (value != nullptr && !IsUndefined(env, value)) {
+        result = BuildJobResult(env, err, CopyAsArrayBuffer(env, value));
+      }
+    }
+  }
   if (wrap->mode == kCryptoJobAsync) {
     InvokeJobOnDone(env, this_arg, result);
     return Undefined(env);
@@ -6147,9 +7536,32 @@ napi_value HashJobRun(napi_env env, napi_callback_info info) {
   JobWrap* wrap = UnwrapJob(env, this_arg);
   if (wrap == nullptr || wrap->args.size() < 2) return BuildJobResult(env, nullptr, Undefined(env));
   std::vector<napi_value> argsv;
-  for (size_t i = 0; i < wrap->args.size(); ++i) argsv.push_back(GetRefValue(env, wrap->args[i]));
-  const char* method = wrap->args.size() >= 3 ? "hashOneShotXof" : "hashOneShot";
+  bool has_output_length = false;
+  for (size_t i = 0; i < wrap->args.size(); ++i) {
+    napi_value value = GetRefValue(env, wrap->args[i]);
+    if (i == 2 && value != nullptr && !IsUndefined(env, value) && !IsNullOrUndefinedValue(env, value)) {
+      has_output_length = true;
+      uint32_t length_bits = 0;
+      if (napi_get_value_uint32(env, value, &length_bits) == napi_ok) {
+        napi_value length_bytes = nullptr;
+        if (napi_create_uint32(env, length_bits / CHAR_BIT, &length_bytes) == napi_ok && length_bytes != nullptr) {
+          value = length_bytes;
+        }
+      }
+    }
+    argsv.push_back(value);
+  }
+  const char* method = has_output_length ? "hashOneShotXof" : "hashOneShot";
   napi_value result = RunSyncCall(env, this_arg, method, argsv);
+  if (result != nullptr && !IsUndefined(env, result)) {
+    napi_value err = nullptr;
+    napi_value value = nullptr;
+    if (napi_get_element(env, result, 0, &err) == napi_ok &&
+        napi_get_element(env, result, 1, &value) == napi_ok &&
+        value != nullptr && !IsUndefined(env, value)) {
+      result = BuildJobResult(env, err, CopyAsArrayBuffer(env, value));
+    }
+  }
   if (wrap->mode == kCryptoJobAsync) {
     InvokeJobOnDone(env, this_arg, result);
     return Undefined(env);
@@ -6496,6 +7908,520 @@ napi_value CryptoNoop(napi_env env, napi_callback_info info) {
   return Undefined(env);
 }
 
+struct X509HandleWrap {
+  napi_env env = nullptr;
+  napi_ref wrapper_ref = nullptr;
+  ncrypto::X509Pointer cert;
+  ncrypto::X509Pointer issuer;
+};
+
+void X509HandleFinalize(napi_env env, void* data, void* /*hint*/) {
+  auto* wrap = static_cast<X509HandleWrap*>(data);
+  if (wrap == nullptr) return;
+  if (wrap->wrapper_ref != nullptr) {
+    napi_delete_reference(env, wrap->wrapper_ref);
+    wrap->wrapper_ref = nullptr;
+  }
+  delete wrap;
+}
+
+X509HandleWrap* UnwrapX509Handle(napi_env env, napi_value value) {
+  if (value == nullptr) return nullptr;
+  X509HandleWrap* wrap = nullptr;
+  if (napi_unwrap(env, value, reinterpret_cast<void**>(&wrap)) != napi_ok) return nullptr;
+  return wrap;
+}
+
+X509HandleWrap* UnwrapX509This(napi_env env, napi_callback_info info, size_t* argc, napi_value* argv) {
+  napi_value this_arg = nullptr;
+  size_t actual_argc = argc != nullptr ? *argc : 0;
+  napi_get_cb_info(env, info, argc != nullptr ? &actual_argc : nullptr, argv, &this_arg, nullptr);
+  if (argc != nullptr) *argc = actual_argc;
+  return UnwrapX509Handle(env, this_arg);
+}
+
+bool CreateNullPrototypeObjectLocal(napi_env env, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return false;
+  napi_value object_ctor = nullptr;
+  if (napi_get_named_property(env, global, "Object", &object_ctor) != napi_ok || object_ctor == nullptr) return false;
+  napi_value create_fn = nullptr;
+  if (napi_get_named_property(env, object_ctor, "create", &create_fn) != napi_ok || create_fn == nullptr) return false;
+  napi_value null_value = nullptr;
+  if (napi_get_null(env, &null_value) != napi_ok || null_value == nullptr) return false;
+  napi_value argv[1] = {null_value};
+  return napi_call_function(env, object_ctor, create_fn, 1, argv, out) == napi_ok && *out != nullptr;
+}
+
+std::string BioToString(ncrypto::BIOPointer&& bio) {
+  if (!bio) return {};
+  BUF_MEM* mem = nullptr;
+  BIO_get_mem_ptr(bio.get(), &mem);
+  if (mem == nullptr || mem->data == nullptr || mem->length == 0) return {};
+  return std::string(mem->data, mem->length);
+}
+
+std::vector<uint8_t> BioToBytes(ncrypto::BIOPointer&& bio) {
+  if (!bio) return {};
+  BUF_MEM* mem = nullptr;
+  BIO_get_mem_ptr(bio.get(), &mem);
+  if (mem == nullptr || mem->data == nullptr || mem->length == 0) return {};
+  const auto* begin = reinterpret_cast<const uint8_t*>(mem->data);
+  return std::vector<uint8_t>(begin, begin + mem->length);
+}
+
+napi_value StringValueFromUtf8(napi_env env, const std::string& text) {
+  napi_value out = nullptr;
+  if (napi_create_string_utf8(env, text.data(), text.size(), &out) != napi_ok) return Undefined(env);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value StringValueFromBio(napi_env env, ncrypto::BIOPointer&& bio) {
+  const std::string text = BioToString(std::move(bio));
+  if (text.empty()) return Undefined(env);
+  return StringValueFromUtf8(env, text);
+}
+
+napi_value BufferValueFromBio(napi_env env, ncrypto::BIOPointer&& bio) {
+  return BytesToBuffer(env, BioToBytes(std::move(bio)));
+}
+
+napi_value FingerprintValue(napi_env env, const ncrypto::Digest& digest, const ncrypto::X509View& cert) {
+  auto fp = cert.getFingerprint(digest);
+  if (!fp.has_value()) return Undefined(env);
+  return StringValueFromUtf8(env, fp.value());
+}
+
+napi_value CreateX509NameObjectValue(napi_env env, const ncrypto::X509Name& name) {
+  if (!name) return Undefined(env);
+  napi_value out = nullptr;
+  if (!CreateNullPrototypeObjectLocal(env, &out) || out == nullptr) return Undefined(env);
+
+  for (const auto& [key_text, value_text] : name) {
+    napi_value key = StringValueFromUtf8(env, key_text);
+    napi_value value = StringValueFromUtf8(env, value_text);
+    if (key == nullptr || value == nullptr) return Undefined(env);
+
+    bool has_prop = false;
+    if (napi_has_property(env, out, key, &has_prop) != napi_ok) return Undefined(env);
+    if (!has_prop) {
+      if (napi_set_property(env, out, key, value) != napi_ok) return Undefined(env);
+      continue;
+    }
+
+    napi_value current = nullptr;
+    if (napi_get_property(env, out, key, &current) != napi_ok || current == nullptr) return Undefined(env);
+    bool is_array = false;
+    if (napi_is_array(env, current, &is_array) == napi_ok && is_array) {
+      uint32_t length = 0;
+      napi_get_array_length(env, current, &length);
+      napi_set_element(env, current, length, value);
+      continue;
+    }
+
+    napi_value array = nullptr;
+    if (napi_create_array_with_length(env, 2, &array) != napi_ok || array == nullptr) return Undefined(env);
+    napi_set_element(env, array, 0, current);
+    napi_set_element(env, array, 1, value);
+    if (napi_set_property(env, out, key, array) != napi_ok) return Undefined(env);
+  }
+
+  return out;
+}
+
+napi_value CreateKeyUsageArrayValue(napi_env env, const ncrypto::X509View& cert) {
+  napi_value out = nullptr;
+  if (napi_create_array(env, &out) != napi_ok || out == nullptr) return Undefined(env);
+  uint32_t index = 0;
+  const bool ok = cert.enumUsages([&](std::string_view usage) {
+    napi_value value = StringValueFromUtf8(env, std::string(usage));
+    if (value != nullptr) {
+      napi_set_element(env, out, index++, value);
+    }
+  });
+  if (!ok) return Undefined(env);
+  return out;
+}
+
+napi_value CreateDateValue(napi_env env, int64_t seconds_since_epoch) {
+  napi_value out = nullptr;
+  if (napi_create_date(env, static_cast<double>(seconds_since_epoch) * 1000.0, &out) != napi_ok) {
+    return Undefined(env);
+  }
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value CreateHexStringValue(napi_env env, const BIGNUM* bn) {
+  if (bn == nullptr) return Undefined(env);
+  char* hex = BN_bn2hex(bn);
+  if (hex == nullptr) return Undefined(env);
+  napi_value out = nullptr;
+  napi_create_string_utf8(env, hex, NAPI_AUTO_LENGTH, &out);
+  OPENSSL_free(hex);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value CreateExponentStringValue(napi_env env, const BIGNUM* bn) {
+  if (bn == nullptr) return Undefined(env);
+  char text[32] = {0};
+  std::snprintf(text, sizeof(text), "0x%" PRIx64, static_cast<uint64_t>(ncrypto::BignumPointer::GetWord(bn)));
+  return StringValueFromUtf8(env, text);
+}
+
+napi_value CreateRsaPublicKeyBuffer(napi_env env, const ncrypto::Rsa& rsa) {
+  const int size = i2d_RSA_PUBKEY(rsa, nullptr);
+  if (size <= 0) return Undefined(env);
+  std::vector<uint8_t> out(static_cast<size_t>(size));
+  unsigned char* write_ptr = out.data();
+  if (i2d_RSA_PUBKEY(rsa, &write_ptr) != size) return Undefined(env);
+  return BytesToBuffer(env, out);
+}
+
+napi_value CreateEcPublicKeyBuffer(napi_env env, const ncrypto::Ec& ec) {
+  const EC_GROUP* group = ec.getGroup();
+  const EC_POINT* point = ncrypto::ECKeyPointer::GetPublicKey(ec);
+  if (group == nullptr || point == nullptr) return Undefined(env);
+  const point_conversion_form_t form = EC_KEY_get_conv_form(ec);
+  const size_t size = EC_POINT_point2oct(group, point, form, nullptr, 0, nullptr);
+  if (size == 0) return Undefined(env);
+  std::vector<uint8_t> out(size);
+  if (EC_POINT_point2oct(group, point, form, out.data(), out.size(), nullptr) != size) return Undefined(env);
+  return BytesToBuffer(env, out);
+}
+
+napi_value CreateCurveNameValue(napi_env env, const char* (*nid_to_name)(int), int nid) {
+  if (nid == 0 || nid_to_name == nullptr) return Undefined(env);
+  const char* name = nid_to_name(nid);
+  if (name == nullptr || name[0] == '\0') return Undefined(env);
+  return StringValueFromUtf8(env, name);
+}
+
+bool SetNamedPropertyIfDefined(napi_env env, napi_value target, const char* key, napi_value value) {
+  if (target == nullptr || key == nullptr || value == nullptr || IsUndefined(env, value)) return true;
+  return napi_set_named_property(env, target, key, value) == napi_ok;
+}
+
+napi_value CreateLegacyX509ObjectValue(napi_env env, const ncrypto::X509View& cert) {
+  napi_value out = nullptr;
+  if (!CreateNullPrototypeObjectLocal(env, &out) || out == nullptr) return Undefined(env);
+
+  auto serial = cert.getSerialNumber();
+
+  if (!SetNamedPropertyIfDefined(env, out, "subject", CreateX509NameObjectValue(env, cert.getSubjectName())) ||
+      !SetNamedPropertyIfDefined(env, out, "issuer", CreateX509NameObjectValue(env, cert.getIssuerName())) ||
+      !SetNamedPropertyIfDefined(env, out, "subjectaltname", StringValueFromBio(env, cert.getSubjectAltName())) ||
+      !SetNamedPropertyIfDefined(env, out, "infoAccess", StringValueFromBio(env, cert.getInfoAccess())) ||
+      !SetNamedPropertyIfDefined(env, out, "valid_from", StringValueFromBio(env, cert.getValidFrom())) ||
+      !SetNamedPropertyIfDefined(env, out, "valid_to", StringValueFromBio(env, cert.getValidTo())) ||
+      !SetNamedPropertyIfDefined(env, out, "fingerprint", FingerprintValue(env, ncrypto::Digest::SHA1, cert)) ||
+      !SetNamedPropertyIfDefined(env, out, "fingerprint256", FingerprintValue(env, ncrypto::Digest::SHA256, cert)) ||
+      !SetNamedPropertyIfDefined(env, out, "fingerprint512", FingerprintValue(env, ncrypto::Digest::SHA512, cert)) ||
+      !SetNamedPropertyIfDefined(env, out, "ext_key_usage", CreateKeyUsageArrayValue(env, cert)) ||
+      !SetNamedPropertyIfDefined(env,
+                                 out,
+                                 "serialNumber",
+                                 serial ? StringValueFromUtf8(env, static_cast<const char*>(serial.get())) : Undefined(env))) {
+    return Undefined(env);
+  }
+
+  napi_value ca = nullptr;
+  napi_get_boolean(env, cert.isCA(), &ca);
+  if (!SetNamedPropertyIfDefined(env, out, "ca", ca)) return Undefined(env);
+  if (!SetNamedPropertyIfDefined(env, out, "raw", BufferValueFromBio(env, cert.toDER()))) return Undefined(env);
+
+  cert.ifRsa([&](const ncrypto::Rsa& rsa) {
+    const auto pub = rsa.getPublicKey();
+    SetNamedPropertyIfDefined(env, out, "modulus", CreateHexStringValue(env, pub.n));
+    SetNamedPropertyIfDefined(env, out, "exponent", CreateExponentStringValue(env, pub.e));
+    SetNamedPropertyIfDefined(env, out, "pubkey", CreateRsaPublicKeyBuffer(env, rsa));
+    if (pub.n != nullptr) {
+      napi_value bits = nullptr;
+      napi_create_int32(env, BN_num_bits(pub.n), &bits);
+      SetNamedPropertyIfDefined(env, out, "bits", bits);
+    }
+    return true;
+  });
+
+  cert.ifEc([&](const ncrypto::Ec& ec) {
+    SetNamedPropertyIfDefined(env, out, "pubkey", CreateEcPublicKeyBuffer(env, ec));
+    const EC_GROUP* group = ec.getGroup();
+    if (group != nullptr) {
+      napi_value bits = nullptr;
+      napi_create_int32(env, EC_GROUP_order_bits(group), &bits);
+      SetNamedPropertyIfDefined(env, out, "bits", bits);
+    }
+    const int nid = ec.getCurve();
+    SetNamedPropertyIfDefined(env, out, "asn1Curve", CreateCurveNameValue(env, OBJ_nid2sn, nid));
+    SetNamedPropertyIfDefined(env, out, "nistCurve", CreateCurveNameValue(env, EC_curve_nid2nist, nid));
+    return true;
+  });
+
+  return out;
+}
+
+napi_value CreateX509HandleValue(napi_env env,
+                                 ncrypto::X509Pointer&& cert,
+                                 ncrypto::X509Pointer&& issuer = ncrypto::X509Pointer()) {
+  napi_value binding = GetBinding(env);
+  if (binding == nullptr) return Undefined(env);
+  napi_value ctor = nullptr;
+  if (napi_get_named_property(env, binding, "X509CertificateHandle", &ctor) != napi_ok || ctor == nullptr) {
+    return Undefined(env);
+  }
+  napi_value handle = nullptr;
+  if (napi_new_instance(env, ctor, 0, nullptr, &handle) != napi_ok || handle == nullptr) return Undefined(env);
+  X509HandleWrap* wrap = UnwrapX509Handle(env, handle);
+  if (wrap == nullptr) return Undefined(env);
+  wrap->cert = std::move(cert);
+  wrap->issuer = std::move(issuer);
+  return handle;
+}
+
+napi_value X509HandleConstructor(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, nullptr, nullptr, &this_arg, nullptr);
+  if (this_arg == nullptr) return Undefined(env);
+  auto* wrap = new X509HandleWrap();
+  wrap->env = env;
+  if (napi_wrap(env, this_arg, wrap, X509HandleFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
+    delete wrap;
+    return Undefined(env);
+  }
+  return this_arg;
+}
+
+napi_value X509HandleSubject(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? StringValueFromBio(env, wrap->cert.view().getSubject()) : Undefined(env);
+}
+
+napi_value X509HandleSubjectAltName(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? StringValueFromBio(env, wrap->cert.view().getSubjectAltName()) : Undefined(env);
+}
+
+napi_value X509HandleIssuer(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? StringValueFromBio(env, wrap->cert.view().getIssuer()) : Undefined(env);
+}
+
+napi_value X509HandleInfoAccess(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? StringValueFromBio(env, wrap->cert.view().getInfoAccess()) : Undefined(env);
+}
+
+napi_value X509HandleValidFrom(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? StringValueFromBio(env, wrap->cert.view().getValidFrom()) : Undefined(env);
+}
+
+napi_value X509HandleValidTo(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? StringValueFromBio(env, wrap->cert.view().getValidTo()) : Undefined(env);
+}
+
+napi_value X509HandleValidFromDate(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? CreateDateValue(env, wrap->cert.view().getValidFromTime()) : Undefined(env);
+}
+
+napi_value X509HandleValidToDate(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? CreateDateValue(env, wrap->cert.view().getValidToTime()) : Undefined(env);
+}
+
+napi_value X509HandleFingerprint(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? FingerprintValue(env, ncrypto::Digest::SHA1, wrap->cert.view()) : Undefined(env);
+}
+
+napi_value X509HandleFingerprint256(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? FingerprintValue(env, ncrypto::Digest::SHA256, wrap->cert.view()) : Undefined(env);
+}
+
+napi_value X509HandleFingerprint512(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? FingerprintValue(env, ncrypto::Digest::SHA512, wrap->cert.view()) : Undefined(env);
+}
+
+napi_value X509HandleKeyUsage(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? CreateKeyUsageArrayValue(env, wrap->cert.view()) : Undefined(env);
+}
+
+napi_value X509HandleSerialNumber(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  if (wrap == nullptr) return Undefined(env);
+  auto serial = wrap->cert.view().getSerialNumber();
+  if (!serial) return Undefined(env);
+  return StringValueFromUtf8(env, static_cast<const char*>(serial.get()));
+}
+
+napi_value X509HandleSignatureAlgorithm(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  if (wrap == nullptr) return Undefined(env);
+  auto value = wrap->cert.view().getSignatureAlgorithm();
+  return value.has_value() ? StringValueFromUtf8(env, std::string(value.value())) : Undefined(env);
+}
+
+napi_value X509HandleSignatureAlgorithmOid(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  if (wrap == nullptr) return Undefined(env);
+  auto value = wrap->cert.view().getSignatureAlgorithmOID();
+  return value.has_value() ? StringValueFromUtf8(env, value.value()) : Undefined(env);
+}
+
+napi_value X509HandleRaw(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? BufferValueFromBio(env, wrap->cert.view().toDER()) : Undefined(env);
+}
+
+napi_value X509HandlePem(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? StringValueFromBio(env, wrap->cert.view().toPEM()) : Undefined(env);
+}
+
+napi_value X509HandlePublicKey(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  if (wrap == nullptr) return Undefined(env);
+  auto result = wrap->cert.view().getPublicKey();
+  if (!result.value) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to get public key"));
+    return nullptr;
+  }
+  return CreateNativeKeyObjectHandleValue(env, kKeyTypePublic, result.value.get());
+}
+
+napi_value X509HandleCheckCA(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  napi_value out = nullptr;
+  napi_get_boolean(env, wrap != nullptr && wrap->cert.view().isCA(), &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value X509HandleCheckHost(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  X509HandleWrap* wrap = UnwrapX509This(env, info, &argc, argv);
+  if (wrap == nullptr || argc < 2) return Undefined(env);
+  const std::string name = GetStringValue(env, argv[0]);
+  uint32_t flags = 0;
+  napi_get_value_uint32(env, argv[1], &flags);
+  ncrypto::DataPointer peer_name;
+  switch (wrap->cert.view().checkHost(name, static_cast<int>(flags), &peer_name)) {
+    case ncrypto::X509View::CheckMatch::MATCH:
+      return peer_name ? StringValueFromUtf8(env, std::string(static_cast<const char*>(peer_name.get()), peer_name.size()))
+                       : argv[0];
+    case ncrypto::X509View::CheckMatch::NO_MATCH:
+      return Undefined(env);
+    case ncrypto::X509View::CheckMatch::INVALID_NAME:
+      napi_throw(env, CreateErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "Invalid name"));
+      return nullptr;
+    default:
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to check host"));
+      return nullptr;
+  }
+}
+
+napi_value X509HandleCheckEmail(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  X509HandleWrap* wrap = UnwrapX509This(env, info, &argc, argv);
+  if (wrap == nullptr || argc < 2) return Undefined(env);
+  const std::string name = GetStringValue(env, argv[0]);
+  uint32_t flags = 0;
+  napi_get_value_uint32(env, argv[1], &flags);
+  switch (wrap->cert.view().checkEmail(name, static_cast<int>(flags))) {
+    case ncrypto::X509View::CheckMatch::MATCH:
+      return argv[0];
+    case ncrypto::X509View::CheckMatch::NO_MATCH:
+      return Undefined(env);
+    case ncrypto::X509View::CheckMatch::INVALID_NAME:
+      napi_throw(env, CreateErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "Invalid name"));
+      return nullptr;
+    default:
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to check email"));
+      return nullptr;
+  }
+}
+
+napi_value X509HandleCheckIP(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  X509HandleWrap* wrap = UnwrapX509This(env, info, &argc, argv);
+  if (wrap == nullptr || argc < 2) return Undefined(env);
+  const std::string ip = GetStringValue(env, argv[0]);
+  uint32_t flags = 0;
+  napi_get_value_uint32(env, argv[1], &flags);
+  switch (wrap->cert.view().checkIp(ip, static_cast<int>(flags))) {
+    case ncrypto::X509View::CheckMatch::MATCH:
+      return argv[0];
+    case ncrypto::X509View::CheckMatch::NO_MATCH:
+      return Undefined(env);
+    case ncrypto::X509View::CheckMatch::INVALID_NAME:
+      napi_throw(env, CreateErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "Invalid IP"));
+      return nullptr;
+    default:
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to check IP"));
+      return nullptr;
+  }
+}
+
+napi_value X509HandleCheckIssued(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  X509HandleWrap* wrap = UnwrapX509This(env, info, &argc, argv);
+  if (wrap == nullptr || argc < 1) return Undefined(env);
+  X509HandleWrap* issuer = UnwrapX509Handle(env, argv[0]);
+  napi_value out = nullptr;
+  napi_get_boolean(env, issuer != nullptr && wrap->cert.view().isIssuedBy(issuer->cert.view()), &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value X509HandleCheckPrivateKey(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  X509HandleWrap* wrap = UnwrapX509This(env, info, &argc, argv);
+  if (wrap == nullptr || argc < 1) return Undefined(env);
+  std::string error_code;
+  std::string error_message;
+  EVP_PKEY* pkey = GetAsymmetricKeyFromValue(env, nullptr, argv[0], true, &error_code, &error_message);
+  if (pkey == nullptr) return Undefined(env);
+  ncrypto::EVPKeyPointer key(pkey);
+  napi_value out = nullptr;
+  napi_get_boolean(env, wrap->cert.view().checkPrivateKey(key), &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value X509HandleVerify(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  X509HandleWrap* wrap = UnwrapX509This(env, info, &argc, argv);
+  if (wrap == nullptr || argc < 1) return Undefined(env);
+  std::string error_code;
+  std::string error_message;
+  EVP_PKEY* pkey = GetAsymmetricKeyFromValue(env, nullptr, argv[0], true, &error_code, &error_message);
+  if (pkey == nullptr) return Undefined(env);
+  ncrypto::EVPKeyPointer key(pkey);
+  napi_value out = nullptr;
+  napi_get_boolean(env, wrap->cert.view().checkPublicKey(key), &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value X509HandleToLegacy(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  return wrap != nullptr ? CreateLegacyX509ObjectValue(env, wrap->cert.view()) : Undefined(env);
+}
+
+napi_value X509HandleGetIssuerCert(napi_env env, napi_callback_info info) {
+  X509HandleWrap* wrap = UnwrapX509This(env, info, nullptr, nullptr);
+  if (wrap == nullptr || !wrap->issuer) return Undefined(env);
+  return CreateX509HandleValue(env, wrap->issuer.view().clone());
+}
+
 napi_value CryptoGetSSLCiphers(napi_env env, napi_callback_info info) {
   napi_value binding = GetBinding(env);
   if (binding != nullptr) {
@@ -6509,13 +8435,27 @@ napi_value CryptoGetSSLCiphers(napi_env env, napi_callback_info info) {
 }
 
 napi_value CryptoParseX509(napi_env env, napi_callback_info info) {
-  napi_value out = nullptr;
-  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
-  SetNamedMethod(env, out, "subject", CryptoNoop);
-  SetNamedMethod(env, out, "issuer", CryptoNoop);
-  SetNamedMethod(env, out, "checkHost", CryptoNoop);
-  SetNamedMethod(env, out, "verify", CryptoNoop);
-  return out;
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1 || argv[0] == nullptr) return Undefined(env);
+  const std::vector<uint8_t> data = ValueToBytes(env, argv[0]);
+  auto result = ncrypto::X509Pointer::Parse({data.data(), data.size()});
+  if (!result.value) {
+    napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse X509 certificate"));
+    return nullptr;
+  }
+  ncrypto::X509Pointer issuer;
+  if (argc >= 2 && argv[1] != nullptr && !IsUndefined(env, argv[1]) && !IsNullOrUndefinedValue(env, argv[1])) {
+    const std::vector<uint8_t> issuer_data = ValueToBytes(env, argv[1]);
+    auto issuer_result = ncrypto::X509Pointer::Parse({issuer_data.data(), issuer_data.size()});
+    if (!issuer_result.value) {
+      napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse issuer certificate"));
+      return nullptr;
+    }
+    issuer = std::move(issuer_result.value);
+  }
+  return CreateX509HandleValue(env, std::move(result.value), std::move(issuer));
 }
 
 napi_value CryptoCreateNativeKeyObjectClass(napi_env env, napi_callback_info info) {
@@ -6869,6 +8809,9 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
                    nullptr},
                   {"initECRaw", nullptr, KeyObjectInitECRaw, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"initEDRaw", nullptr, KeyObjectInitEDRaw, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"initPqcRaw", nullptr, KeyObjectInitPqcRaw, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"rawPublicKey", nullptr, KeyObjectRawPublicKey, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"rawSeed", nullptr, KeyObjectRawSeed, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"keyDetail", nullptr, KeyObjectGetAsymmetricKeyDetails, nullptr, nullptr, nullptr, napi_default,
                    nullptr},
                   {"getSymmetricKeySize", nullptr, KeyObjectGetSymmetricKeySize, nullptr, nullptr, nullptr, napi_default,
@@ -7049,14 +8992,109 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               {
                   {"run", nullptr, ECDHBitsJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
               });
-
-  const char* stub_classes[] = {
-      "AESCipherJob",      "Argon2Job",          "ChaCha20Poly1305CipherJob",
-      "DHKeyExportJob",
-      "ECKeyExportJob",    "HmacJob",            "KEMDecapsulateJob",         "KEMEncapsulateJob",
-      "KmacJob",           "RSAKeyExportJob",
-  };
-  for (const char* cls : stub_classes) EnsureStubClass(env, out, cls);
+  EnsureClass(env,
+              out,
+              "X509CertificateHandle",
+              X509HandleConstructor,
+              {
+                  {"subject", nullptr, X509HandleSubject, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"subjectAltName", nullptr, X509HandleSubjectAltName, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"issuer", nullptr, X509HandleIssuer, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"infoAccess", nullptr, X509HandleInfoAccess, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"validFrom", nullptr, X509HandleValidFrom, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"validTo", nullptr, X509HandleValidTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"validFromDate", nullptr, X509HandleValidFromDate, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"validToDate", nullptr, X509HandleValidToDate, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"fingerprint", nullptr, X509HandleFingerprint, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"fingerprint256", nullptr, X509HandleFingerprint256, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"fingerprint512", nullptr, X509HandleFingerprint512, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"keyUsage", nullptr, X509HandleKeyUsage, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"serialNumber", nullptr, X509HandleSerialNumber, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"signatureAlgorithm", nullptr, X509HandleSignatureAlgorithm, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"signatureAlgorithmOid", nullptr, X509HandleSignatureAlgorithmOid, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"raw", nullptr, X509HandleRaw, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"pem", nullptr, X509HandlePem, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"publicKey", nullptr, X509HandlePublicKey, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"checkCA", nullptr, X509HandleCheckCA, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"checkHost", nullptr, X509HandleCheckHost, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"checkEmail", nullptr, X509HandleCheckEmail, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"checkIP", nullptr, X509HandleCheckIP, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"checkIssued", nullptr, X509HandleCheckIssued, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"checkPrivateKey", nullptr, X509HandleCheckPrivateKey, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"verify", nullptr, X509HandleVerify, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"toLegacy", nullptr, X509HandleToLegacy, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"getIssuerCert", nullptr, X509HandleGetIssuerCert, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "AESCipherJob",
+              JobCtor,
+              {
+                  {"run", nullptr, AESCipherJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "Argon2Job",
+              JobCtor,
+              {
+                  {"run", nullptr, Argon2JobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "ChaCha20Poly1305CipherJob",
+              JobCtor,
+              {
+                  {"run", nullptr, ChaCha20Poly1305CipherJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "DHKeyExportJob",
+              JobCtor,
+              {
+                  {"run", nullptr, DHKeyExportJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "ECKeyExportJob",
+              JobCtor,
+              {
+                  {"run", nullptr, ECKeyExportJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "HmacJob",
+              JobCtor,
+              {
+                  {"run", nullptr, HmacJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "KEMDecapsulateJob",
+              JobCtor,
+              {
+                  {"run", nullptr, KEMDecapsulateJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "KEMEncapsulateJob",
+              JobCtor,
+              {
+                  {"run", nullptr, KEMEncapsulateJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "KmacJob",
+              JobCtor,
+              {
+                  {"run", nullptr, KmacJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
+  EnsureClass(env,
+              out,
+              "RSAKeyExportJob",
+              JobCtor,
+              {
+                  {"run", nullptr, RSAKeyExportJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
+              });
 
   return out;
 }

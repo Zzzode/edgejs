@@ -407,6 +407,25 @@ bool ValidateNodeOptions(const std::vector<std::string>& node_options_tokens, st
   return true;
 }
 
+bool HasExactOptionToken(const std::vector<std::string>& tokens, const char* option) {
+  for (const auto& token : tokens) {
+    if (token == option) return true;
+  }
+  return false;
+}
+
+bool ValidateCaOptions(const ubi_options::EffectiveCliState& state, std::string* error_out) {
+  const bool use_openssl_ca = HasExactOptionToken(state.effective_tokens, "--use-openssl-ca");
+  const bool use_bundled_ca = HasExactOptionToken(state.effective_tokens, "--use-bundled-ca");
+  if (use_openssl_ca && use_bundled_ca) {
+    if (error_out != nullptr) {
+      *error_out = FormatCliError("either --use-openssl-ca or --use-bundled-ca can be used, not both");
+    }
+    return false;
+  }
+  return true;
+}
+
 bool RawExecArgvHasInputType(const std::vector<std::string>& raw_exec_argv) {
   for (const auto& token : raw_exec_argv) {
     if (token == "--input-type" || token.rfind("--input-type=", 0) == 0) {
@@ -610,6 +629,9 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       return false;
     }
     if (!ValidateNodeOptions(out_state->node_options_tokens, error_out)) {
+      return false;
+    }
+    if (!ValidateCaOptions(*out_state, error_out)) {
       return false;
     }
     ApplyEnvUpdates(out_state->env_updates);

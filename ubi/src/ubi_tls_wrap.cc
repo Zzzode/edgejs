@@ -16,7 +16,9 @@
 
 #include "crypto/ubi_secure_context_bridge.h"
 #include "ncrypto.h"
+#include "internal_binding/helpers.h"
 #include "ubi_async_wrap.h"
+#include "ubi_module_loader.h"
 #include "ubi_runtime.h"
 #include "ubi_stream_base.h"
 #include "ubi_stream_wrap.h"
@@ -122,6 +124,45 @@ napi_value GetNamedValue(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
   if (napi_get_named_property(env, obj, key, &out) != napi_ok) return nullptr;
   return out;
+}
+
+napi_value ResolveInternalBinding(napi_env env, const char* name) {
+  if (env == nullptr || name == nullptr) return nullptr;
+
+  napi_value global = internal_binding::GetGlobal(env);
+  if (global == nullptr) return nullptr;
+
+  napi_value internal_binding = UbiGetInternalBinding(env);
+  if (internal_binding == nullptr) {
+    if (napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok ||
+        internal_binding == nullptr) {
+      return nullptr;
+    }
+  }
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, internal_binding, &type) != napi_ok || type != napi_function) {
+    return nullptr;
+  }
+
+  napi_value binding_name = nullptr;
+  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &binding_name) != napi_ok ||
+      binding_name == nullptr) {
+    return nullptr;
+  }
+
+  napi_value binding = nullptr;
+  napi_value argv[1] = {binding_name};
+  if (napi_call_function(env, global, internal_binding, 1, argv, &binding) != napi_ok ||
+      binding == nullptr) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value ignored = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored);
+    }
+    return nullptr;
+  }
+  return binding;
 }
 
 void InvokeReqWithStatus(TlsWrap* wrap, napi_ref* req_ref, int status) {
@@ -648,10 +689,11 @@ void OnInternalWriteDone(TlsWrap* wrap, int status) {
 
   PendingEncryptedWrite pending = std::move(wrap->pending_encrypted_writes.front());
   wrap->pending_encrypted_writes.pop_front();
-  if (status < 0) {
-    EmitError(wrap, CreateErrorWithCode(wrap->env, "ERR_TLS_WRAP", uv_strerror(status)));
+  int effective_status = status;
+  if (wrap->ssl == nullptr) {
+    effective_status = UV_ECANCELED;
   }
-  CompleteReq(wrap, &pending.completion_req_ref, status);
+  CompleteReq(wrap, &pending.completion_req_ref, effective_status);
   MaybeStartParentShutdown(wrap);
   Cycle(wrap);
 }
@@ -1631,34 +1673,39 @@ std::string GetSubjectAltNameString(X509* cert) {
 
 napi_value CreateLegacyCertObject(napi_env env, X509* cert) {
   if (cert == nullptr) return Undefined(env);
-  napi_value out = nullptr;
-  napi_create_object(env, &out);
-  if (out == nullptr) return Undefined(env);
+  napi_value crypto_binding = ResolveInternalBinding(env, "crypto");
+  if (crypto_binding == nullptr) return Undefined(env);
 
-  napi_value subject = CreateX509NameObject(env, X509_get_subject_name(cert));
-  if (subject != nullptr) napi_set_named_property(env, out, "subject", subject);
-
-  napi_value issuer = CreateX509NameObject(env, X509_get_issuer_name(cert));
-  if (issuer != nullptr) napi_set_named_property(env, out, "issuer", issuer);
-
-  const std::string san = GetSubjectAltNameString(cert);
-  if (!san.empty()) {
-    napi_value san_v = nullptr;
-    napi_create_string_utf8(env, san.c_str(), san.size(), &san_v);
-    if (san_v != nullptr) napi_set_named_property(env, out, "subjectaltname", san_v);
+  napi_value parse_x509 = nullptr;
+  if (napi_get_named_property(env, crypto_binding, "parseX509", &parse_x509) != napi_ok || parse_x509 == nullptr) {
+    return Undefined(env);
   }
 
-  napi_value ca = MakeBool(env, X509_check_ca(cert) == 1);
-  if (ca != nullptr) napi_set_named_property(env, out, "ca", ca);
-
   const int der_len = i2d_X509(cert, nullptr);
-  if (der_len > 0) {
-    std::vector<uint8_t> der(static_cast<size_t>(der_len));
-    unsigned char* ptr = der.data();
-    if (i2d_X509(cert, &ptr) == der_len) {
-      napi_value raw = CreateBufferCopy(env, der.data(), der.size());
-      if (raw != nullptr) napi_set_named_property(env, out, "raw", raw);
-    }
+  if (der_len <= 0) return Undefined(env);
+  std::vector<uint8_t> der(static_cast<size_t>(der_len));
+  unsigned char* ptr = der.data();
+  if (i2d_X509(cert, &ptr) != der_len) return Undefined(env);
+
+  napi_value raw = CreateBufferCopy(env, der.data(), der.size());
+  if (raw == nullptr) return Undefined(env);
+  napi_value handle_argv[1] = {raw};
+  napi_value handle = nullptr;
+  if (napi_call_function(env, crypto_binding, parse_x509, 1, handle_argv, &handle) != napi_ok || handle == nullptr) {
+    return Undefined(env);
+  }
+
+  napi_value to_legacy = nullptr;
+  if (napi_get_named_property(env, handle, "toLegacy", &to_legacy) != napi_ok || to_legacy == nullptr) {
+    return Undefined(env);
+  }
+  napi_value out = nullptr;
+  if (napi_call_function(env, handle, to_legacy, 0, nullptr, &out) != napi_ok || out == nullptr) {
+    return Undefined(env);
+  }
+
+  if (X509_check_issued(cert, cert) == X509_V_OK) {
+    napi_set_named_property(env, out, "issuerCertificate", out);
   }
 
   return out;
@@ -1693,15 +1740,105 @@ napi_value TlsWrapGetCertificate(napi_env env, napi_callback_info info) {
 }
 
 napi_value TlsWrapGetPeerX509Certificate(napi_env env, napi_callback_info info) {
-  (void)env;
-  (void)info;
-  return Undefined(env);
+  TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
+  if (wrap == nullptr || wrap->ssl == nullptr) return Undefined(env);
+  X509* cert = SSL_get_peer_certificate(wrap->ssl);
+  if (cert == nullptr) return Undefined(env);
+
+  napi_value crypto_binding = ResolveInternalBinding(env, "crypto");
+  if (crypto_binding == nullptr) {
+    X509_free(cert);
+    return Undefined(env);
+  }
+
+  napi_value parse_x509 = nullptr;
+  if (napi_get_named_property(env, crypto_binding, "parseX509", &parse_x509) != napi_ok || parse_x509 == nullptr) {
+    X509_free(cert);
+    return Undefined(env);
+  }
+
+  const int der_len = i2d_X509(cert, nullptr);
+  if (der_len <= 0) {
+    X509_free(cert);
+    return Undefined(env);
+  }
+  std::vector<uint8_t> der(static_cast<size_t>(der_len));
+  unsigned char* ptr = der.data();
+  if (i2d_X509(cert, &ptr) != der_len) {
+    X509_free(cert);
+    return Undefined(env);
+  }
+
+  std::vector<uint8_t> issuer_der;
+  STACK_OF(X509)* chain = SSL_get_peer_cert_chain(wrap->ssl);
+  if (chain == nullptr) {
+#if OPENSSL_VERSION_MAJOR >= 3
+    chain = SSL_get0_verified_chain(wrap->ssl);
+#endif
+  }
+  if (chain != nullptr) {
+    const int count = sk_X509_num(chain);
+    for (int i = 0; i < count; ++i) {
+      X509* candidate = sk_X509_value(chain, i);
+      if (candidate == nullptr) continue;
+      if (X509_NAME_cmp(X509_get_subject_name(candidate), X509_get_issuer_name(cert)) != 0) continue;
+      const int issuer_len = i2d_X509(candidate, nullptr);
+      if (issuer_len <= 0) continue;
+      issuer_der.resize(static_cast<size_t>(issuer_len));
+      unsigned char* issuer_ptr = issuer_der.data();
+      if (i2d_X509(candidate, &issuer_ptr) != issuer_len) {
+        issuer_der.clear();
+      }
+      break;
+    }
+  }
+  X509_free(cert);
+
+  napi_value raw = CreateBufferCopy(env, der.data(), der.size());
+  if (raw == nullptr) return Undefined(env);
+  napi_value handle_argv[2] = {raw, Undefined(env)};
+  size_t handle_argc = 1;
+  if (!issuer_der.empty()) {
+    handle_argv[1] = CreateBufferCopy(env, issuer_der.data(), issuer_der.size());
+    if (handle_argv[1] != nullptr) {
+      handle_argc = 2;
+    }
+  }
+  napi_value out = nullptr;
+  if (napi_call_function(env, crypto_binding, parse_x509, handle_argc, handle_argv, &out) != napi_ok || out == nullptr) {
+    return Undefined(env);
+  }
+  return out;
 }
 
 napi_value TlsWrapGetX509Certificate(napi_env env, napi_callback_info info) {
-  (void)env;
-  (void)info;
-  return Undefined(env);
+  TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
+  if (wrap == nullptr || wrap->ssl == nullptr) return Undefined(env);
+  X509* cert = SSL_get_certificate(wrap->ssl);
+  if (cert == nullptr) return Undefined(env);
+
+  napi_value crypto_binding = ResolveInternalBinding(env, "crypto");
+  if (crypto_binding == nullptr) return Undefined(env);
+
+  napi_value parse_x509 = nullptr;
+  if (napi_get_named_property(env, crypto_binding, "parseX509", &parse_x509) != napi_ok || parse_x509 == nullptr) {
+    return Undefined(env);
+  }
+
+  const int der_len = i2d_X509(cert, nullptr);
+  if (der_len <= 0) return Undefined(env);
+  std::vector<uint8_t> der(static_cast<size_t>(der_len));
+  unsigned char* ptr = der.data();
+  if (i2d_X509(cert, &ptr) != der_len) return Undefined(env);
+
+  napi_value raw = CreateBufferCopy(env, der.data(), der.size());
+  if (raw == nullptr) return Undefined(env);
+  napi_value handle_argv[1] = {raw};
+  napi_value out = nullptr;
+  if (napi_call_function(env, crypto_binding, parse_x509, 1, handle_argv, &out) != napi_ok || out == nullptr) {
+    return Undefined(env);
+  }
+  return out;
 }
 
 napi_value TlsWrapSetKeyCert(napi_env env, napi_callback_info info) {

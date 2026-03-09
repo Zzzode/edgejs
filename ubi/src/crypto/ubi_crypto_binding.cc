@@ -21,6 +21,7 @@
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 namespace ubi::crypto {
 namespace {
@@ -325,6 +326,12 @@ void ThrowOpenSslError(napi_env env, const char* code, unsigned long err, const 
   if (effective_code != nullptr &&
       std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
       reason != nullptr &&
+      std::strstr(reason, "invalid digest") != nullptr) {
+    effective_code = "ERR_OSSL_INVALID_DIGEST";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
       std::strstr(reason, "pss saltlen too small") != nullptr) {
     effective_code = "ERR_OSSL_PSS_SALTLEN_TOO_SMALL";
   }
@@ -487,6 +494,77 @@ void UpdateIssuerFromStore(SecureContextHolder* holder) {
   }
   X509_STORE_CTX_free(store_ctx);
 #endif
+}
+
+int UseCertificateChain(SecureContextHolder* holder, const uint8_t* data, size_t len) {
+  if (holder == nullptr || holder->ctx == nullptr || data == nullptr || len == 0) return 0;
+
+  BIO* bio = BIO_new_mem_buf(data, static_cast<int>(len));
+  if (bio == nullptr) return 0;
+
+  ncrypto::X509Pointer cert(PEM_read_bio_X509_AUX(bio, nullptr, nullptr, nullptr));
+  if (!cert) {
+    BIO_free(bio);
+    return 0;
+  }
+
+  ncrypto::StackOfX509 extra_certs(sk_X509_new_null());
+  if (!extra_certs) {
+    BIO_free(bio);
+    return 0;
+  }
+
+  ncrypto::X509Pointer extra;
+  while ((extra = ncrypto::X509Pointer(PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)))) {
+    if (!sk_X509_push(extra_certs.get(), extra.get())) {
+      BIO_free(bio);
+      return 0;
+    }
+    extra.release();
+  }
+
+  BIO_free(bio);
+
+  const unsigned long err = ERR_peek_last_error();
+  if (err != 0) {
+    if (ERR_GET_LIB(err) == ERR_LIB_PEM &&
+        ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
+      ERR_clear_error();
+    } else {
+      return 0;
+    }
+  }
+
+  X509* issuer = nullptr;
+  int ok = SSL_CTX_use_certificate(holder->ctx, cert.get());
+  if (ok == 1) {
+    SSL_CTX_clear_extra_chain_certs(holder->ctx);
+
+    const int count = sk_X509_num(extra_certs.get());
+    for (int i = 0; i < count; ++i) {
+      X509* ca = sk_X509_value(extra_certs.get(), i);
+      if (ca == nullptr) continue;
+      if (!SSL_CTX_add1_chain_cert(holder->ctx, ca)) {
+        ok = 0;
+        issuer = nullptr;
+        break;
+      }
+      if (issuer == nullptr && X509_check_issued(ca, cert.get()) == X509_V_OK) {
+        issuer = ca;
+      }
+    }
+  }
+
+  if (ok == 1) {
+    ResetStoredCertificate(&holder->cert, cert.get());
+    if (issuer != nullptr) {
+      ResetStoredCertificate(&holder->issuer, issuer);
+    } else {
+      UpdateIssuerFromStore(holder);
+    }
+  }
+
+  return ok;
 }
 
 X509* ParseX509(const uint8_t* data, size_t len);
@@ -1338,17 +1416,26 @@ napi_value CryptoSecureContextSetCert(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_INVALID_ARG_TYPE", "cert must be a string or Buffer");
     return nullptr;
   }
-  X509* cert = ParseX509(cert_bytes, cert_len);
-  if (cert == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_OSSL_PEM_NO_START_LINE", "Failed to parse certificate");
-    return nullptr;
+  int ok = 0;
+  const bool looks_like_pem =
+      cert_len >= 11 &&
+      std::memcmp(cert_bytes, "-----BEGIN ", 11) == 0;
+  if (looks_like_pem) {
+    ok = UseCertificateChain(holder, cert_bytes, cert_len);
   }
-  const int ok = SSL_CTX_use_certificate(holder->ctx, cert);
-  if (ok == 1) {
-    ResetStoredCertificate(&holder->cert, cert);
-    UpdateIssuerFromStore(holder);
+  if (ok != 1) {
+    X509* cert = ParseX509(cert_bytes, cert_len);
+    if (cert == nullptr) {
+      ThrowLastOpenSslError(env, "ERR_OSSL_PEM_NO_START_LINE", "Failed to parse certificate");
+      return nullptr;
+    }
+    ok = SSL_CTX_use_certificate(holder->ctx, cert);
+    if (ok == 1) {
+      ResetStoredCertificate(&holder->cert, cert);
+      UpdateIssuerFromStore(holder);
+    }
+    X509_free(cert);
   }
-  X509_free(cert);
   if (ok != 1) {
     ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to use certificate");
     return nullptr;
@@ -1770,7 +1857,7 @@ X509_CRL* ParseX509Crl(const uint8_t* data, size_t len) {
 
 std::string AsymmetricKeyTypeName(const EVP_PKEY* pkey) {
   if (pkey == nullptr) return "";
-  switch (EVP_PKEY_base_id(pkey)) {
+  switch (ncrypto::EVPKeyPointer::id(pkey)) {
     case EVP_PKEY_RSA:
       return "rsa";
     case EVP_PKEY_RSA_PSS:
@@ -1789,9 +1876,112 @@ std::string AsymmetricKeyTypeName(const EVP_PKEY* pkey) {
       return "x25519";
     case EVP_PKEY_X448:
       return "x448";
+#if OPENSSL_WITH_PQC
+    case EVP_PKEY_ML_DSA_44:
+      return "ml-dsa-44";
+    case EVP_PKEY_ML_DSA_65:
+      return "ml-dsa-65";
+    case EVP_PKEY_ML_DSA_87:
+      return "ml-dsa-87";
+    case EVP_PKEY_ML_KEM_512:
+      return "ml-kem-512";
+    case EVP_PKEY_ML_KEM_768:
+      return "ml-kem-768";
+    case EVP_PKEY_ML_KEM_1024:
+      return "ml-kem-1024";
+    case EVP_PKEY_SLH_DSA_SHA2_128S:
+      return "slh-dsa-sha2-128s";
+    case EVP_PKEY_SLH_DSA_SHA2_128F:
+      return "slh-dsa-sha2-128f";
+    case EVP_PKEY_SLH_DSA_SHA2_192S:
+      return "slh-dsa-sha2-192s";
+    case EVP_PKEY_SLH_DSA_SHA2_192F:
+      return "slh-dsa-sha2-192f";
+    case EVP_PKEY_SLH_DSA_SHA2_256S:
+      return "slh-dsa-sha2-256s";
+    case EVP_PKEY_SLH_DSA_SHA2_256F:
+      return "slh-dsa-sha2-256f";
+    case EVP_PKEY_SLH_DSA_SHAKE_128S:
+      return "slh-dsa-shake-128s";
+    case EVP_PKEY_SLH_DSA_SHAKE_128F:
+      return "slh-dsa-shake-128f";
+    case EVP_PKEY_SLH_DSA_SHAKE_192S:
+      return "slh-dsa-shake-192s";
+    case EVP_PKEY_SLH_DSA_SHAKE_192F:
+      return "slh-dsa-shake-192f";
+    case EVP_PKEY_SLH_DSA_SHAKE_256S:
+      return "slh-dsa-shake-256s";
+    case EVP_PKEY_SLH_DSA_SHAKE_256F:
+      return "slh-dsa-shake-256f";
+#endif
     default:
       return "";
   }
+}
+
+bool IsRsaVariant(int type) {
+  return type == EVP_PKEY_RSA || type == EVP_PKEY_RSA_PSS
+#ifdef EVP_PKEY_RSA2
+         || type == EVP_PKEY_RSA2
+#endif
+      ;
+}
+
+bool IsOneShotVariant(int type) {
+  switch (type) {
+    case EVP_PKEY_ED25519:
+    case EVP_PKEY_ED448:
+#if OPENSSL_WITH_PQC
+    case EVP_PKEY_ML_DSA_44:
+    case EVP_PKEY_ML_DSA_65:
+    case EVP_PKEY_ML_DSA_87:
+    case EVP_PKEY_SLH_DSA_SHA2_128F:
+    case EVP_PKEY_SLH_DSA_SHA2_128S:
+    case EVP_PKEY_SLH_DSA_SHA2_192F:
+    case EVP_PKEY_SLH_DSA_SHA2_192S:
+    case EVP_PKEY_SLH_DSA_SHA2_256F:
+    case EVP_PKEY_SLH_DSA_SHA2_256S:
+    case EVP_PKEY_SLH_DSA_SHAKE_128F:
+    case EVP_PKEY_SLH_DSA_SHAKE_128S:
+    case EVP_PKEY_SLH_DSA_SHAKE_192F:
+    case EVP_PKEY_SLH_DSA_SHAKE_192S:
+    case EVP_PKEY_SLH_DSA_SHAKE_256F:
+    case EVP_PKEY_SLH_DSA_SHAKE_256S:
+#endif
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool SupportsContextString(int type) {
+#if OPENSSL_VERSION_NUMBER < 0x3020000fL
+  return false;
+#else
+  switch (type) {
+    case EVP_PKEY_ED448:
+#if OPENSSL_WITH_PQC
+    case EVP_PKEY_ML_DSA_44:
+    case EVP_PKEY_ML_DSA_65:
+    case EVP_PKEY_ML_DSA_87:
+    case EVP_PKEY_SLH_DSA_SHA2_128F:
+    case EVP_PKEY_SLH_DSA_SHA2_128S:
+    case EVP_PKEY_SLH_DSA_SHA2_192F:
+    case EVP_PKEY_SLH_DSA_SHA2_192S:
+    case EVP_PKEY_SLH_DSA_SHA2_256F:
+    case EVP_PKEY_SLH_DSA_SHA2_256S:
+    case EVP_PKEY_SLH_DSA_SHAKE_128F:
+    case EVP_PKEY_SLH_DSA_SHAKE_128S:
+    case EVP_PKEY_SLH_DSA_SHAKE_192F:
+    case EVP_PKEY_SLH_DSA_SHAKE_192S:
+    case EVP_PKEY_SLH_DSA_SHAKE_256F:
+    case EVP_PKEY_SLH_DSA_SHAKE_256S:
+#endif
+      return true;
+    default:
+      return false;
+  }
+#endif
 }
 
 size_t GetDsaSigPartLengthFromPkey(EVP_PKEY* pkey) {
@@ -2551,17 +2741,17 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to create digest context");
     return nullptr;
   }
-  const int pkey_type = EVP_PKEY_base_id(pkey);
-  const bool is_rsa_family = (pkey_type == EVP_PKEY_RSA || pkey_type == EVP_PKEY_RSA_PSS);
+  const int pkey_type = ncrypto::EVPKeyPointer::id(pkey);
+  const bool is_rsa_family = IsRsaVariant(pkey_type);
+  const bool is_one_shot_variant = IsOneShotVariant(pkey_type);
   const bool is_ed_key = (pkey_type == EVP_PKEY_ED25519 || pkey_type == EVP_PKEY_ED448);
-  const bool is_ed448 = (pkey_type == EVP_PKEY_ED448);
   if (has_context && context_len > 255) {
     EVP_MD_CTX_free(mctx);
     EVP_PKEY_free(pkey);
     ThrowError(env, "ERR_OUT_OF_RANGE", "context string must be at most 255 bytes");
     return nullptr;
   }
-  if (has_context && context_len > 0 && !is_ed448) {
+  if (has_context && context_len > 0 && !SupportsContextString(pkey_type)) {
     EVP_MD_CTX_free(mctx);
     EVP_PKEY_free(pkey);
     ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
@@ -2680,7 +2870,7 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
   }
   size_t sig_len = 0;
   std::vector<uint8_t> sig;
-  if (ok && is_ed_key) {
+  if (ok && is_one_shot_variant) {
     ok = EVP_DigestSign(mctx, nullptr, &sig_len, data, data_len) == 1;
     if (ok) {
       sig.resize(sig_len);
@@ -2826,10 +3016,10 @@ napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to create digest context");
     return nullptr;
   }
-  const int pkey_type = EVP_PKEY_base_id(pkey);
-  const bool is_rsa_family = (pkey_type == EVP_PKEY_RSA || pkey_type == EVP_PKEY_RSA_PSS);
+  const int pkey_type = ncrypto::EVPKeyPointer::id(pkey);
+  const bool is_rsa_family = IsRsaVariant(pkey_type);
+  const bool is_one_shot_variant = IsOneShotVariant(pkey_type);
   const bool is_ed_key = (pkey_type == EVP_PKEY_ED25519 || pkey_type == EVP_PKEY_ED448);
-  const bool is_ed448 = (pkey_type == EVP_PKEY_ED448);
   if (dsa_sig_enc == 1 && (pkey_type == EVP_PKEY_EC || pkey_type == EVP_PKEY_DSA)) {
     const size_t part_len = GetDsaSigPartLengthFromPkey(pkey);
     if (part_len == 0 || sig_len != part_len * 2 ||
@@ -2849,7 +3039,7 @@ napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_OUT_OF_RANGE", "context string must be at most 255 bytes");
     return nullptr;
   }
-  if (has_context && context_len > 0 && !is_ed448) {
+  if (has_context && context_len > 0 && !SupportsContextString(pkey_type)) {
     EVP_MD_CTX_free(mctx);
     EVP_PKEY_free(pkey);
     ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
@@ -2954,7 +3144,7 @@ napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
     ok = false;
     ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported crypto operation");
   }
-  if (ok && is_ed_key) {
+  if (ok && is_one_shot_variant) {
     vr = EVP_DigestVerify(mctx, sig, sig_len, data, data_len);
   } else {
     if (ok) ok = EVP_DigestVerifyUpdate(mctx, data, data_len) == 1;
