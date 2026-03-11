@@ -432,6 +432,23 @@ bool ValidateCaOptions(const ubi_options::EffectiveCliState& state, std::string*
   return true;
 }
 
+bool ValidateTraceRequireModuleOption(const ubi_options::EffectiveCliState& state,
+                                      std::string* error_out) {
+  for (const auto& token : state.effective_tokens) {
+    constexpr std::string_view kPrefix = "--trace-require-module=";
+    if (token.rfind(kPrefix, 0) != 0) continue;
+    const std::string value = token.substr(kPrefix.size());
+    if (value == "all" || value == "no-node-modules") {
+      return true;
+    }
+    if (error_out != nullptr) {
+      *error_out = "invalid value for --trace-require-module";
+    }
+    return false;
+  }
+  return true;
+}
+
 bool RawExecArgvHasInputType(const std::vector<std::string>& raw_exec_argv) {
   for (const auto& token : raw_exec_argv) {
     if (token == "--input-type" || token.rfind("--input-type=", 0) == 0) {
@@ -638,6 +655,9 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       return false;
     }
     if (!ValidateCaOptions(*out_state, error_out)) {
+      return false;
+    }
+    if (!ValidateTraceRequireModuleOption(*out_state, error_out)) {
       return false;
     }
     ApplyEnvUpdates(out_state->env_updates);

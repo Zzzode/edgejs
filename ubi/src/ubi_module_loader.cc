@@ -1329,8 +1329,14 @@ static std::string ReadCliMarkdown() {
   const fs::path cwd = fs::current_path(ec);
   if (ec) return "";
   const std::vector<fs::path> candidates = {
+      cwd / "node-test" / "doc" / "api" / "cli.md",
+      cwd / "doc" / "api" / "cli.md",
       cwd / "node" / "doc" / "api" / "cli.md",
+      cwd / ".." / "node-test" / "doc" / "api" / "cli.md",
+      cwd / ".." / "doc" / "api" / "cli.md",
       cwd / ".." / "node" / "doc" / "api" / "cli.md",
+      cwd / ".." / ".." / "node-test" / "doc" / "api" / "cli.md",
+      cwd / ".." / ".." / "doc" / "api" / "cli.md",
       cwd / ".." / ".." / "node" / "doc" / "api" / "cli.md",
   };
   for (const auto& path : candidates) {
@@ -1912,12 +1918,17 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
       "--debug-arraybuffer-allocations",
       "--no-debug-arraybuffer-allocations",
       "--es-module-specifier-resolution",
+      "--experimental-detect-module",
+      "--no-experimental-detect-module",
       "--experimental-fetch",
+      "--experimental-require-module",
+      "--no-experimental-require-module",
       "--experimental-wasm-modules",
       "--experimental-global-customevent",
       "--experimental-global-webcrypto",
       "--experimental-report",
       "--experimental-strip-types",
+      "--no-experimental-strip-types",
       "--experimental-worker",
       "--node-snapshot",
       "--no-node-snapshot",

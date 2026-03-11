@@ -15,6 +15,7 @@
 
 #include "internal/napi_v8_env.h"
 #include "node_api.h"
+#include "unofficial_napi_error_utils.h"
 
 namespace {
 
@@ -141,86 +142,6 @@ std::string V8ValueToUtf8(v8::Isolate* isolate, v8::Local<v8::Value> value) {
   v8::String::Utf8Value utf8(isolate, value);
   if (*utf8 == nullptr) return {};
   return std::string(*utf8, utf8.length());
-}
-
-std::string BuildSyntaxArrowMessage(v8::Isolate* isolate,
-                                    v8::Local<v8::Context> context,
-                                    v8::Local<v8::Message> message) {
-  if (message.IsEmpty()) return {};
-
-  std::string filename = "<anonymous_script>";
-  v8::Local<v8::Value> script_resource_name = message->GetScriptResourceName();
-  if (!script_resource_name.IsEmpty() && !script_resource_name->IsUndefined()) {
-    const std::string utf8_name = V8ValueToUtf8(isolate, script_resource_name);
-    if (!utf8_name.empty()) filename = utf8_name;
-  }
-
-  const int line_number = message->GetLineNumber(context).FromMaybe(0);
-  v8::MaybeLocal<v8::String> source_line_maybe = message->GetSourceLine(context);
-  v8::Local<v8::String> source_line_v8;
-  if (!source_line_maybe.ToLocal(&source_line_v8)) return {};
-
-  const std::string source_line = V8ValueToUtf8(isolate, source_line_v8);
-  if (source_line.empty()) return {};
-
-  int start = message->GetStartColumn(context).FromMaybe(0);
-  int end = message->GetEndColumn(context).FromMaybe(start + 1);
-  if (end <= start) end = start + 1;
-  if (start < 0) start = 0;
-  if (end < 0) end = 0;
-
-  std::string underline(static_cast<size_t>(start), ' ');
-  underline.append(static_cast<size_t>(std::max(1, end - start)), '^');
-
-  return filename + ":" + std::to_string(line_number) + "\n" +
-         source_line + "\n" +
-         underline + "\n";
-}
-
-void AttachSyntaxArrowMessage(v8::Isolate* isolate,
-                              v8::Local<v8::Context> context,
-                              v8::Local<v8::Value> exception,
-                              v8::Local<v8::Message> message) {
-  if (exception.IsEmpty() || !exception->IsObject() || message.IsEmpty()) return;
-
-  v8::Local<v8::Object> err_obj = exception.As<v8::Object>();
-  v8::Local<v8::Private> arrow_key =
-      v8::Private::ForApi(isolate, OneByteString(isolate, "node:arrowMessage"));
-  v8::Local<v8::Private> decorated_key =
-      v8::Private::ForApi(isolate, OneByteString(isolate, "node:decorated"));
-
-  v8::Local<v8::Value> existing_arrow;
-  if (err_obj->GetPrivate(context, arrow_key).ToLocal(&existing_arrow) && existing_arrow->IsString()) {
-    return;
-  }
-
-  const std::string arrow = BuildSyntaxArrowMessage(isolate, context, message);
-  if (arrow.empty()) return;
-
-  v8::Local<v8::String> arrow_v8;
-  if (!v8::String::NewFromUtf8(isolate, arrow.c_str(), v8::NewStringType::kNormal).ToLocal(&arrow_v8)) {
-    return;
-  }
-  (void)err_obj->SetPrivate(context, arrow_key, arrow_v8);
-
-  v8::Local<v8::Value> decorated;
-  const bool already_decorated =
-      err_obj->GetPrivate(context, decorated_key).ToLocal(&decorated) && decorated->IsTrue();
-  if (already_decorated) return;
-
-  v8::Local<v8::Value> stack_value;
-  if (!err_obj->Get(context, OneByteString(isolate, "stack")).ToLocal(&stack_value) || !stack_value->IsString()) {
-    return;
-  }
-
-  v8::Local<v8::String> decorated_stack = v8::String::Concat(
-      isolate,
-      arrow_v8,
-      stack_value.As<v8::String>());
-  if (!err_obj->Set(context, OneByteString(isolate, "stack"), decorated_stack).FromMaybe(false)) {
-    return;
-  }
-  (void)err_obj->SetPrivate(context, decorated_key, v8::True(isolate));
 }
 
 std::string SerializeModuleRequestKey(const std::string& specifier,
@@ -569,6 +490,21 @@ void ThrowCodeError(napi_env env, const char* code, const std::string& message) 
   if (CreateCodeError(env, code, message, &error) && error != nullptr) {
     napi_throw(env, error);
   }
+}
+
+std::string RequireAsyncModuleMessage(const std::string& filename,
+                                      const std::string& parent_filename) {
+  std::string message =
+      "require() cannot be used on an ESM graph with top-level await. "
+      "Use import() instead. To see where the top-level await comes from, "
+      "use --experimental-print-required-tla.";
+  if (!parent_filename.empty()) {
+    message += "\n  From " + parent_filename + " ";
+  }
+  if (!filename.empty()) {
+    message += "\n  Requiring " + filename + " ";
+  }
+  return message;
 }
 
 void ThrowV8CodeError(v8::Local<v8::Context> context, const char* code, const std::string& message) {
@@ -1479,7 +1415,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function_for_cjs_loade
     can_parse_as_esm = CompileAsModule(isolate, context, code_str, filename_str);
     if (!can_parse_as_esm || !should_detect_module) {
       if (!cjs_exception.IsEmpty()) {
-        AttachSyntaxArrowMessage(isolate, context, cjs_exception, cjs_message);
+        unofficial_napi_internal::AttachSyntaxArrowMessage(isolate, context, cjs_exception, cjs_message);
         isolate->ThrowException(cjs_exception);
       }
       return cjs_exception.IsEmpty() ? napi_generic_failure : napi_pending_exception;
@@ -1676,7 +1612,8 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
   v8::Local<v8::Module> module;
   if (!v8::ScriptCompiler::CompileModule(isolate, &source_obj).ToLocal(&module)) {
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
-      AttachSyntaxArrowMessage(isolate, context, try_catch.Exception(), try_catch.Message());
+      unofficial_napi_internal::AttachSyntaxArrowMessage(
+          isolate, context, try_catch.Exception(), try_catch.Message());
       try_catch.ReThrow();
       return napi_pending_exception;
     }
@@ -1693,6 +1630,19 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_create_source_text(
   if (host_id_value != nullptr) {
     napi_create_reference(env, host_id_value, 1, &record->host_defined_option_ref);
     (void)SetHostDefinedOptionSymbolOnWrapper(env, wrapper, host_id_value);
+  }
+
+  napi_value has_tla = napi_v8_wrap_value(env, v8::Boolean::New(isolate, module->HasTopLevelAwait()));
+  if (has_tla != nullptr) {
+    (void)napi_set_named_property(env, wrapper, "hasTopLevelAwait", has_tla);
+  }
+  napi_value source_url = napi_v8_wrap_value(env, module->GetUnboundModuleScript()->GetSourceURL());
+  if (source_url != nullptr) {
+    (void)napi_set_named_property(env, wrapper, "sourceURL", source_url);
+  }
+  napi_value source_map_url = napi_v8_wrap_value(env, module->GetUnboundModuleScript()->GetSourceMappingURL());
+  if (source_map_url != nullptr) {
+    (void)napi_set_named_property(env, wrapper, "sourceMapURL", source_map_url);
   }
 
   if (!PopulateModuleRequests(env, record, context, module)) {
@@ -1923,11 +1873,67 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate(
 napi_status NAPI_CDECL unofficial_napi_module_wrap_evaluate_sync(
     napi_env env,
     void* handle,
+    napi_value filename,
+    napi_value parent_filename,
     napi_value* result_out) {
   if (env == nullptr || handle == nullptr || result_out == nullptr) return napi_invalid_arg;
-  napi_status st = unofficial_napi_module_wrap_evaluate(env, handle, -1, false, result_out);
-  if (st != napi_ok) return st;
-  return unofficial_napi_module_wrap_get_namespace(env, handle, result_out);
+  *result_out = nullptr;
+
+  ModuleWrapRecord* record = static_cast<ModuleWrapRecord*>(handle);
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = record->context.Get(isolate);
+  v8::Context::Scope context_scope(context);
+  v8::Local<v8::Module> module = record->module.Get(isolate);
+
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::Value> result;
+  if (!module->Evaluate(context).ToLocal(&result)) {
+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+      try_catch.ReThrow();
+      return napi_pending_exception;
+    }
+    return napi_generic_failure;
+  }
+  if (!result->IsPromise()) return napi_generic_failure;
+
+  napi_value promise = napi_v8_wrap_value(env, result);
+  if (promise == nullptr) return napi_generic_failure;
+
+  int32_t promise_state = 0;
+  napi_value promise_result = nullptr;
+  bool has_promise_result = false;
+  napi_status status = unofficial_napi_get_promise_details(
+      env, promise, &promise_state, &promise_result, &has_promise_result);
+  if (status != napi_ok) return status;
+
+  if (promise_state == 2 && has_promise_result && promise_result != nullptr) {
+    status = unofficial_napi_mark_promise_as_handled(env, promise);
+    if (status != napi_ok && status != napi_pending_exception) return status;
+    napi_throw(env, promise_result);
+    return napi_pending_exception;
+  }
+
+  if (module->IsGraphAsync()) {
+    auto stalled_messages = std::get<1>(module->GetStalledTopLevelAwaitMessages(isolate));
+    for (const auto& message : stalled_messages) {
+      const std::string info = unofficial_napi_internal::BuildSyntaxArrowMessage(isolate, context, message);
+      std::fprintf(stderr, "Error: unexpected top-level await at %s\n", info.c_str());
+    }
+    ThrowCodeError(env,
+                   "ERR_REQUIRE_ASYNC_MODULE",
+                   RequireAsyncModuleMessage(
+                       filename != nullptr ? V8ValueToUtf8(isolate, napi_v8_unwrap_value(filename)) : "",
+                       parent_filename != nullptr
+                           ? V8ValueToUtf8(isolate, napi_v8_unwrap_value(parent_filename))
+                           : ""));
+    return napi_pending_exception;
+  }
+
+  if (promise_state != 1) return napi_generic_failure;
+
+  *result_out = napi_v8_wrap_value(env, module->GetModuleNamespace());
+  return *result_out != nullptr ? napi_ok : napi_generic_failure;
 }
 
 napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
@@ -1941,6 +1947,10 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_get_namespace(
   v8::Local<v8::Context> context = record->context.Get(isolate);
   v8::Context::Scope context_scope(context);
   v8::Local<v8::Module> module = record->module.Get(isolate);
+  if (module->GetStatus() < v8::Module::Status::kInstantiated) {
+    ThrowCodeError(env, "ERR_MODULE_NOT_INSTANTIATED", "Module is not instantiated");
+    return napi_pending_exception;
+  }
   *result_out = napi_v8_wrap_value(env, module->GetModuleNamespace());
   return napi_ok;
 }
@@ -2024,7 +2034,7 @@ napi_status NAPI_CDECL unofficial_napi_module_wrap_check_unsettled_top_level_awa
   if (!warnings) return napi_ok;
 
   for (const auto& message : stalled_messages) {
-    const std::string info = BuildSyntaxArrowMessage(isolate, context, message);
+    const std::string info = unofficial_napi_internal::BuildSyntaxArrowMessage(isolate, context, message);
     std::fprintf(stderr, "Warning: Detected unsettled top-level await at %s\n", info.c_str());
   }
   return napi_ok;

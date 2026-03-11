@@ -374,14 +374,20 @@ napi_value ModuleWrapInstantiateSync(napi_env env, napi_callback_info info) {
 
 napi_value ModuleWrapEvaluateSync(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   ModuleWrapInstance* instance = UnwrapModuleWrap(env, this_arg);
   if (instance == nullptr) return Undefined(env);
   if (instance->module_handle == nullptr) return Undefined(env);
 
   napi_value out = nullptr;
-  if (unofficial_napi_module_wrap_evaluate_sync(env, instance->module_handle, &out) != napi_ok) {
+  if (unofficial_napi_module_wrap_evaluate_sync(
+          env,
+          instance->module_handle,
+          argc >= 1 ? argv[0] : nullptr,
+          argc >= 2 ? argv[1] : nullptr,
+          &out) != napi_ok) {
     return nullptr;
   }
   return out != nullptr ? out : Undefined(env);
@@ -447,7 +453,10 @@ napi_value ModuleWrapGetModuleSourceObject(napi_env env, napi_callback_info info
       out != nullptr) {
     return out;
   }
-  ThrowCodeError(env, "ERR_SOURCE_PHASE_NOT_DEFINED", "Source phase object is not defined");
+  const std::string message =
+      "Source phase import object is not defined for module '" +
+      ValueToUtf8(env, GetRefValue(env, instance->url_ref)) + "'";
+  ThrowCodeError(env, "ERR_SOURCE_PHASE_NOT_DEFINED", message.c_str());
   return nullptr;
 }
 
@@ -489,10 +498,6 @@ napi_value ModuleWrapGetNamespace(napi_env env, napi_callback_info info) {
     }
   }
   return Undefined(env);
-}
-
-napi_value ModuleWrapGetNamespaceSync(napi_env env, napi_callback_info info) {
-  return ModuleWrapGetNamespace(env, info);
 }
 
 napi_value ModuleWrapGetStatus(napi_env env, napi_callback_info info) {
@@ -617,6 +622,9 @@ napi_value ModuleWrapThrowIfPromiseRejected(napi_env env, napi_callback_info inf
   }
   // Mirror Node's native helper: only rejected promises are rethrown.
   if (state == 2 && has_result && result != nullptr) {
+    if (unofficial_napi_mark_promise_as_handled(env, argv[0]) != napi_ok) {
+      return nullptr;
+    }
     napi_throw(env, result);
     return nullptr;
   }
@@ -649,7 +657,6 @@ napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& /*options*/) {
       {"link", nullptr, ModuleWrapLink, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getModuleRequests", nullptr, ModuleWrapGetModuleRequests, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"instantiate", nullptr, ModuleWrapInstantiate, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"instantiateSync", nullptr, ModuleWrapInstantiateSync, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"evaluate", nullptr, ModuleWrapEvaluate, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"evaluateSync", nullptr, ModuleWrapEvaluateSync, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"setExport", nullptr, ModuleWrapSetExport, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -659,7 +666,6 @@ napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& /*options*/) {
        nullptr},
       {"createCachedData", nullptr, ModuleWrapCreateCachedData, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getNamespace", nullptr, ModuleWrapGetNamespace, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getNamespaceSync", nullptr, ModuleWrapGetNamespaceSync, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getStatus", nullptr, ModuleWrapGetStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getError", nullptr, ModuleWrapGetError, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"hasAsyncGraph", nullptr, nullptr, ModuleWrapHasAsyncGraph, nullptr, nullptr, napi_default, nullptr},

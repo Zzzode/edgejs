@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -287,98 +288,237 @@ std::string GetProcessVersion(napi_env env) {
   return out;
 }
 
-bool ParseTopStackFrame(const std::string& stack,
-                        std::string* file_out,
-                        int* line_out,
-                        int* column_out) {
-  if (file_out == nullptr || line_out == nullptr || column_out == nullptr) return false;
-  *file_out = "";
-  *line_out = 0;
-  *column_out = 0;
+std::string NapiValueToUtf8(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return {};
+  napi_value string_value = nullptr;
+  if (napi_coerce_to_string(env, value, &string_value) != napi_ok || string_value == nullptr) {
+    return {};
+  }
+  size_t length = 0;
+  if (napi_get_value_string_utf8(env, string_value, nullptr, 0, &length) != napi_ok) {
+    return {};
+  }
+  std::string out(length + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, string_value, out.data(), out.size(), &copied) != napi_ok) {
+    return {};
+  }
+  out.resize(copied);
+  return out;
+}
 
-  const size_t first_newline = stack.find('\n');
-  if (first_newline == std::string::npos) return false;
-  const size_t second_newline = stack.find('\n', first_newline + 1);
-  const std::string frame_line = stack.substr(first_newline + 1,
-                                              second_newline == std::string::npos ? std::string::npos
-                                                                                  : second_newline - first_newline - 1);
-  if (frame_line.empty()) return false;
+std::string GetNamedStringProperty(napi_env env, napi_value object, const char* name) {
+  if (env == nullptr || object == nullptr || name == nullptr) return {};
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, object, name, &value) != napi_ok || value == nullptr) {
+    return {};
+  }
+  return NapiValueToUtf8(env, value);
+}
 
-  size_t at_pos = frame_line.find("at ");
-  if (at_pos == std::string::npos) return false;
-  std::string location = frame_line.substr(at_pos + 3);
-  const size_t open_paren = location.rfind('(');
-  const size_t close_paren = location.rfind(')');
-  if (open_paren != std::string::npos && close_paren != std::string::npos && close_paren > open_paren) {
-    location = location.substr(open_paren + 1, close_paren - open_paren - 1);
+std::string GetAssertThrowsExceptionLineForStderr(napi_env env, napi_value exception) {
+  if (env == nullptr || exception == nullptr) return {};
+  if (GetNamedStringProperty(env, exception, "code") != "ERR_ASSERTION") {
+    return {};
+  }
+  if (GetNamedStringProperty(env, exception, "operator") != "throws") {
+    return {};
   }
 
-  const size_t last_colon = location.rfind(':');
-  if (last_colon == std::string::npos) return false;
-  const size_t prev_colon = location.rfind(':', last_colon - 1);
-  if (prev_colon == std::string::npos) return false;
-  const std::string file = location.substr(0, prev_colon);
-  if (file.rfind("node:", 0) == 0) return false;
+  napi_value actual = nullptr;
+  if (napi_get_named_property(env, exception, "actual", &actual) != napi_ok || actual == nullptr) {
+    return {};
+  }
+  const std::string actual_stack = GetNamedStringProperty(env, actual, "stack");
+  size_t marker = actual_stack.find("node:assert:");
+  if (marker == std::string::npos) {
+    marker = actual_stack.find("node:assert/");
+  }
 
-  int line = 0;
-  int col = 0;
-  try {
-    line = std::stoi(location.substr(prev_colon + 1, last_colon - prev_colon - 1));
-    col = std::stoi(location.substr(last_colon + 1));
-  } catch (...) {
+  std::string line_number = "0";
+  if (marker != std::string::npos) {
+    marker = actual_stack.find(':', marker);
+    if (marker != std::string::npos) {
+      ++marker;
+      size_t end = marker;
+      while (end < actual_stack.size() && std::isdigit(static_cast<unsigned char>(actual_stack[end]))) {
+        ++end;
+      }
+      if (end > marker) {
+        line_number = actual_stack.substr(marker, end - marker);
+      }
+    }
+  }
+
+  return "node:assert:" + line_number + "\n      throw err;\n      ^\n";
+}
+
+std::string GetInternalAssertExceptionLineForStderr(napi_env env, napi_value exception) {
+  if (env == nullptr || exception == nullptr) return {};
+  if (GetNamedStringProperty(env, exception, "code") != "ERR_INTERNAL_ASSERTION") {
+    return {};
+  }
+
+  const std::string stack = GetNamedStringProperty(env, exception, "stack");
+  size_t frame_pos = stack.find("at assert");
+  if (frame_pos == std::string::npos) return {};
+  size_t resource_pos = stack.find("node:internal/assert:", frame_pos);
+  if (resource_pos == std::string::npos) return {};
+
+  size_t line_start = resource_pos + std::strlen("node:internal/assert:");
+  size_t line_end = line_start;
+  while (line_end < stack.size() && std::isdigit(static_cast<unsigned char>(stack[line_end]))) {
+    ++line_end;
+  }
+  const std::string line_number =
+      line_end > line_start ? stack.substr(line_start, line_end - line_start) : "0";
+
+  const bool is_fail = stack.compare(frame_pos, std::strlen("at assert.fail"), "at assert.fail") == 0;
+  const char* source_line = is_fail ? "  throw new ERR_INTERNAL_ASSERTION(message);"
+                                    : "    throw new ERR_INTERNAL_ASSERTION(message);";
+  const char* caret_line = is_fail ? "  ^\n" : "    ^\n";
+  return "node:internal/assert:" + line_number + "\n" + source_line + "\n" + caret_line;
+}
+
+struct PendingExceptionInfo {
+  bool has_exception = false;
+  napi_value exception = nullptr;
+  std::string exception_line;
+};
+
+bool TakePendingExceptionInfo(napi_env env, PendingExceptionInfo* out) {
+  if (env == nullptr || out == nullptr) return false;
+  *out = {};
+
+  unofficial_napi_pending_exception_info pending = {};
+  if (unofficial_napi_get_and_clear_pending_exception(env, &pending) != napi_ok) {
     return false;
   }
-  if (line <= 0 || col <= 0) return false;
-  *file_out = file;
-  *line_out = line;
-  *column_out = col;
+
+  out->has_exception = pending.has_exception;
+  out->exception = pending.exception;
+  if (!pending.has_exception || pending.exception_line == nullptr) {
+    return true;
+  }
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, pending.exception_line, &type) != napi_ok || type == napi_undefined) {
+    return true;
+  }
+  out->exception_line = NapiValueToUtf8(env, pending.exception_line);
   return true;
 }
 
-std::string ReadSourceLine(const std::string& file, int line_number) {
-  if (file.empty() || line_number <= 0) return {};
-  std::ifstream stream(file);
-  if (!stream.is_open()) return {};
-  std::string line;
-  for (int i = 1; i <= line_number; ++i) {
-    if (!std::getline(stream, line)) return {};
+std::string GetExceptionLineForStderr(napi_env env, napi_value exception) {
+  const std::string internal_assert_line = GetInternalAssertExceptionLineForStderr(env, exception);
+  if (!internal_assert_line.empty()) {
+    return internal_assert_line;
   }
-  return line;
+
+  const std::string assert_throws_line = GetAssertThrowsExceptionLineForStderr(env, exception);
+  if (!assert_throws_line.empty()) {
+    return assert_throws_line;
+  }
+
+  unofficial_napi_error_source_positions positions = {};
+  if (unofficial_napi_get_error_source_positions(env, exception, &positions) != napi_ok ||
+      positions.source_line == nullptr ||
+      positions.script_resource_name == nullptr ||
+      positions.line_number <= 0) {
+    return {};
+  }
+
+  const std::string source_line = NapiValueToUtf8(env, positions.source_line);
+  const std::string script_resource_name = NapiValueToUtf8(env, positions.script_resource_name);
+  if (source_line.empty() || script_resource_name.empty()) {
+    return {};
+  }
+
+  int32_t start_column = positions.start_column;
+  int32_t end_column = positions.end_column;
+  if (script_resource_name == "node:internal/assert") {
+    start_column = 0;
+    while (start_column < static_cast<int32_t>(source_line.size()) &&
+           (source_line[static_cast<size_t>(start_column)] == ' ' ||
+            source_line[static_cast<size_t>(start_column)] == '\t')) {
+      ++start_column;
+    }
+    end_column = start_column + 1;
+  }
+  if (start_column < 0) start_column = 0;
+  if (end_column <= start_column) end_column = start_column + 1;
+
+  std::string underline(static_cast<size_t>(start_column), ' ');
+  underline.append(static_cast<size_t>(std::max<int32_t>(1, end_column - start_column)), '^');
+  return script_resource_name + ":" + std::to_string(positions.line_number) + "\n" +
+         source_line + "\n" +
+         underline + "\n";
+}
+
+void StripBuiltinModuleCompileFrame(std::string* message) {
+  if (message == nullptr || message->empty()) return;
+  static constexpr const char kFramePrefix[] =
+      "\n    at BuiltinModule.compileForInternalLoader (node:internal/bootstrap/realm:";
+  size_t pos = message->find(kFramePrefix);
+  while (pos != std::string::npos) {
+    const size_t end = message->find('\n', pos + 1);
+    message->erase(pos, end == std::string::npos ? std::string::npos : end - pos);
+    pos = message->find(kFramePrefix);
+  }
+}
+
+void NormalizeAssertionPropertyBlock(std::string* message) {
+  if (message == nullptr || message->empty()) return;
+  size_t block_pos = message->find("\n  generatedMessage:");
+  if (block_pos == std::string::npos) {
+    block_pos = message->find("\n  code:");
+  }
+  if (block_pos == std::string::npos || block_pos == 0) return;
+
+  const size_t line_start = message->rfind('\n', block_pos - 1);
+  if (line_start == std::string::npos) return;
+  if (block_pos >= 2 && message->compare(block_pos - 2, 2, " {") == 0) {
+    return;
+  }
+  message->insert(block_pos, " {");
+}
+
+void StripLeadingExceptionLine(std::string* message) {
+  if (message == nullptr || message->empty()) return;
+  size_t first_newline = message->find('\n');
+  if (first_newline == std::string::npos) return;
+  size_t second_newline = message->find('\n', first_newline + 1);
+  if (second_newline == std::string::npos) return;
+  size_t third_newline = message->find('\n', second_newline + 1);
+  if (third_newline == std::string::npos) return;
+  message->erase(0, third_newline + 1);
 }
 
 std::string FormatUncaughtExceptionForStderr(napi_env env,
-                                             const std::string& stack_message) {
+                                             napi_value exception,
+                                             const std::string& stack_message,
+                                             const std::string& pending_exception_line = {}) {
   if (stack_message.empty()) return stack_message;
 
   std::string formatted = stack_message;
-  std::string file;
-  int line = 0;
-  int column = 0;
-  if (ParseTopStackFrame(stack_message, &file, &line, &column)) {
-    const std::string source_line = ReadSourceLine(file, line);
-    if (!source_line.empty()) {
-      std::string caret;
-      const int caret_padding = column > 1 ? column - 1 : 0;
-      caret.assign(static_cast<size_t>(caret_padding), ' ');
-      caret.push_back('^');
-      formatted = file + ":" + std::to_string(line) + "\n" +
-                  source_line + "\n" +
-                  caret + "\n\n" +
-                  stack_message;
-    }
-  } else {
-    bool check_syntax_mode = false;
-    for (const auto& arg : g_ubi_cli_exec_argv) {
-      if (arg == "--check" || arg == "-c") {
-        check_syntax_mode = true;
-        break;
-      }
-    }
-    if (check_syntax_mode && !g_ubi_current_script_path.empty()) {
-      formatted = g_ubi_current_script_path + "\n" + stack_message;
-    }
+  const std::string code = GetNamedStringProperty(env, exception, "code");
+  const std::string operator_name = GetNamedStringProperty(env, exception, "operator");
+  const bool prefer_derived_exception_line =
+      code == "ERR_INTERNAL_ASSERTION" || (code == "ERR_ASSERTION" && operator_name == "throws");
+  const std::string derived_exception_line = GetExceptionLineForStderr(env, exception);
+  if (prefer_derived_exception_line &&
+      (formatted.rfind("node:internal/assert:", 0) == 0 || formatted.rfind("node:assert:", 0) == 0)) {
+    StripLeadingExceptionLine(&formatted);
   }
-
+  const std::string exception_line = prefer_derived_exception_line
+                                         ? derived_exception_line
+                                         : (pending_exception_line.empty() ? derived_exception_line
+                                                                           : pending_exception_line);
+  if (!exception_line.empty() && formatted.rfind(exception_line, 0) != 0) {
+    formatted = exception_line + formatted;
+  }
+  StripBuiltinModuleCompileFrame(&formatted);
+  NormalizeAssertionPropertyBlock(&formatted);
   const std::string version = GetProcessVersion(env);
   if (!version.empty()) {
     formatted += "\n\nNode.js " + version;
@@ -444,23 +584,20 @@ std::string StatusToString(napi_status status) {
 std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int* process_exit_code) {
   if (is_process_exit != nullptr) *is_process_exit = false;
   if (process_exit_code != nullptr) *process_exit_code = 1;
-  bool pending = false;
-  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) {
+  PendingExceptionInfo pending = {};
+  if (!TakePendingExceptionInfo(env, &pending) || !pending.has_exception || pending.exception == nullptr) {
     return "";
   }
 
-  napi_value exception = nullptr;
-  if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
-    return "";
-  }
-
-  const std::string enhanced_exception = UbiFormatFatalExceptionAfterInspector(env, exception);
+  const std::string enhanced_exception = UbiFormatFatalExceptionAfterInspector(env, pending.exception);
   if (!enhanced_exception.empty()) {
-    return FormatUncaughtExceptionForStderr(env, enhanced_exception);
+    return FormatUncaughtExceptionForStderr(
+        env, pending.exception, enhanced_exception, pending.exception_line);
   }
 
   napi_value stack_value = nullptr;
-  if (napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok && stack_value != nullptr) {
+  if (napi_get_named_property(env, pending.exception, "stack", &stack_value) == napi_ok &&
+      stack_value != nullptr) {
     napi_value stack_string = nullptr;
     if (napi_coerce_to_string(env, stack_value, &stack_string) == napi_ok && stack_string != nullptr) {
       size_t stack_len = 0;
@@ -468,14 +605,16 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
         std::vector<char> stack_buf(stack_len + 1, '\0');
         size_t copied = 0;
         if (napi_get_value_string_utf8(env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
-          return FormatUncaughtExceptionForStderr(env, std::string(stack_buf.data(), copied));
+          return FormatUncaughtExceptionForStderr(
+              env, pending.exception, std::string(stack_buf.data(), copied), pending.exception_line);
         }
       }
     }
   }
 
   napi_value exception_string = nullptr;
-  if (napi_coerce_to_string(env, exception, &exception_string) != napi_ok || exception_string == nullptr) {
+  if (napi_coerce_to_string(env, pending.exception, &exception_string) != napi_ok ||
+      exception_string == nullptr) {
     return "";
   }
 
@@ -762,14 +901,17 @@ bool ShouldAbortOnUncaughtException() {
          UbiExecArgvHasFlag("--abort_on_uncaught_exception");
 }
 
-std::string FormatFatalExceptionMessage(napi_env env, napi_value exception) {
+std::string FormatFatalExceptionMessage(napi_env env,
+                                        napi_value exception,
+                                        const std::string& pending_exception_line = {}) {
   if (env == nullptr || exception == nullptr) return "Unhandled async exception";
 
   std::string exception_message;
   const std::string enhanced_exception =
       UbiFormatFatalExceptionAfterInspector(env, exception);
   if (!enhanced_exception.empty()) {
-    exception_message = FormatUncaughtExceptionForStderr(env, enhanced_exception);
+    exception_message = FormatUncaughtExceptionForStderr(
+        env, exception, enhanced_exception, pending_exception_line);
   }
 
   napi_value stack_value = nullptr;
@@ -786,7 +928,8 @@ std::string FormatFatalExceptionMessage(napi_env env, napi_value exception) {
         size_t copied = 0;
         if (napi_get_value_string_utf8(
                 env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
-          exception_message.assign(stack_buf.data(), copied);
+          exception_message = FormatUncaughtExceptionForStderr(
+              env, exception, std::string(stack_buf.data(), copied), pending_exception_line);
         }
       }
     }
@@ -796,23 +939,18 @@ std::string FormatFatalExceptionMessage(napi_env env, napi_value exception) {
     napi_value exception_string = nullptr;
     if (napi_coerce_to_string(env, exception, &exception_string) == napi_ok &&
         exception_string != nullptr) {
-      size_t length = 0;
-      if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) == napi_ok) {
-        std::vector<char> buffer(length + 1, '\0');
-        size_t copied = 0;
-        if (napi_get_value_string_utf8(
-                env, exception_string, buffer.data(), buffer.size(), &copied) == napi_ok) {
-          exception_message.assign(buffer.data(), copied);
-        }
-      }
+      exception_message = FormatUncaughtExceptionForStderr(
+          env, exception, NapiValueToUtf8(env, exception_string), pending_exception_line);
     }
   }
 
   return exception_message.empty() ? "Unhandled async exception" : exception_message;
 }
 
-[[noreturn]] void AbortOnUncaughtException(napi_env env, napi_value exception) {
-  std::string exception_message = FormatFatalExceptionMessage(env, exception);
+[[noreturn]] void AbortOnUncaughtException(napi_env env,
+                                          napi_value exception,
+                                          const std::string& pending_exception_line = {}) {
+  std::string exception_message = FormatFatalExceptionMessage(env, exception, pending_exception_line);
   if (!exception_message.empty()) {
     if (exception_message.back() != '\n') exception_message.push_back('\n');
     WriteTextToFd(2, exception_message);
@@ -824,10 +962,12 @@ bool DispatchUncaughtException(napi_env env,
                                napi_value exception,
                                bool* handled_out,
                                napi_value* effective_exception_out = nullptr,
-                               int* fatal_exit_code_out = nullptr) {
+                               int* fatal_exit_code_out = nullptr,
+                               std::string* effective_exception_line_out = nullptr) {
   if (handled_out != nullptr) *handled_out = false;
   if (effective_exception_out != nullptr) *effective_exception_out = exception;
   if (fatal_exit_code_out != nullptr) *fatal_exit_code_out = -1;
+  if (effective_exception_line_out != nullptr) effective_exception_line_out->clear();
   if (exception == nullptr) return false;
 
   napi_value global = nullptr;
@@ -870,13 +1010,13 @@ bool DispatchUncaughtException(napi_env env,
       return true;
     }
 
-    bool has_pending = false;
-    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
-      napi_value pending = nullptr;
-      if (napi_get_and_clear_last_exception(env, &pending) == napi_ok && pending != nullptr) {
-        if (effective_exception_out != nullptr) {
-          *effective_exception_out = pending;
-        }
+    PendingExceptionInfo pending = {};
+    if (TakePendingExceptionInfo(env, &pending) && pending.has_exception && pending.exception != nullptr) {
+      if (effective_exception_out != nullptr) {
+        *effective_exception_out = pending.exception;
+      }
+      if (effective_exception_line_out != nullptr) {
+        *effective_exception_line_out = pending.exception_line;
       }
     }
     if (DebugExceptionsEnabled()) {
@@ -906,16 +1046,26 @@ bool DispatchUncaughtException(napi_env env,
   return true;
 }
 
-int HandleExtractedException(napi_env env, napi_value exception, std::string* error_out) {
+int HandleExtractedException(napi_env env,
+                             napi_value exception,
+                             std::string* error_out,
+                             const std::string& pending_exception_line = {}) {
   const bool abort_on_uncaught = ShouldAbortOnUncaughtException();
   if (abort_on_uncaught && !HasActiveDomainErrorHandler(env)) {
-    AbortOnUncaughtException(env, exception);
+    AbortOnUncaughtException(env, exception, pending_exception_line);
   }
 
   bool handled = false;
   napi_value effective_exception = exception;
+  std::string effective_exception_line = pending_exception_line;
   int fatal_exit_code = -1;
-  (void)DispatchUncaughtException(env, exception, &handled, &effective_exception, &fatal_exit_code);
+  (void)DispatchUncaughtException(
+      env,
+      exception,
+      &handled,
+      &effective_exception,
+      &fatal_exit_code,
+      &effective_exception_line);
   if (handled) {
     if (DebugExceptionsEnabled()) {
       std::cerr << "[ubi-exc] handled async exception, continue loop\n";
@@ -924,14 +1074,14 @@ int HandleExtractedException(napi_env env, napi_value exception, std::string* er
   }
 
   if (abort_on_uncaught) {
-    AbortOnUncaughtException(env, effective_exception);
+    AbortOnUncaughtException(env, effective_exception, effective_exception_line);
   }
 
   const int exit_code = EmitProcessExitOnFatalException(
       env,
       fatal_exit_code >= 0 ? fatal_exit_code : 1);
   const std::string exception_message =
-      FormatFatalExceptionMessage(env, effective_exception);
+      FormatFatalExceptionMessage(env, effective_exception, effective_exception_line);
   if (error_out != nullptr) {
     *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
   }
@@ -939,24 +1089,21 @@ int HandleExtractedException(napi_env env, napi_value exception, std::string* er
 }
 
 int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
-  bool has_pending = false;
-  if (napi_is_exception_pending(env, &has_pending) != napi_ok || !has_pending) {
+  PendingExceptionInfo pending = {};
+  if (!TakePendingExceptionInfo(env, &pending) || !pending.has_exception) {
     return -1;
   }
 
   if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
-    napi_value ignored = nullptr;
-    (void)napi_get_and_clear_last_exception(env, &ignored);
     return -1;
   }
 
-  napi_value exception = nullptr;
-  if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
+  if (pending.exception == nullptr) {
     if (error_out != nullptr) *error_out = "Unhandled async exception";
     return 1;
   }
 
-  return HandleExtractedException(env, exception, error_out);
+  return HandleExtractedException(env, pending.exception, error_out, pending.exception_line);
 }
 
 // Mirrors Node's native tick dispatch by preferring the task_queue callback
@@ -2644,63 +2791,39 @@ int RunScriptWithGlobals(napi_env env,
 
   std::string entry_source;
   const char* source_to_run = source_text;
-  bool source_is_wrapper_factory = false;
+  bool use_require_for_entry_main = false;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
     const bool check_syntax_mode = ExecArgvHasAnyFlag({"--check", "-c"});
     const std::string entry_main_module =
         check_syntax_mode ? "internal/main/check_syntax" : "internal/main/run_main_module";
-    entry_source =
-        "(function(require, getInternalBinding, internalBinding){"
-        "require('" +
-        entry_main_module +
-        "');"
-        "var __ib = (typeof getInternalBinding === 'function') ? getInternalBinding : "
-        "           ((typeof internalBinding === 'function') ? internalBinding : null);"
-        "if (__ib) {"
-        "  var __util = __ib('util');"
-        "  var __ps = __util && __util.privateSymbols;"
-        "  var __sym = __ps && __ps.entry_point_promise_private_symbol;"
-        "  if (__sym && globalThis[__sym]) return globalThis[__sym];"
-        "}"
-        "return undefined;"
-        "})";
-    source_to_run = entry_source.c_str();
-    source_is_wrapper_factory = true;
-  }
-
-  napi_value script = nullptr;
-  status = napi_create_string_utf8(env, source_to_run, NAPI_AUTO_LENGTH, &script);
-  if (status != napi_ok || script == nullptr) {
-    if (error_out != nullptr) {
-      *error_out = "napi_create_string_utf8 failed: " + StatusToString(status);
-    }
-    return 1;
+    entry_source = entry_main_module;
+    use_require_for_entry_main = true;
   }
 
   napi_value result = nullptr;
-  if (source_is_wrapper_factory) {
-    napi_value wrapper = nullptr;
-    status = napi_run_script(env, script, &wrapper);
-    if (status == napi_ok && wrapper != nullptr) {
-      napi_value global = nullptr;
-      napi_get_global(env, &global);
-      napi_value require_fn = UbiGetRequireFunction(env);
-      napi_value get_internal_binding = nullptr;
-      napi_value internal_binding = nullptr;
-      if (global != nullptr) {
-        (void)GetNamedProperty(env, global, "getInternalBinding", &get_internal_binding);
-        (void)GetNamedProperty(env, global, "internalBinding", &internal_binding);
+  if (use_require_for_entry_main) {
+    napi_value global = nullptr;
+    napi_value require_fn = UbiGetRequireFunction(env);
+    napi_value entry_name = nullptr;
+    if (napi_get_global(env, &global) != napi_ok ||
+        !IsFunction(env, require_fn) ||
+        napi_create_string_utf8(env, entry_source.c_str(), NAPI_AUTO_LENGTH, &entry_name) != napi_ok ||
+        entry_name == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to invoke entry main module";
       }
-      if (!IsFunction(env, require_fn)) {
-        status = napi_invalid_arg;
-      } else {
-        napi_value argv[3] = {require_fn, get_internal_binding, internal_binding};
-        if (argv[1] == nullptr) napi_get_undefined(env, &argv[1]);
-        if (argv[2] == nullptr) napi_get_undefined(env, &argv[2]);
-        status = napi_call_function(env, global, wrapper, 3, argv, &result);
-      }
+      return 1;
     }
+    status = napi_call_function(env, global, require_fn, 1, &entry_name, &result);
   } else {
+    napi_value script = nullptr;
+    status = napi_create_string_utf8(env, source_to_run, NAPI_AUTO_LENGTH, &script);
+    if (status != napi_ok || script == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "napi_create_string_utf8 failed: " + StatusToString(status);
+      }
+      return 1;
+    }
     status = napi_run_script(env, script, &result);
   }
   if (status == napi_ok) {
@@ -2750,11 +2873,13 @@ int RunScriptWithGlobals(napi_env env,
   }
 
   bool handled_top_level_exception = false;
-  napi_value top_level_exception = nullptr;
-  if (napi_get_and_clear_last_exception(env, &top_level_exception) == napi_ok &&
-      top_level_exception != nullptr) {
+  PendingExceptionInfo top_level_exception = {};
+  if (TakePendingExceptionInfo(env, &top_level_exception) &&
+      top_level_exception.has_exception &&
+      top_level_exception.exception != nullptr) {
     const int exception_status =
-        HandleExtractedException(env, top_level_exception, error_out);
+        HandleExtractedException(
+            env, top_level_exception.exception, error_out, top_level_exception.exception_line);
     if (exception_status >= 0) {
       return exception_status;
     }
@@ -2957,26 +3082,23 @@ bool UbiHandlePendingExceptionNow(napi_env env, bool* handled_out) {
   if (handled_out != nullptr) *handled_out = false;
   if (env == nullptr) return false;
 
-  bool has_pending = false;
-  if (napi_is_exception_pending(env, &has_pending) != napi_ok || !has_pending) {
-    return false;
-  }
-
-  napi_value exception = nullptr;
-  if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
+  PendingExceptionInfo pending = {};
+  if (!TakePendingExceptionInfo(env, &pending) || !pending.has_exception || pending.exception == nullptr) {
     return false;
   }
 
   bool handled = false;
-  napi_value effective_exception = exception;
-  const bool dispatched = DispatchUncaughtException(env, exception, &handled, &effective_exception, nullptr);
+  napi_value effective_exception = pending.exception;
+  std::string effective_exception_line = pending.exception_line;
+  const bool dispatched = DispatchUncaughtException(
+      env, pending.exception, &handled, &effective_exception, nullptr, &effective_exception_line);
   if (!dispatched || !handled) {
     bool has_pending = false;
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
       if (handled_out != nullptr) *handled_out = false;
       return true;
     }
-    (void)napi_throw(env, effective_exception != nullptr ? effective_exception : exception);
+    (void)napi_throw(env, effective_exception != nullptr ? effective_exception : pending.exception);
     if (handled_out != nullptr) *handled_out = false;
     return true;
   }
