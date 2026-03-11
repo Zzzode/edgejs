@@ -19,5 +19,7 @@ napi_value UbiGetRequireFunction(napi_env env);
 napi_value UbiGetInternalBinding(napi_env env);
 void UbiFinalizeModuleLoaderEnv(napi_env env);
 bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out);
+napi_value UbiGetBuiltinInternalBinding(napi_env env);
+bool UbiExecuteBuiltin(napi_env env, const char* id, napi_value* out);
 
 #endif  // UBI_MODULE_LOADER_H_

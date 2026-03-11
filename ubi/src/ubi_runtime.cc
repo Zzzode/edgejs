@@ -2335,6 +2335,7 @@ bool PrepareProcessPrototypeForBootstrap(napi_env env, std::string* error_out) {
 int RunScriptWithGlobals(napi_env env,
                          const char* source_text,
                          const char* entry_script_path,
+                         const char* native_main_builtin_id,
                          std::string* error_out,
                          bool keep_event_loop_alive,
                          UbiBootstrapMode mode) {
@@ -2419,6 +2420,26 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
+  auto execute_bootstrapper = [&](const char* id, napi_value* out_result) -> bool {
+    napi_value result = nullptr;
+    if (UbiExecuteBuiltin(env, id, &result)) {
+      if (out_result != nullptr) *out_result = result;
+      return true;
+    }
+    if (error_out != nullptr) {
+      std::string msg = std::string("Failed to execute ") + id;
+      bool is_exit = false;
+      int exit_code = 0;
+      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+      if (!exc.empty()) {
+        msg += ": ";
+        msg += exc;
+      }
+      *error_out = msg;
+    }
+    return false;
+  };
+
   auto require_bootstrap_module_exports = [&](const char* id, napi_value* out_exports) -> bool {
     napi_value exports = nullptr;
     if (UbiRequireBuiltin(env, id, &exports)) {
@@ -2458,9 +2479,6 @@ int RunScriptWithGlobals(napi_env env,
     return false;
   };
 
-  auto require_bootstrap_module = [&](const char* id) -> bool {
-    return require_bootstrap_module_exports(id, nullptr);
-  };
   auto define_hidden_global = [&](const char* name, napi_value value) -> bool {
     if (name == nullptr || value == nullptr) return false;
     napi_property_descriptor desc = {};
@@ -2519,35 +2537,30 @@ int RunScriptWithGlobals(napi_env env,
       get_linked_binding != nullptr) {
     define_hidden_global("getLinkedBinding", get_linked_binding);
   }
-  if (!require_bootstrap_module("internal/per_context/primordials")) {
+  if (!execute_bootstrapper("internal/per_context/primordials", nullptr)) {
     return 1;
   }
-  if (!require_bootstrap_module("internal/per_context/domexception") ||
-      !require_bootstrap_module("internal/per_context/messageport")) {
+  if (!execute_bootstrapper("internal/per_context/domexception", nullptr) ||
+      !execute_bootstrapper("internal/per_context/messageport", nullptr)) {
     return 1;
   }
-
-  napi_value realm_exports = nullptr;
-  if (!RequireModule(env, "internal/bootstrap/realm", &realm_exports) || realm_exports == nullptr) {
+  if (napi_set_named_property(env, global, "primordials", primordials_container) != napi_ok) {
     if (error_out != nullptr) {
-      std::string msg = "internal/bootstrap/realm bootstrap failed";
-      bool is_exit = false;
-      int exit_code = 0;
-      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
-      if (!exc.empty()) {
-        msg += ": ";
-        msg += exc;
-      }
-      *error_out = msg;
+      *error_out = "Failed to expose primordials during bootstrap";
     }
     return 1;
   }
 
-  napi_value internal_binding = native_internal_binding;
-  napi_value exported_internal_binding = nullptr;
-  if (GetNamedProperty(env, realm_exports, "internalBinding", &exported_internal_binding) &&
-      IsFunction(env, exported_internal_binding)) {
-    internal_binding = exported_internal_binding;
+  if (!execute_bootstrapper("internal/bootstrap/realm", nullptr)) {
+    return 1;
+  }
+
+  napi_value internal_binding = UbiGetBuiltinInternalBinding(env);
+  if (!IsFunction(env, internal_binding)) {
+    internal_binding = UbiGetInternalBinding(env);
+  }
+  if (!IsFunction(env, internal_binding)) {
+    internal_binding = native_internal_binding;
   }
   if (!define_hidden_global("internalBinding", internal_binding)) {
     if (error_out != nullptr) {
@@ -2621,12 +2634,7 @@ int RunScriptWithGlobals(napi_env env,
     }
   }
 
-  napi_value primordials_value = nullptr;
-  if (GetNamedProperty(env, realm_exports, "primordials", &primordials_value) &&
-      !IsUndefinedValue(env, primordials_value)) {
-    napi_set_named_property(env, global, "primordials", primordials_value);
-    UbiSetPrimordials(env, primordials_value);
-  }
+  UbiSetPrimordials(env, primordials_container);
 
   const char* thread_switch_module = mode == UbiBootstrapMode::kWorkerThread
                                          ? "internal/bootstrap/switches/is_not_main_thread"
@@ -2634,19 +2642,21 @@ int RunScriptWithGlobals(napi_env env,
   const char* process_state_switch_module = mode == UbiBootstrapMode::kWorkerThread
                                                 ? "internal/bootstrap/switches/does_not_own_process_state"
                                                 : "internal/bootstrap/switches/does_own_process_state";
-  if (!require_bootstrap_module("internal/bootstrap/node") ||
-      !require_bootstrap_module(thread_switch_module) ||
-      !require_bootstrap_module(process_state_switch_module) ||
-      !require_bootstrap_module("internal/bootstrap/web/exposed-wildcard") ||
-      !require_bootstrap_module("internal/bootstrap/web/exposed-window-or-worker")) {
+  if (!execute_bootstrapper("internal/bootstrap/node", nullptr) ||
+      !execute_bootstrapper(thread_switch_module, nullptr) ||
+      !execute_bootstrapper(process_state_switch_module, nullptr) ||
+      !execute_bootstrapper("internal/bootstrap/web/exposed-wildcard", nullptr) ||
+      !execute_bootstrapper("internal/bootstrap/web/exposed-window-or-worker", nullptr)) {
     return 1;
   }
 
   napi_value pre_execution_exports = nullptr;
+  const bool has_explicit_native_main =
+      native_main_builtin_id != nullptr && native_main_builtin_id[0] != '\0';
   const bool entry_script_bootstraps_main =
       entry_script_path != nullptr && entry_script_path[0] != '\0';
   const bool source_bootstraps_main =
-      entry_script_bootstraps_main || CliSourceRunsMainEntry(source_text);
+      entry_script_bootstraps_main || has_explicit_native_main || CliSourceRunsMainEntry(source_text);
   if (mode != UbiBootstrapMode::kWorkerThread && !source_bootstraps_main) {
     if (!require_bootstrap_module_exports("internal/process/pre_execution", &pre_execution_exports) ||
         pre_execution_exports == nullptr) {
@@ -2870,32 +2880,35 @@ int RunScriptWithGlobals(napi_env env,
     delete_global_named("internalBinding");
   }
 
-  std::string entry_source;
   const char* source_to_run = source_text;
-  bool use_require_for_entry_main = false;
+  const char* selected_main_builtin_id = native_main_builtin_id;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
     const bool check_syntax_mode = ExecArgvHasAnyFlag({"--check", "-c"});
-    const std::string entry_main_module =
-        check_syntax_mode ? "internal/main/check_syntax" : "internal/main/run_main_module";
-    entry_source = entry_main_module;
-    use_require_for_entry_main = true;
+    selected_main_builtin_id = check_syntax_mode ? "internal/main/check_syntax" : "internal/main/run_main_module";
+  }
+  if (mode == UbiBootstrapMode::kWorkerThread &&
+      selected_main_builtin_id != nullptr &&
+      std::strcmp(selected_main_builtin_id, "internal/main/worker_thread") == 0) {
+    delete_global_named("require");
+    delete_global_named("__filename");
+    delete_global_named("__dirname");
   }
 
   napi_value result = nullptr;
-  if (use_require_for_entry_main) {
-    napi_value global = nullptr;
-    napi_value require_fn = UbiGetRequireFunction(env);
-    napi_value entry_name = nullptr;
-    if (napi_get_global(env, &global) != napi_ok ||
-        !IsFunction(env, require_fn) ||
-        napi_create_string_utf8(env, entry_source.c_str(), NAPI_AUTO_LENGTH, &entry_name) != napi_ok ||
-        entry_name == nullptr) {
-      if (error_out != nullptr) {
-        *error_out = "Failed to invoke entry main module";
+  if (selected_main_builtin_id != nullptr && selected_main_builtin_id[0] != '\0') {
+    if (UbiExecuteBuiltin(env, selected_main_builtin_id, &result)) {
+      status = napi_ok;
+    } else {
+      bool has_pending_exception = false;
+      if (napi_is_exception_pending(env, &has_pending_exception) == napi_ok && has_pending_exception) {
+        status = napi_pending_exception;
+      } else {
+        if (error_out != nullptr) {
+          *error_out = std::string("Failed to execute ") + selected_main_builtin_id;
+        }
+        return 1;
       }
-      return 1;
     }
-    status = napi_call_function(env, global, require_fn, 1, &entry_name, &result);
   } else {
     napi_value script = nullptr;
     status = napi_create_string_utf8(env, source_to_run, NAPI_AUTO_LENGTH, &script);
@@ -3252,12 +3265,19 @@ napi_status UbiInstallConsole(napi_env env) {
 int UbiRunScriptSourceWithLoop(napi_env env,
                                const char* source_text,
                                std::string* error_out,
-                               bool keep_event_loop_alive) {
+                               bool keep_event_loop_alive,
+                               const char* native_main_builtin_id) {
   if (error_out != nullptr) {
     error_out->clear();
   }
   return RunScriptWithGlobals(
-      env, source_text, nullptr, error_out, keep_event_loop_alive, UbiBootstrapMode::kMainThread);
+      env,
+      source_text,
+      nullptr,
+      native_main_builtin_id,
+      error_out,
+      keep_event_loop_alive,
+      UbiBootstrapMode::kMainThread);
 }
 
 int UbiRunScriptSource(napi_env env, const char* source_text, std::string* error_out) {
@@ -3267,7 +3287,8 @@ int UbiRunScriptSource(napi_env env, const char* source_text, std::string* error
 int UbiRunScriptFileWithLoop(napi_env env,
                                const char* script_path,
                                std::string* error_out,
-                               bool keep_event_loop_alive) {
+                               bool keep_event_loop_alive,
+                               const char* native_main_builtin_id) {
   if (error_out != nullptr) {
     error_out->clear();
   }
@@ -3295,11 +3316,38 @@ int UbiRunScriptFileWithLoop(napi_env env,
         }
       }
     }
+    if (restore_cwd.empty() && fs_script_path != nullptr) {
+      const std::string script_path_s(fs_script_path);
+      constexpr std::string_view kVendoredTestAlias = "/.workspace/test/";
+      constexpr std::string_view kVendoredWorkspaceDir = "/.workspace";
+      const std::size_t alias_pos = script_path_s.find(kVendoredTestAlias);
+      if (alias_pos != std::string::npos) {
+        char cwd_buf[4096] = {'\0'};
+        if (getcwd(cwd_buf, sizeof(cwd_buf)) != nullptr) {
+          const std::string cwd(cwd_buf);
+          const std::string alias_root =
+              script_path_s.substr(0, alias_pos + kVendoredWorkspaceDir.size());
+          if (cwd == alias_root) {
+            restore_cwd = cwd;
+            const std::string inferred_test_dir = script_path_s.substr(0, alias_pos);
+            if (!inferred_test_dir.empty()) {
+              chdir(inferred_test_dir.c_str());
+            }
+          }
+        }
+      }
+    }
   }
 #endif
   const int rc =
       RunScriptWithGlobals(
-          env, source.c_str(), script_path, error_out, keep_event_loop_alive, UbiBootstrapMode::kMainThread);
+          env,
+          source.c_str(),
+          script_path,
+          native_main_builtin_id,
+          error_out,
+          keep_event_loop_alive,
+          UbiBootstrapMode::kMainThread);
 #if !defined(_WIN32)
   if (!restore_cwd.empty()) {
     chdir(restore_cwd.c_str());
@@ -3326,16 +3374,14 @@ int UbiRunWorkerThreadMain(napi_env env,
   g_ubi_process_title.clear();
   g_ubi_script_argv.clear();
 
-  static constexpr char kWorkerBootstrapSource[] =
-      "(function(){"
-      "const __ubi_require = require;"
-      "try { delete globalThis.require; } catch {}"
-      "try { delete globalThis.__filename; } catch {}"
-      "try { delete globalThis.__dirname; } catch {}"
-      "return __ubi_require('internal/main/worker_thread');"
-      "})()";
   return RunScriptWithGlobals(
-      env, kWorkerBootstrapSource, nullptr, error_out, true, UbiBootstrapMode::kWorkerThread);
+      env,
+      ";",
+      nullptr,
+      "internal/main/worker_thread",
+      error_out,
+      true,
+      UbiBootstrapMode::kWorkerThread);
 }
 
 bool UbiInitializeOpenSslForCli(std::string* error_out) {

@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -852,6 +853,28 @@ static bool IsPerContextBuiltinId(const std::string& id);
 static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state);
 static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state);
 static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state);
+static napi_value GetStateInternalBinding(napi_env env, ModuleLoaderState* state);
+static napi_value GetGlobalInternalBindingFunction(napi_env env, napi_value global);
+
+enum class NativeBuiltinExecutionKind {
+  kUnsupported,
+  kPerContext,
+  kBootstrapRealm,
+  kBootstrapOrMain,
+};
+
+static NativeBuiltinExecutionKind GetNativeBuiltinExecutionKind(const std::string& id) {
+  if (IsPerContextBuiltinId(id)) {
+    return NativeBuiltinExecutionKind::kPerContext;
+  }
+  if (id == "internal/bootstrap/realm") {
+    return NativeBuiltinExecutionKind::kBootstrapRealm;
+  }
+  if (id.rfind("internal/bootstrap/", 0) == 0 || id.rfind("internal/main/", 0) == 0) {
+    return NativeBuiltinExecutionKind::kBootstrapOrMain;
+  }
+  return NativeBuiltinExecutionKind::kUnsupported;
+}
 
 static const std::vector<std::string>& CollectRuntimeBuiltinIds() {
   static const std::vector<std::string> ids = []() {
@@ -1186,6 +1209,239 @@ static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state)
 static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state) {
   if (state == nullptr) return nullptr;
   return GetRefValue(env, state->per_isolate_symbols_ref);
+}
+
+static bool IsFunctionValue(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+static napi_value GetStateInternalBindingLoader(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->internal_binding_loader_ref);
+}
+
+static napi_value GetStateInternalBinding(napi_env env, ModuleLoaderState* state) {
+  napi_value internal_binding = GetStateInternalBindingLoader(env, state);
+  if (IsFunctionValue(env, internal_binding)) {
+    return internal_binding;
+  }
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->internal_binding_ref);
+}
+
+static bool CreateStringArray(napi_env env,
+                              std::initializer_list<const char*> values,
+                              napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  napi_value array = nullptr;
+  if (napi_create_array_with_length(env, values.size(), &array) != napi_ok || array == nullptr) {
+    return false;
+  }
+
+  size_t index = 0;
+  for (const char* value : values) {
+    napi_value entry = nullptr;
+    if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &entry) != napi_ok ||
+        entry == nullptr ||
+        napi_set_element(env, array, index++, entry) != napi_ok) {
+      return false;
+    }
+  }
+
+  *out = array;
+  return true;
+}
+
+static bool ThrowNativeBuiltinExecutionError(napi_env env,
+                                             const std::string& id,
+                                             const std::string& message) {
+  const std::string full_message = "Failed to execute builtin '" + id + "': " + message;
+  napi_throw_error(env, nullptr, full_message.c_str());
+  return false;
+}
+
+static bool ResolveNativeBuiltinCompileInput(napi_env env,
+                                             ModuleLoaderState* state,
+                                             const std::string& id,
+                                             napi_value* params_out,
+                                             std::vector<napi_value>* argv_out) {
+  if (params_out == nullptr || argv_out == nullptr) return false;
+  *params_out = nullptr;
+  argv_out->clear();
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return ThrowNativeBuiltinExecutionError(env, id, "failed to fetch global object");
+  }
+
+  napi_value process_obj = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return ThrowNativeBuiltinExecutionError(env, id, "process object is unavailable");
+  }
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+
+  const NativeBuiltinExecutionKind kind = GetNativeBuiltinExecutionKind(id);
+  switch (kind) {
+    case NativeBuiltinExecutionKind::kPerContext: {
+      napi_value exports_obj = nullptr;
+      if (napi_create_object(env, &exports_obj) != napi_ok || exports_obj == nullptr) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to create per-context exports object");
+      }
+
+      napi_value primordials = GetStatePrimordials(env, state);
+      if (primordials == nullptr) primordials = undefined;
+      if (napi_set_named_property(env, exports_obj, "primordials", primordials) != napi_ok) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to initialize per-context exports");
+      }
+
+      napi_value private_symbols = GetStatePrivateSymbols(env, state);
+      if (private_symbols == nullptr) private_symbols = undefined;
+      napi_value per_isolate_symbols = GetStatePerIsolateSymbols(env, state);
+      if (per_isolate_symbols == nullptr) per_isolate_symbols = undefined;
+
+      if (!CreateStringArray(env,
+                             {"exports", "primordials", "privateSymbols", "perIsolateSymbols"},
+                             params_out)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to build parameter list");
+      }
+      argv_out->assign({exports_obj, primordials, private_symbols, per_isolate_symbols});
+      return true;
+    }
+    case NativeBuiltinExecutionKind::kBootstrapRealm: {
+      napi_value get_linked_binding = nullptr;
+      if (napi_get_named_property(env, global, "getLinkedBinding", &get_linked_binding) != napi_ok ||
+          !IsFunctionValue(env, get_linked_binding)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "getLinkedBinding is unavailable");
+      }
+
+      napi_value get_internal_binding = nullptr;
+      if (napi_get_named_property(env, global, "getInternalBinding", &get_internal_binding) != napi_ok ||
+          !IsFunctionValue(env, get_internal_binding)) {
+        get_internal_binding = GetGlobalInternalBindingFunction(env, global);
+      }
+      if (!IsFunctionValue(env, get_internal_binding)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "getInternalBinding is unavailable");
+      }
+
+      napi_value primordials = GetStatePrimordials(env, state);
+      if (primordials == nullptr) primordials = undefined;
+
+      if (!CreateStringArray(env,
+                             {"process", "getLinkedBinding", "getInternalBinding", "primordials"},
+                             params_out)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to build parameter list");
+      }
+      argv_out->assign({process_obj, get_linked_binding, get_internal_binding, primordials});
+      return true;
+    }
+    case NativeBuiltinExecutionKind::kBootstrapOrMain: {
+      napi_value require_builtin = nullptr;
+      if (state != nullptr) {
+        require_builtin = GetRefValue(env, state->require_builtin_loader_ref);
+      }
+      if (!IsFunctionValue(env, require_builtin)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "requireBuiltin loader is unavailable");
+      }
+
+      napi_value internal_binding = GetStateInternalBinding(env, state);
+      if (!IsFunctionValue(env, internal_binding)) {
+        internal_binding = GetGlobalInternalBindingFunction(env, global);
+      }
+      if (!IsFunctionValue(env, internal_binding)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "internalBinding loader is unavailable");
+      }
+
+      napi_value primordials = GetStatePrimordials(env, state);
+      if (primordials == nullptr) primordials = undefined;
+
+      if (!CreateStringArray(env,
+                             {"process", "require", "internalBinding", "primordials"},
+                             params_out)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to build parameter list");
+      }
+      argv_out->assign({process_obj, require_builtin, internal_binding, primordials});
+      return true;
+    }
+    case NativeBuiltinExecutionKind::kUnsupported:
+      return ThrowNativeBuiltinExecutionError(env, id, "unsupported native execution kind");
+  }
+
+  return false;
+}
+
+static bool ExecuteBuiltinFromNative(napi_env env, ModuleLoaderState* state, const std::string& id, napi_value* out) {
+  if (out != nullptr) *out = nullptr;
+  if (env == nullptr || state == nullptr || id.empty()) return false;
+
+  fs::path resolved;
+  if (!builtin_catalog::ResolveBuiltinId(id, &resolved)) {
+    return ThrowNativeBuiltinExecutionError(env, id, "builtin source was not found");
+  }
+
+  const std::string source = ReadTextFile(resolved);
+  if (source.empty()) {
+    std::ifstream probe(resolved);
+    if (!probe.is_open()) {
+      return ThrowNativeBuiltinExecutionError(env, id, "builtin source could not be read");
+    }
+  }
+
+  napi_value params = nullptr;
+  std::vector<napi_value> argv;
+  if (!ResolveNativeBuiltinCompileInput(env, state, id, &params, &argv)) {
+    return false;
+  }
+
+  const std::string source_url = "node:" + id;
+  napi_value code = nullptr;
+  napi_value filename = nullptr;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  if (napi_create_string_utf8(env, source.c_str(), source.size(), &code) != napi_ok ||
+      code == nullptr ||
+      napi_create_string_utf8(env, source_url.c_str(), NAPI_AUTO_LENGTH, &filename) != napi_ok ||
+      filename == nullptr) {
+    return ThrowNativeBuiltinExecutionError(env, id, "failed to create compile inputs");
+  }
+
+  napi_value compile_result = nullptr;
+  if (unofficial_napi_contextify_compile_function(env,
+                                                  code,
+                                                  filename,
+                                                  0,
+                                                  0,
+                                                  undefined,
+                                                  false,
+                                                  undefined,
+                                                  undefined,
+                                                  params,
+                                                  undefined,
+                                                  &compile_result) != napi_ok ||
+      compile_result == nullptr) {
+    return false;
+  }
+
+  napi_value compiled_fn = nullptr;
+  if (napi_get_named_property(env, compile_result, "function", &compiled_fn) != napi_ok ||
+      !IsFunctionValue(env, compiled_fn)) {
+    return ThrowNativeBuiltinExecutionError(env, id, "compiled function is unavailable");
+  }
+
+  napi_value call_result = nullptr;
+  if (napi_call_function(env, undefined, compiled_fn, argv.size(), argv.data(), &call_result) != napi_ok) {
+    return false;
+  }
+
+  if (out != nullptr) {
+    *out = call_result;
+  }
+  return true;
 }
 
 using BindingFactory = napi_value (*)(napi_env env);
@@ -3903,9 +4159,7 @@ bool EvaluateJsModule(napi_env env,
     if (per_isolate_symbols == nullptr) napi_get_undefined(env, &per_isolate_symbols);
     wrapper_args = {primordials_val, private_symbols, per_isolate_symbols};
   } else {
-    if (state != nullptr && state->internal_binding_ref != nullptr) {
-      napi_get_reference_value(env, state->internal_binding_ref, &internal_binding_val);
-    }
+    internal_binding_val = GetStateInternalBinding(env, state);
     if (internal_binding_val == nullptr) {
       internal_binding_val = GetGlobalInternalBindingFunction(env, global);
     }
@@ -4298,12 +4552,14 @@ napi_value UbiGetInternalBinding(napi_env env) {
   if (env == nullptr) return nullptr;
   auto it = g_loader_states.find(env);
   if (it == g_loader_states.end()) return nullptr;
-  if (it->second.internal_binding_ref == nullptr) return nullptr;
-  napi_value out = nullptr;
-  if (napi_get_reference_value(env, it->second.internal_binding_ref, &out) != napi_ok || out == nullptr) {
-    return nullptr;
-  }
-  return out;
+  return GetStateInternalBinding(env, &it->second);
+}
+
+napi_value UbiGetBuiltinInternalBinding(napi_env env) {
+  if (env == nullptr) return nullptr;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return nullptr;
+  return GetStateInternalBindingLoader(env, &it->second);
 }
 
 void UbiFinalizeModuleLoaderEnv(napi_env env) {
@@ -4316,6 +4572,13 @@ bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out) {
   auto it = g_loader_states.find(env);
   if (it == g_loader_states.end()) return false;
   return CallRequireBuiltinLoader(env, &it->second, id, out);
+}
+
+bool UbiExecuteBuiltin(napi_env env, const char* id, napi_value* out) {
+  if (env == nullptr || id == nullptr || id[0] == '\0') return false;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return false;
+  return ExecuteBuiltinFromNative(env, &it->second, id, out);
 }
 
 napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) {

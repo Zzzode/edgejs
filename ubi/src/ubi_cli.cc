@@ -562,9 +562,17 @@ bool StdinIsTTY() {
 #endif
 }
 
-int RunCliBuiltin(const char* source_text, std::string* error_out) {
+int RunCliBuiltin(const char* source_text,
+                  const char* native_main_builtin_id,
+                  std::string* error_out) {
   return RunWithFreshEnv(
-      [&](napi_env env) { return UbiRunScriptSourceWithLoop(env, source_text, error_out, true); },
+      [&](napi_env env) {
+        return UbiRunScriptSourceWithLoop(env,
+                                          source_text,
+                                          error_out,
+                                          true,
+                                          native_main_builtin_id);
+      },
       error_out);
 }
 
@@ -799,8 +807,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       return 1;
     }
     UbiSetScriptArgv({});
-    static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
-    return RunCliBuiltin(kInteractiveMain, error_out);
+    return RunCliBuiltin(";", "internal/main/repl", error_out);
   }
 
   if (has_eval_string || (print_flag && mode == CliMode::kPrint)) {
@@ -812,8 +819,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       if (argv[argi] != nullptr) script_argv.emplace_back(argv[argi]);
     }
     UbiSetScriptArgv(script_argv);
-    static constexpr const char kEvalStringMain[] = "require('internal/main/eval_string');";
-    return RunCliBuiltin(kEvalStringMain, error_out);
+    return RunCliBuiltin(";", "internal/main/eval_string", error_out);
   }
 
   if (mode == CliMode::kRun) {
@@ -830,9 +836,6 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       }
     }
     UbiSetScriptArgv(script_argv);
-    static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
-    static constexpr const char kEvalStdinMain[] = "require('internal/main/eval_stdin');";
-    static constexpr const char kCheckSyntaxMain[] = "require('internal/main/check_syntax');";
     static constexpr const char kCheckSyntaxModuleStdinMain[] =
         "/*__ubi_skip_pre_execution__*/"
         "const { prepareMainThreadExecution, markBootstrapComplete } = "
@@ -853,11 +856,11 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
         "});";
     if (mode == CliMode::kCheck) {
       if (RawExecArgvHasInputType(raw_exec_argv)) {
-        return RunCliBuiltin(kCheckSyntaxModuleStdinMain, error_out);
+        return RunCliBuiltin(kCheckSyntaxModuleStdinMain, nullptr, error_out);
       }
-      return RunCliBuiltin(kCheckSyntaxMain, error_out);
+      return RunCliBuiltin(";", "internal/main/check_syntax", error_out);
     }
-    return RunCliBuiltin(StdinIsTTY() ? kInteractiveMain : kEvalStdinMain, error_out);
+    return RunCliBuiltin(";", StdinIsTTY() ? "internal/main/repl" : "internal/main/eval_stdin", error_out);
   }
 
   script_argv.reserve(static_cast<size_t>(argc - (script_index + 1)));
