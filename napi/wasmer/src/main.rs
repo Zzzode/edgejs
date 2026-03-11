@@ -22,7 +22,10 @@ fn parse_mount(spec: &str) -> Result<GuestMount> {
     }
     let guest_path = PathBuf::from(guest);
     if !guest_path.is_absolute() {
-        bail!("mount target must be an absolute guest path: {}", guest_path.display());
+        bail!(
+            "mount target must be an absolute guest path: {}",
+            guest_path.display()
+        );
     }
     Ok(GuestMount {
         host_path,
@@ -105,7 +108,10 @@ fn main() -> Result<()> {
             let script_parent = host_script
                 .parent()
                 .ok_or_else(|| anyhow!("script has no parent dir: {}", host_script.display()))?;
-            if !extra_mounts.iter().any(|m| m.guest_path == Path::new("/app")) {
+            if !extra_mounts
+                .iter()
+                .any(|m| m.guest_path == Path::new("/app"))
+            {
                 extra_mounts.push(GuestMount {
                     host_path: script_parent.to_path_buf(),
                     guest_path: PathBuf::from("/app"),

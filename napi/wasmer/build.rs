@@ -77,13 +77,12 @@ fn main() {
     build.compile("napi_bridge");
 
     println!("cargo:rustc-link-search=native={v8_lib}");
-    let v8_link_kind = if v8_lib_dir.join("libv8.so").exists()
-        || v8_lib_dir.join("libv8.dylib").exists()
-    {
-        "dylib"
-    } else {
-        "static"
-    };
+    let v8_link_kind =
+        if v8_lib_dir.join("libv8.so").exists() || v8_lib_dir.join("libv8.dylib").exists() {
+            "dylib"
+        } else {
+            "static"
+        };
     println!("cargo:rustc-link-lib={v8_link_kind}=v8");
 
     let v8_libplatform_kind = if v8_lib_dir.join("libv8_libplatform.a").exists() {
