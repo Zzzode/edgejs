@@ -170,10 +170,28 @@ bool IsSupportedV8ProfilerFlag(const std::string& token) {
 
 void ApplySupportedV8Flags(const std::vector<std::string>& raw_exec_argv) {
   std::string flags;
+  bool has_js_source_phase_imports = false;
+  bool has_no_js_source_phase_imports = false;
+  bool has_import_attributes = false;
+  bool has_no_import_attributes = false;
   for (const auto& token : raw_exec_argv) {
     if (!IsSupportedV8ProfilerFlag(token)) continue;
     if (!flags.empty()) flags.push_back(' ');
     flags += token;
+  }
+  for (const auto& token : raw_exec_argv) {
+    has_js_source_phase_imports = has_js_source_phase_imports || token == "--js-source-phase-imports";
+    has_no_js_source_phase_imports = has_no_js_source_phase_imports || token == "--no-js-source-phase-imports";
+    has_import_attributes = has_import_attributes || token == "--harmony-import-attributes";
+    has_no_import_attributes = has_no_import_attributes || token == "--no-harmony-import-attributes";
+  }
+  if (!has_js_source_phase_imports && !has_no_js_source_phase_imports) {
+    if (!flags.empty()) flags.push_back(' ');
+    flags += "--js-source-phase-imports";
+  }
+  if (!has_import_attributes && !has_no_import_attributes) {
+    if (!flags.empty()) flags.push_back(' ');
+    flags += "--harmony-import-attributes";
   }
   if (!flags.empty()) {
     (void)unofficial_napi_set_flags_from_string(flags.c_str(), flags.size());
@@ -202,6 +220,8 @@ bool OptionConsumesNextToken(const std::string& token) {
       "--loader",
       "--import",
       "--conditions",
+      "--trace-event-categories",
+      "--trace-event-file-pattern",
       "--run",
       "--allow-fs-read",
       "--allow-fs-write",
@@ -289,7 +309,6 @@ bool IsBooleanOptionForNegation(const std::string& option) {
       "--tls-min-v1.2",
       "--tls-min-v1.3",
       "--trace-deprecation",
-      "--trace-require-module",
       "--trace-sigint",
       "--trace-tls",
       "--trace-warnings",
@@ -337,6 +356,9 @@ bool IsKnownNonBooleanOption(const std::string& option) {
       "--test-shard",
       "--tls-cipher-list",
       "--tls-keylog",
+      "--trace-require-module",
+      "--trace-event-categories",
+      "--trace-event-file-pattern",
       "--unhandled-rejections",
       "--watch-kill-signal",
   };
@@ -403,7 +425,10 @@ bool IsRecognizedCliOptionToken(const std::string& token) {
            key == "--env-file" ||
            key == "--env-file-if-exists" ||
            key == "--experimental-config-file" ||
-           key == "--input-type";
+           key == "--input-type" ||
+           key == "--trace-require-module" ||
+           key == "--trace-event-categories" ||
+           key == "--trace-event-file-pattern";
   }
   if (OptionConsumesNextToken(token)) return true;
   if (token == "--experimental-strip-types") return true;
@@ -412,7 +437,10 @@ bool IsRecognizedCliOptionToken(const std::string& token) {
   if (token.rfind("--env-file=", 0) == 0 ||
       token.rfind("--env-file-if-exists=", 0) == 0 ||
       token.rfind("--experimental-config-file=", 0) == 0 ||
-      token.rfind("--input-type=", 0) == 0) {
+      token.rfind("--input-type=", 0) == 0 ||
+      token.rfind("--trace-require-module=", 0) == 0 ||
+      token.rfind("--trace-event-categories=", 0) == 0 ||
+      token.rfind("--trace-event-file-pattern=", 0) == 0) {
     return true;
   }
   return false;

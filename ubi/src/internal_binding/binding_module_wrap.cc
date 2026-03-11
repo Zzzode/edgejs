@@ -125,7 +125,70 @@ void SetNamedBool(napi_env env, napi_value obj, const char* key, bool value) {
   }
 }
 
+bool GetNamedProperty(napi_env env, napi_value obj, const char* key, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (env == nullptr || obj == nullptr || key == nullptr) return false;
+
+  bool has_prop = false;
+  if (napi_has_named_property(env, obj, key, &has_prop) != napi_ok || !has_prop) {
+    return false;
+  }
+
+  return napi_get_named_property(env, obj, key, out) == napi_ok && *out != nullptr;
+}
+
+bool IsFunctionValue(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+bool CallFunction(napi_env env,
+                  napi_value recv,
+                  napi_value fn,
+                  size_t argc,
+                  napi_value* argv,
+                  napi_value* result) {
+  napi_value local_result = nullptr;
+  if (env == nullptr || recv == nullptr || fn == nullptr) return false;
+  if (napi_call_function(env, recv, fn, argc, argv, &local_result) != napi_ok) return false;
+  if (result != nullptr) *result = local_result;
+  return true;
+}
+
 std::string ValueToUtf8(napi_env env, napi_value value);
+
+napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name) {
+  if (env == nullptr || property_name == nullptr) return nullptr;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+
+  napi_value internal_binding = nullptr;
+  if (!GetNamedProperty(env, global, "internalBinding", &internal_binding) ||
+      !IsFunctionValue(env, internal_binding)) {
+    if (!GetNamedProperty(env, global, "getInternalBinding", &internal_binding) ||
+        !IsFunctionValue(env, internal_binding)) {
+      return nullptr;
+    }
+  }
+
+  napi_value symbols_name = nullptr;
+  if (napi_create_string_utf8(env, "symbols", NAPI_AUTO_LENGTH, &symbols_name) != napi_ok ||
+      symbols_name == nullptr) {
+    return nullptr;
+  }
+
+  napi_value symbols_binding = nullptr;
+  if (!CallFunction(env, global, internal_binding, 1, &symbols_name, &symbols_binding) ||
+      symbols_binding == nullptr) {
+    return nullptr;
+  }
+
+  napi_value out = nullptr;
+  if (!GetNamedProperty(env, symbols_binding, property_name, &out)) return nullptr;
+  return out;
+}
 
 std::string GetFirstSourceLine(std::string source_text) {
   const size_t newline = source_text.find('\n');
@@ -185,12 +248,6 @@ void SetNamedMethod(napi_env env, napi_value obj, const char* key, napi_callback
   if (napi_create_function(env, key, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok && fn != nullptr) {
     napi_set_named_property(env, obj, key, fn);
   }
-}
-
-bool IsFunctionValue(napi_env env, napi_value value) {
-  if (value == nullptr) return false;
-  napi_valuetype type = napi_undefined;
-  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
 }
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
@@ -259,6 +316,12 @@ napi_value ModuleWrapCtor(napi_env env, napi_callback_info info) {
           instance->module_handle == nullptr) {
         delete instance;
         return nullptr;
+      }
+    }
+    if (argc >= 5 && argv[4] != nullptr) {
+      napi_value imported_cjs_symbol = GetSymbolsBindingProperty(env, "imported_cjs_symbol");
+      if (imported_cjs_symbol != nullptr) {
+        (void)napi_set_property(env, this_arg, imported_cjs_symbol, argv[4]);
       }
     }
   } else if (has_exports_array) {

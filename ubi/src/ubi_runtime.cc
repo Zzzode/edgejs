@@ -2186,6 +2186,38 @@ napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   return undefined;
 }
 
+napi_value ConsoleErrorCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 16;
+  napi_value args[16];
+  napi_status status = napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  if (status == napi_ok) {
+    std::string line;
+    for (size_t i = 0; i < argc; ++i) {
+      if (i > 0) line.push_back(' ');
+      napi_value string_value = nullptr;
+      if (napi_coerce_to_string(env, args[i], &string_value) != napi_ok || string_value == nullptr) {
+        continue;
+      }
+      size_t length = 0;
+      if (napi_get_value_string_utf8(env, string_value, nullptr, 0, &length) != napi_ok) {
+        continue;
+      }
+      std::string out(length + 1, '\0');
+      size_t copied = 0;
+      if (napi_get_value_string_utf8(env, string_value, out.data(), out.size(), &copied) != napi_ok) {
+        continue;
+      }
+      out.resize(copied);
+      line += out;
+    }
+    line.push_back('\n');
+    WriteTextToFd(2, line);
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 napi_value ReturnUndefinedCallback(napi_env env, napi_callback_info /*info*/) {
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -2588,6 +2620,15 @@ int RunScriptWithGlobals(napi_env env,
 
   if (!execute_bootstrapper("internal/bootstrap/realm", nullptr)) {
     return 1;
+  }
+
+  {
+    napi_value primordials_key = nullptr;
+    if (napi_create_string_utf8(env, "primordials", NAPI_AUTO_LENGTH, &primordials_key) == napi_ok &&
+        primordials_key != nullptr) {
+      bool deleted = false;
+      (void)napi_delete_property(env, global, primordials_key, &deleted);
+    }
   }
 
   napi_value internal_binding = UbiGetBuiltinInternalBinding(env);
@@ -3294,7 +3335,7 @@ napi_status UbiInstallConsole(napi_env env) {
     return napi_generic_failure;
   }
   napi_value err_fn = nullptr;
-  if (napi_create_function(env, "error", NAPI_AUTO_LENGTH, ConsoleLogCallback, nullptr, &err_fn) != napi_ok ||
+  if (napi_create_function(env, "error", NAPI_AUTO_LENGTH, ConsoleErrorCallback, nullptr, &err_fn) != napi_ok ||
       err_fn == nullptr) {
     return napi_generic_failure;
   }

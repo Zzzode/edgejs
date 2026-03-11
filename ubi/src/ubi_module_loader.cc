@@ -494,8 +494,18 @@ std::optional<std::string> FileUrlToPathString(std::string_view specifier) {
   return decoded;
 }
 
-bool ThrowInvalidPackageConfig(napi_env env, const std::string& path) {
-  const std::string message = "Invalid package config " + path + ".";
+bool ThrowInvalidPackageConfig(napi_env env,
+                               const std::string& path,
+                               const std::string* base = nullptr,
+                               const std::string* specifier = nullptr) {
+  std::string message = "Invalid package config " + path;
+  if (base != nullptr && specifier != nullptr && !specifier->empty()) {
+    message += " while importing \"";
+    message += *specifier;
+    message += "\" from ";
+    message += *base;
+  }
+  message += ".";
   napi_throw_error(env, "ERR_INVALID_PACKAGE_CONFIG", message.c_str());
   return false;
 }
@@ -1896,7 +1906,6 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       "--tls-min-v1.2",
       "--tls-min-v1.3",
       "--trace-deprecation",
-      "--trace-require-module",
       "--trace-sigint",
       "--trace-tls",
       "--trace-warnings",
@@ -1934,6 +1943,9 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       {"--test-isolation", "process"},
       {"--test-rerun-failures", ""},
       {"--test-shard", ""},
+      {"--trace-require-module", ""},
+      {"--trace-event-categories", ""},
+      {"--trace-event-file-pattern", ""},
       {"--tls-cipher-list", UBI_DEFAULT_CIPHER_LIST_CORE},
       {"--tls-keylog", ""},
       {"--unhandled-rejections", "throw"},
@@ -2333,6 +2345,9 @@ static napi_value OptionsGetEnvOptionsInputTypeCallback(napi_env env, napi_callb
       "--test-shard",
       "--test-skip-pattern",
       "--test-timeout",
+      "--trace-require-module",
+      "--trace-event-categories",
+      "--trace-event-file-pattern",
       "--tls-cipher-list",
       "--tls-keylog",
       "--unhandled-rejections",
@@ -2374,7 +2389,22 @@ static napi_value ModulesReadPackageJSONCallback(napi_env env, napi_callback_inf
     return UndefinedValue(env);
   }
   if (status == ParsePackageStatus::kInvalid) {
-    ThrowInvalidPackageConfig(env, maybe_path->lexically_normal().string());
+    napi_valuetype is_esm_type = napi_undefined;
+    bool is_esm = false;
+    if (argc >= 2 && argv[1] != nullptr && napi_typeof(env, argv[1], &is_esm_type) == napi_ok &&
+        is_esm_type == napi_boolean) {
+      (void)napi_get_value_bool(env, argv[1], &is_esm);
+    }
+    if (is_esm && argc >= 4 && argv[3] != nullptr) {
+      const std::string specifier = ValueToUtf8(env, argv[3]);
+      std::string base = ValueToUtf8(env, argv[2]);
+      if (std::optional<fs::path> base_path = ParsePathOrFileUrl(base); base_path.has_value()) {
+        base = base_path->lexically_normal().string();
+      }
+      ThrowInvalidPackageConfig(env, maybe_path->lexically_normal().string(), &base, &specifier);
+    } else {
+      ThrowInvalidPackageConfig(env, maybe_path->lexically_normal().string());
+    }
     return nullptr;
   }
   napi_value out = SerializePackageConfigToArray(env, package_config);
@@ -2818,6 +2848,50 @@ static napi_value ContextifyScriptRunInContextCallback(napi_env env, napi_callba
     return nullptr;
   }
   return result;
+}
+
+static bool EvalEntryUsesModuleInputType(napi_env env) {
+  if (env == nullptr) return false;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+
+  napi_value process = nullptr;
+  bool has_process = false;
+  if (napi_has_named_property(env, global, "process", &has_process) != napi_ok || !has_process ||
+      napi_get_named_property(env, global, "process", &process) != napi_ok || process == nullptr) {
+    return false;
+  }
+
+  napi_value exec_argv = nullptr;
+  bool has_exec_argv = false;
+  if (napi_has_named_property(env, process, "execArgv", &has_exec_argv) != napi_ok || !has_exec_argv ||
+      napi_get_named_property(env, process, "execArgv", &exec_argv) != napi_ok || exec_argv == nullptr) {
+    return false;
+  }
+
+  bool is_array = false;
+  if (napi_is_array(env, exec_argv, &is_array) != napi_ok || !is_array) return false;
+
+  uint32_t length = 0;
+  if (napi_get_array_length(env, exec_argv, &length) != napi_ok) return false;
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value element = nullptr;
+    if (napi_get_element(env, exec_argv, i, &element) != napi_ok || element == nullptr) continue;
+    const std::string token = ValueToUtf8(env, element);
+    if (token == "--input-type" && i + 1 < length) {
+      napi_value next = nullptr;
+      if (napi_get_element(env, exec_argv, i + 1, &next) == napi_ok && next != nullptr) {
+        const std::string value = ValueToUtf8(env, next);
+        return value.rfind("module", 0) == 0;
+      }
+      return false;
+    }
+    if (token.rfind("--input-type=", 0) == 0) {
+      return token.substr(std::string("--input-type=").size()).rfind("module", 0) == 0;
+    }
+  }
+
+  return false;
 }
 
 static napi_value ContextifyScriptCreateCachedDataCallback(napi_env env, napi_callback_info info) {
@@ -4686,7 +4760,7 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
   }
   ResetStateRef(env, &state.require_ref, require_fn);
 
-  if (is_eval_entry) {
+  if (is_eval_entry && !EvalEntryUsesModuleInputType(env)) {
     napi_value filename_value = nullptr;
     napi_value dirname_value = nullptr;
     if (napi_create_string_utf8(env, "[eval]", NAPI_AUTO_LENGTH, &filename_value) != napi_ok ||
