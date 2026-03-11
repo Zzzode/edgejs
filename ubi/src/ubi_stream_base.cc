@@ -1224,6 +1224,34 @@ bool UbiStreamBaseExtractByteSpan(napi_env env,
   return true;
 }
 
+bool IsUint8ArrayPayload(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return false;
+
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
+    return true;
+  }
+
+  bool is_typedarray = false;
+  if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok || !is_typedarray) {
+    return false;
+  }
+
+  napi_typedarray_type ta_type = napi_uint8_array;
+  size_t length = 0;
+  void* raw = nullptr;
+  napi_value arraybuffer = nullptr;
+  size_t byte_offset = 0;
+  return napi_get_typedarray_info(env,
+                                  value,
+                                  &ta_type,
+                                  &length,
+                                  &raw,
+                                  &arraybuffer,
+                                  &byte_offset) == napi_ok &&
+         ta_type == napi_uint8_array;
+}
+
 napi_value UbiStreamBufferFromWithEncoding(napi_env env,
                                           napi_value value,
                                           napi_value encoding) {
@@ -1262,6 +1290,11 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
                                      napi_value send_handle_obj) {
   if (base == nullptr || base->env == nullptr || base->ops == nullptr || base->ops->get_stream == nullptr) {
     return nullptr;
+  }
+
+  if (!IsUint8ArrayPayload(base->env, payload)) {
+    napi_throw_type_error(base->env, "ERR_INVALID_ARG_TYPE", "Second argument must be a buffer");
+    return UbiStreamBaseMakeInt32(base->env, 0);
   }
 
   const uint8_t* data = nullptr;
