@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build-wasix"
-TOOLCHAIN_FILE="${PROJECT_ROOT}/cmake/wasix-toolchain.cmake"
+TOOLCHAIN_FILE="${PROJECT_ROOT}/scripts/cmake/wasix-toolchain.cmake"
 OPENSSL_WASIX_DIR="${PROJECT_ROOT}/deps/openssl-wasix"
 
 "${SCRIPT_DIR}/setup-wasix-deps.sh"

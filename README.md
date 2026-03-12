@@ -84,4 +84,4 @@ We have created a [public ROADMAP](https://github.com/wasmerio/edgejs/issues/8),
 - `1.x` Need for speed: faster startup, faster core paths, and performance that competes with or beats Node.js, Bun, and Deno on most workloads.
 - `2.x` Enhancements: first-class TypeScript support and a smoother developer experience.
 
-For architecture detail, see [`ARCHITECTURE.md`](./ARCHITECTURE.md) and [`ROADMAP.md`](./ROADMAP.md).
+For architecture detail, see [`ARCHITECTURE.md`](./ARCHITECTURE.md).

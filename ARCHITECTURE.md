@@ -39,7 +39,7 @@ paths, `edge` system bindings should be implemented through `napi/v8` APIs.
 
 ## Roadmap Summary
 
-Detailed milestones and test gates are in `ROADMAP.md`.
+Detailed milestones are tracked in the public roadmap issue.
 
 1. **Bootstrap**
    - `edge` executable that creates an environment through `napi/v8`.
@@ -70,7 +70,7 @@ No phase should be marked complete without passing its defined test gate.
 
 - Use `EDGE_NAPI_PROVIDER=imports` to compile `edge` with N-API imports only
   (no bundled `napi/v8` linkage).
-- WASIX toolchain file: `cmake/wasix-toolchain.cmake`.
+- WASIX toolchain file: `scripts/cmake/wasix-toolchain.cmake`.
 - Setup + build helper:
   - `scripts/setup-wasix-deps.sh`
   - `scripts/build-wasix.sh`
