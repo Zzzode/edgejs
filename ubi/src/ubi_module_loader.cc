@@ -4418,7 +4418,8 @@ napi_value RequireCallback(napi_env env, napi_callback_info info) {
     if (resolved_path_value == nullptr) {
       return nullptr;
     }
-    resolved_key = CanonicalPathKey(fs::path(ValueToUtf8(env, resolved_path_value)));
+    const std::string resolved_path_text = ValueToUtf8(env, resolved_path_value);
+    resolved_key = CanonicalPathKey(fs::path(resolved_path_text));
     if (resolved_key.empty()) {
       ThrowLoaderError(env, "Failed to resolve module path");
       return nullptr;
