@@ -30,6 +30,9 @@ NAPI_EXTERN napi_status unofficial_napi_release_env(void* scope);
 NAPI_EXTERN napi_status unofficial_napi_set_flags_from_string(
     const char* flags,
     size_t length);
+NAPI_EXTERN napi_status unofficial_napi_set_prepare_stack_trace_callback(
+    napi_env env,
+    napi_value callback);
 
 // Unofficial/test-only helper. Requests a full GC cycle for testing.
 NAPI_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);

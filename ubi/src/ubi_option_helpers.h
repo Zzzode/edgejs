@@ -436,6 +436,20 @@ inline std::vector<std::string> ParseConfigFileFlags(const fs::path& path,
   return out;
 }
 
+inline void ApplyImpliedCliFlags(std::vector<std::string>* tokens) {
+  if (tokens == nullptr) return;
+  bool has_transform_types = false;
+  for (const auto& token : *tokens) {
+    if (token == "--experimental-transform-types") {
+      has_transform_types = true;
+      break;
+    }
+  }
+  if (!has_transform_types) return;
+  tokens->push_back("--strip-types");
+  tokens->push_back("--enable-source-maps");
+}
+
 inline EffectiveCliState BuildEffectiveCliState(const std::vector<std::string>& raw_exec_argv) {
   EffectiveCliState state;
 
@@ -488,6 +502,7 @@ inline EffectiveCliState BuildEffectiveCliState(const std::vector<std::string>& 
   state.effective_tokens.insert(state.effective_tokens.end(),
                                 raw_exec_argv.begin(),
                                 raw_exec_argv.end());
+  ApplyImpliedCliFlags(&state.effective_tokens);
   return state;
 }
 

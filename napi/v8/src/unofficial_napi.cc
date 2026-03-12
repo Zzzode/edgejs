@@ -19,6 +19,7 @@
 
 #include "internal/node_v8_default_flags.h"
 #include "internal/napi_v8_env.h"
+#include "internal/unofficial_napi_bridge.h"
 #include "unofficial_napi_error_utils.h"
 #include "ubi_v8_platform.h"
 
@@ -56,11 +57,22 @@ struct UnofficialEnvScope {
   }
 };
 
+struct PrepareStackTraceContextCallback {
+  v8::Global<v8::Context> context;
+  v8::Global<v8::Function> callback;
+};
+
+struct PrepareStackTraceState {
+  v8::Global<v8::Function> principal_callback;
+  std::vector<PrepareStackTraceContextCallback> context_callbacks;
+};
+
 std::mutex g_runtime_mu;
 SharedRuntime g_runtime;
 std::unordered_map<v8::Isolate*, napi_env> g_env_by_isolate;
 std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_callbacks;
 std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>> g_promise_hooks;
+std::unordered_map<napi_env, PrepareStackTraceState> g_prepare_stack_trace_callbacks;
 std::unordered_map<v8::ArrayBuffer::Allocator*, void*> g_tracking_allocators;
 
 struct FatalErrorCallbacks {
@@ -251,6 +263,87 @@ bool SerializeHeapProfile(v8::Isolate* isolate, std::string* out) {
   BuildHeapProfileNode(isolate, profile->GetRootNode(), out);
   out->push_back('}');
   return true;
+}
+
+void ResetPrepareStackTraceState(PrepareStackTraceState* state) {
+  if (state == nullptr) return;
+  state->principal_callback.Reset();
+  for (auto& entry : state->context_callbacks) {
+    entry.context.Reset();
+    entry.callback.Reset();
+  }
+  state->context_callbacks.clear();
+}
+
+v8::Local<v8::Function> LookupPrepareStackTraceCallback(napi_env env,
+                                                        v8::Local<v8::Context> context) {
+  if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) {
+    return v8::Local<v8::Function>();
+  }
+
+  auto state_it = g_prepare_stack_trace_callbacks.find(env);
+  if (state_it == g_prepare_stack_trace_callbacks.end()) {
+    return v8::Local<v8::Function>();
+  }
+
+  PrepareStackTraceState& state = state_it->second;
+  v8::Local<v8::Context> principal_context = env->context();
+  const bool use_principal_callback =
+      !principal_context.IsEmpty() &&
+      (context == principal_context || NapiV8IsContextifyContext(env, context));
+
+  if (use_principal_callback) {
+    return state.principal_callback.Get(context->GetIsolate());
+  }
+
+  for (const auto& entry : state.context_callbacks) {
+    v8::Local<v8::Context> candidate = entry.context.Get(context->GetIsolate());
+    if (!candidate.IsEmpty() && candidate == context) {
+      return entry.callback.Get(context->GetIsolate());
+    }
+  }
+
+  return state.principal_callback.Get(context->GetIsolate());
+}
+
+v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> context,
+                                                        v8::Local<v8::Value> exception,
+                                                        v8::Local<v8::Array> trace) {
+  napi_env env = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto env_it = g_env_by_isolate.find(context->GetIsolate());
+    if (env_it != g_env_by_isolate.end()) {
+      env = env_it->second;
+    }
+  }
+
+  if (env == nullptr) {
+    return exception->ToString(context);
+  }
+
+  v8::Local<v8::Function> callback;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    callback = LookupPrepareStackTraceCallback(env, context);
+  }
+
+  if (callback.IsEmpty()) {
+    return exception->ToString(context);
+  }
+
+  v8::TryCatch try_catch(context->GetIsolate());
+  v8::Local<v8::Value> argv[3] = {
+      context->Global(),
+      exception,
+      trace,
+  };
+  v8::MaybeLocal<v8::Value> result =
+      callback->Call(context, v8::Undefined(context->GetIsolate()), 3, argv);
+  if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
+    try_catch.ReThrow();
+  }
+  return result;
 }
 
 bool IsEnvThreadEntered(napi_env env) {
@@ -1210,6 +1303,11 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
       }
       g_promise_hooks.erase(hooks_it);
     }
+    auto prepare_it = g_prepare_stack_trace_callbacks.find(env);
+    if (prepare_it != g_prepare_stack_trace_callbacks.end()) {
+      ResetPrepareStackTraceState(&prepare_it->second);
+      g_prepare_stack_trace_callbacks.erase(prepare_it);
+    }
     g_fatal_error_callbacks.erase(env->isolate);
     g_near_heap_limit_callbacks.erase(env->isolate);
     auto profiler_it = g_profiler_states.find(env);
@@ -1425,6 +1523,64 @@ napi_status NAPI_CDECL unofficial_napi_set_flags_from_string(
     size_t length) {
   if (flags == nullptr) return napi_invalid_arg;
   v8::V8::SetFlagsFromString(flags, static_cast<int>(length));
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_prepare_stack_trace_callback(
+    napi_env env,
+    napi_value callback) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+
+  v8::Local<v8::Value> raw = callback != nullptr ? napi_v8_unwrap_value(callback) : v8::Local<v8::Value>();
+  if (!raw.IsEmpty() && !raw->IsFunction()) return napi_invalid_arg;
+  v8::Local<v8::Context> current_context = env->isolate->GetCurrentContext();
+  if (current_context.IsEmpty()) {
+    current_context = env->context();
+  }
+
+  bool has_prepare_stack_trace_callback = false;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    PrepareStackTraceState& state = g_prepare_stack_trace_callbacks[env];
+    v8::Local<v8::Context> principal_context = env->context();
+    const bool use_principal_callback =
+        current_context.IsEmpty() ||
+        (!principal_context.IsEmpty() &&
+         (current_context == principal_context ||
+          NapiV8IsContextifyContext(env, current_context)));
+
+    if (use_principal_callback) {
+      state.principal_callback.Reset();
+      if (!raw.IsEmpty()) {
+        state.principal_callback.Reset(env->isolate, raw.As<v8::Function>());
+      }
+    } else {
+      for (auto it = state.context_callbacks.begin(); it != state.context_callbacks.end(); ++it) {
+        v8::Local<v8::Context> candidate = it->context.Get(env->isolate);
+        if (!candidate.IsEmpty() && candidate == current_context) {
+          it->context.Reset();
+          it->callback.Reset();
+          state.context_callbacks.erase(it);
+          break;
+        }
+      }
+      if (!raw.IsEmpty()) {
+        PrepareStackTraceContextCallback entry;
+        entry.context.Reset(env->isolate, current_context);
+        entry.callback.Reset(env->isolate, raw.As<v8::Function>());
+        state.context_callbacks.push_back(std::move(entry));
+      }
+    }
+
+    if (state.principal_callback.IsEmpty() && state.context_callbacks.empty()) {
+      g_prepare_stack_trace_callbacks.erase(env);
+    } else {
+      has_prepare_stack_trace_callback = true;
+    }
+  }
+
+  env->isolate->SetPrepareStackTraceCallback(
+      has_prepare_stack_trace_callback ? NapiPrepareStackTraceCallback : nullptr);
   return napi_ok;
 }
 
@@ -1902,7 +2058,6 @@ napi_status NAPI_CDECL unofficial_napi_get_caller_location(napi_env env, napi_va
   if (file.IsEmpty()) {
     return napi_ok;
   }
-
   v8::Local<v8::Value> values[] = {
       v8::Integer::New(isolate, frame->GetLineNumber()),
       v8::Integer::New(isolate, frame->GetColumn()),

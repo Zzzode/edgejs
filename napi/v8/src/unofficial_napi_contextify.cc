@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "internal/napi_v8_env.h"
+#include "internal/unofficial_napi_bridge.h"
 #include "node_api.h"
 #include "unofficial_napi_error_utils.h"
 
@@ -1060,6 +1061,20 @@ v8::MaybeLocal<v8::Function> CompileCjsFunction(v8::Local<v8::Context> context,
 }
 
 }  // namespace
+
+bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
+  if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) return false;
+  std::lock_guard<std::mutex> lock(g_context_mu);
+  auto it = g_context_records.find(env);
+  if (it == g_context_records.end()) return false;
+  for (auto& rec : it->second) {
+    v8::Local<v8::Context> candidate = rec.context.Get(env->isolate);
+    if (!candidate.IsEmpty() && candidate == context) {
+      return true;
+    }
+  }
+  return false;
+}
 
 extern "C" {
 

@@ -187,6 +187,11 @@ napi_value ErrorsSetPrepareStackTraceCallback(napi_env env, napi_callback_info i
   if (argc >= 1) {
     ErrorsSetRef(env, &st.prepare_stack_trace_callback_ref, argv[0]);
   }
+  if (argc >= 1 && argv[0] != nullptr) {
+    (void)unofficial_napi_set_prepare_stack_trace_callback(env, argv[0]);
+  } else {
+    (void)unofficial_napi_set_prepare_stack_trace_callback(env, nullptr);
+  }
   return MakeUndefined(env);
 }
 
