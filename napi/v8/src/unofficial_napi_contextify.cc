@@ -68,6 +68,9 @@ struct ModuleWrapBindingState {
   ModuleWrapRecord* temporary_required_module_facade_original = nullptr;
 };
 
+napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name);
+napi_value GetSourceTextModuleDefaultHdoSymbol(napi_env env);
+
 std::mutex g_module_wrap_mu;
 std::unordered_map<napi_env, ModuleWrapBindingState> g_module_wrap_states;
 std::unordered_set<napi_env> g_module_wrap_cleanup_hooks;
@@ -76,6 +79,23 @@ v8::Local<v8::String> OneByteString(v8::Isolate* isolate, const char* value) {
   return v8::String::NewFromUtf8(isolate, value, v8::NewStringType::kInternalized)
       .ToLocalChecked();
 }
+
+static const auto kEsmSyntaxErrorMessages = std::array<std::string_view, 3>{
+    "Cannot use import statement outside a module",
+    "Unexpected token 'export'",
+    "Cannot use 'import.meta' outside a module"};
+
+static const auto kThrowsOnlyInCjsErrorMessages = std::array<std::string_view, 6>{
+    "Identifier 'module' has already been declared",
+    "Identifier 'exports' has already been declared",
+    "Identifier 'require' has already been declared",
+    "Identifier '__filename' has already been declared",
+    "Identifier '__dirname' has already been declared",
+    "await is only valid in async functions and the top level bodies of modules"};
+
+static const auto kMaybeTopLevelAwaitErrors = std::array<std::string_view, 2>{
+    "missing ) after argument list",
+    "SyntaxError: Unexpected"};
 
 bool IsNullish(napi_env env, napi_value value) {
   if (value == nullptr) return true;
@@ -573,6 +593,12 @@ v8::Local<v8::Object> CreateFrozenNullProtoObject(
 
 napi_value GetVmDynamicImportDefaultInternalSymbol(napi_env env) {
   if (env == nullptr) return nullptr;
+  napi_value out = GetSymbolsBindingProperty(env, "vm_dynamic_import_default_internal");
+  return out;
+}
+
+napi_value GetSymbolsBindingProperty(napi_env env, const char* property_name) {
+  if (env == nullptr || property_name == nullptr) return nullptr;
   napi_value global = nullptr;
   napi_get_global(env, &global);
   if (global == nullptr) return nullptr;
@@ -599,10 +625,14 @@ napi_value GetVmDynamicImportDefaultInternalSymbol(napi_env env) {
   }
 
   napi_value out = nullptr;
-  if (napi_get_named_property(env, symbols_binding, "vm_dynamic_import_default_internal", &out) != napi_ok) {
+  if (napi_get_named_property(env, symbols_binding, property_name, &out) != napi_ok) {
     return nullptr;
   }
   return out;
+}
+
+napi_value GetSourceTextModuleDefaultHdoSymbol(napi_env env) {
+  return GetSymbolsBindingProperty(env, "source_text_module_default_hdo");
 }
 
 bool PopulateModuleRequests(napi_env env,
@@ -924,8 +954,18 @@ bool ResolveContextFromKey(napi_env env,
 
 bool CompileAsModule(v8::Isolate* isolate,
                      v8::Local<v8::Context> context,
+                     napi_env env,
                      v8::Local<v8::String> code,
                      v8::Local<v8::String> resource_name) {
+  napi_value hdo_value = GetSourceTextModuleDefaultHdoSymbol(env);
+  v8::Local<v8::Symbol> hdo_symbol;
+  if (hdo_value != nullptr) {
+    v8::Local<v8::Value> raw = napi_v8_unwrap_value(hdo_value);
+    if (!raw.IsEmpty() && raw->IsSymbol()) {
+      hdo_symbol = raw.As<v8::Symbol>();
+    }
+  }
+
   v8::TryCatch tc(isolate);
   v8::ScriptOrigin origin(resource_name,
                           0,
@@ -935,13 +975,50 @@ bool CompileAsModule(v8::Isolate* isolate,
                           v8::Local<v8::Value>(),
                           false,
                           false,
-                          true);
+                          true,
+                          HostDefinedOptions(isolate, hdo_symbol));
   v8::ScriptCompiler::Source source(code, origin);
   v8::Local<v8::Module> module;
   if (v8::ScriptCompiler::CompileModule(isolate, &source).ToLocal(&module)) {
     return true;
   }
   return false;
+}
+
+bool ShouldRetryAsEsm(v8::Isolate* isolate,
+                      v8::Local<v8::Context> context,
+                      napi_env env,
+                      v8::Local<v8::Value> message,
+                      v8::Local<v8::String> code,
+                      v8::Local<v8::String> resource_name) {
+  const std::string message_text = V8ValueToUtf8(isolate, message);
+
+  for (const auto& error_message : kEsmSyntaxErrorMessages) {
+    if (message_text.find(error_message) != std::string::npos) {
+      return true;
+    }
+  }
+
+  bool maybe_valid_in_esm = false;
+  for (const auto& error_message : kThrowsOnlyInCjsErrorMessages) {
+    if (message_text.find(error_message) != std::string::npos) {
+      maybe_valid_in_esm = true;
+      break;
+    }
+  }
+  if (!maybe_valid_in_esm) {
+    for (const auto& error_message : kMaybeTopLevelAwaitErrors) {
+      if (message_text.find(error_message) != std::string::npos) {
+        maybe_valid_in_esm = true;
+        break;
+      }
+    }
+  }
+  if (!maybe_valid_in_esm) {
+    return false;
+  }
+
+  return CompileAsModule(isolate, context, env, code, resource_name);
 }
 
 v8::MaybeLocal<v8::Function> CompileCjsFunction(v8::Local<v8::Context> context,
@@ -1140,7 +1217,6 @@ napi_status NAPI_CDECL unofficial_napi_contextify_run_script(
   }
 
   v8::TryCatch try_catch(isolate);
-  try_catch.SetVerbose(display_errors);
   v8::Context::Scope scope(target_context);
   v8::ScriptOrigin origin(filename_str,
                           line_offset,
@@ -1412,7 +1488,10 @@ napi_status NAPI_CDECL unofficial_napi_contextify_compile_function_for_cjs_loade
 
   bool can_parse_as_esm = false;
   if (!cjs_ok) {
-    can_parse_as_esm = CompileAsModule(isolate, context, code_str, filename_str);
+    if (!cjs_message.IsEmpty()) {
+      can_parse_as_esm =
+          ShouldRetryAsEsm(isolate, context, env, cjs_message->Get(), code_str, filename_str);
+    }
     if (!can_parse_as_esm || !should_detect_module) {
       if (!cjs_exception.IsEmpty()) {
         unofficial_napi_internal::AttachSyntaxArrowMessage(isolate, context, cjs_exception, cjs_message);
@@ -1478,9 +1557,12 @@ napi_status NAPI_CDECL unofficial_napi_contextify_contains_module_syntax(
       *result_out = false;
       return napi_ok;
     }
+    if (tc.HasCaught()) {
+      *result_out = ShouldRetryAsEsm(isolate, context, env, tc.Message()->Get(), code_str, resource_name);
+      return napi_ok;
+    }
   }
-
-  *result_out = CompileAsModule(isolate, context, code_str, resource_name);
+  *result_out = false;
   return napi_ok;
 }
 
