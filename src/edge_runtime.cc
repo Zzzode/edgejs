@@ -39,6 +39,7 @@
 #endif
 
 #include "edge_fs.h"
+#include "edge_environment.h"
 #include "edge_errors_binding.h"
 #include "edge_buffer.h"
 #include "edge_env_loop.h"
@@ -81,12 +82,17 @@ constexpr int kExitCodeInvalidFatalExceptionMonkeyPatching = 6;
 constexpr int kExitCodeExceptionInFatalExceptionHandler = 7;
 constexpr int kExitCodeUnsettledTopLevelAwait = 13;
 
+void ResetDomainHelperRef(napi_env env, napi_ref* ref);
+
 struct DomainCallbackCache {
+  explicit DomainCallbackCache(napi_env env_in) : env(env_in) {}
+  ~DomainCallbackCache() {
+    ResetDomainHelperRef(env, &helper_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref helper_ref = nullptr;
 };
-
-std::unordered_map<napi_env, DomainCallbackCache> g_domain_callback_cache;
-std::unordered_set<napi_env> g_domain_callback_cleanup_hooks;
 
 enum class EdgeBootstrapMode {
   kMainThread,
@@ -118,24 +124,6 @@ void ResetDomainHelperRef(napi_env env, napi_ref* ref) {
   *ref = nullptr;
 }
 
-void OnDomainCallbackEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_domain_callback_cleanup_hooks.erase(env);
-  auto it = g_domain_callback_cache.find(env);
-  if (it == g_domain_callback_cache.end()) return;
-  ResetDomainHelperRef(env, &it->second.helper_ref);
-  g_domain_callback_cache.erase(it);
-}
-
-void EnsureDomainCallbackCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_domain_callback_cleanup_hooks.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnDomainCallbackEnvCleanup, env) != napi_ok) {
-    g_domain_callback_cleanup_hooks.erase(it);
-  }
-}
-
 bool IsNullOrUndefinedValue(napi_env env, napi_value value) {
   if (env == nullptr || value == nullptr) return true;
   napi_valuetype type = napi_undefined;
@@ -151,9 +139,8 @@ bool IsDomainHelperFunctionValue(napi_env env, napi_value value) {
 
 napi_value GetCachedDomainCallbackHelper(napi_env env) {
   if (env == nullptr) return nullptr;
-  EnsureDomainCallbackCleanupHook(env);
-
-  auto& cache = g_domain_callback_cache[env];
+  auto& cache = EdgeEnvironmentGetOrCreateSlotData<DomainCallbackCache>(
+      env, kEdgeEnvironmentSlotDomainCallbackCache);
   if (cache.helper_ref != nullptr) {
     napi_value helper = nullptr;
     if (napi_get_reference_value(env, cache.helper_ref, &helper) == napi_ok && helper != nullptr) {
@@ -2934,8 +2921,13 @@ napi_status EdgeMakeCallbackWithFlags(napi_env env,
   if (env == nullptr || recv == nullptr || callback == nullptr) {
     return napi_invalid_arg;
   }
-  thread_local int callback_scope_depth = 0;
-  callback_scope_depth++;
+  thread_local int detached_callback_scope_depth = 0;
+  edge::Environment* environment = EdgeEnvironmentGet(env);
+  if (environment != nullptr) {
+    environment->IncrementAsyncCallbackScopeDepth();
+  } else {
+    detached_callback_scope_depth++;
+  }
   napi_status status = EdgeCallCallbackWithDomain(env, recv, callback, argc, argv, result);
 
   auto handle_pending_exception = [&](napi_status current_status) -> napi_status {
@@ -2965,16 +2957,27 @@ napi_status EdgeMakeCallbackWithFlags(napi_env env,
   };
 
   const bool skip_task_queues = (flags & kEdgeMakeCallbackSkipTaskQueues) != 0;
+  const size_t callback_scope_depth =
+      environment != nullptr ? environment->async_callback_scope_depth()
+                             : static_cast<size_t>(detached_callback_scope_depth);
   status = handle_pending_exception(status);
   if (status == napi_pending_exception) {
-    callback_scope_depth--;
+    if (environment != nullptr) {
+      environment->DecrementAsyncCallbackScopeDepth();
+    } else {
+      detached_callback_scope_depth--;
+    }
     return status;
   } else if (status == napi_ok && callback_scope_depth == 1 && !skip_task_queues) {
     status = EdgeRunCallbackScopeCheckpoint(env);
     status = handle_pending_exception(status);
   }
 
-  callback_scope_depth--;
+  if (environment != nullptr) {
+    environment->DecrementAsyncCallbackScopeDepth();
+  } else {
+    detached_callback_scope_depth--;
+  }
   return status;
 }
 

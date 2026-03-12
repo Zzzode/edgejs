@@ -1,16 +1,28 @@
 #include "edge_errors_binding.h"
 
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include "unofficial_napi.h"
+#include "edge_environment.h"
 #include "edge_worker_env.h"
 
 namespace {
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct ErrorsBindingState {
+  explicit ErrorsBindingState(napi_env env_in) : env(env_in) {}
+  ~ErrorsBindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+    DeleteRefIfPresent(env, &prepare_stack_trace_callback_ref);
+    DeleteRefIfPresent(env, &get_source_map_error_source_ref);
+    DeleteRefIfPresent(env, &maybe_cache_generated_source_map_ref);
+    DeleteRefIfPresent(env, &enhance_fatal_stack_before_inspector_ref);
+    DeleteRefIfPresent(env, &enhance_fatal_stack_after_inspector_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref prepare_stack_trace_callback_ref = nullptr;
   napi_ref get_source_map_error_source_ref = nullptr;
@@ -20,13 +32,19 @@ struct ErrorsBindingState {
   bool source_maps_enabled = false;
 };
 
-std::unordered_map<napi_env, ErrorsBindingState> g_errors_states;
-std::unordered_set<napi_env> g_errors_cleanup_hook_registered;
-
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
+}
+
+ErrorsBindingState* GetErrorsState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<ErrorsBindingState>(env, kEdgeEnvironmentSlotErrorsBindingState);
+}
+
+ErrorsBindingState& EnsureErrorsState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<ErrorsBindingState>(
+      env, kEdgeEnvironmentSlotErrorsBindingState);
 }
 
 bool IsNullOrUndefinedValue(napi_env env, napi_value value) {
@@ -34,30 +52,6 @@ bool IsNullOrUndefinedValue(napi_env env, napi_value value) {
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, value, &type) == napi_ok &&
          (type == napi_undefined || type == napi_null);
-}
-
-void OnErrorsEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_errors_cleanup_hook_registered.erase(env);
-
-  auto it = g_errors_states.find(env);
-  if (it == g_errors_states.end()) return;
-  DeleteRefIfPresent(env, &it->second.binding_ref);
-  DeleteRefIfPresent(env, &it->second.prepare_stack_trace_callback_ref);
-  DeleteRefIfPresent(env, &it->second.get_source_map_error_source_ref);
-  DeleteRefIfPresent(env, &it->second.maybe_cache_generated_source_map_ref);
-  DeleteRefIfPresent(env, &it->second.enhance_fatal_stack_before_inspector_ref);
-  DeleteRefIfPresent(env, &it->second.enhance_fatal_stack_after_inspector_ref);
-  g_errors_states.erase(it);
-}
-
-void EnsureErrorsCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_errors_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnErrorsEnvCleanup, env) != napi_ok) {
-    g_errors_cleanup_hook_registered.erase(it);
-  }
 }
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
@@ -104,9 +98,9 @@ std::string CallRefCallbackAsUtf8(napi_env env, napi_ref ref, napi_value arg) {
 }
 
 std::string FormatFatalExceptionAfterInspector(napi_env env, napi_value exception) {
-  const auto it = g_errors_states.find(env);
-  if (it == g_errors_states.end()) return "";
-  return CallRefCallbackAsUtf8(env, it->second.enhance_fatal_stack_after_inspector_ref, exception);
+  auto* state = GetErrorsState(env);
+  if (state == nullptr) return "";
+  return CallRefCallbackAsUtf8(env, state->enhance_fatal_stack_after_inspector_ref, exception);
 }
 
 napi_value MakeUndefined(napi_env env) {
@@ -183,7 +177,7 @@ napi_value ErrorsSetPrepareStackTraceCallback(napi_env env, napi_callback_info i
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
-  auto& st = g_errors_states[env];
+  auto& st = EnsureErrorsState(env);
   if (argc >= 1) {
     ErrorsSetRef(env, &st.prepare_stack_trace_callback_ref, argv[0]);
   }
@@ -199,7 +193,7 @@ napi_value ErrorsSetGetSourceMapErrorSource(napi_env env, napi_callback_info inf
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
-  auto& st = g_errors_states[env];
+  auto& st = EnsureErrorsState(env);
   if (argc >= 1) {
     ErrorsSetRef(env, &st.get_source_map_error_source_ref, argv[0]);
   }
@@ -210,7 +204,7 @@ napi_value ErrorsSetSourceMapsEnabled(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
-  auto& st = g_errors_states[env];
+  auto& st = EnsureErrorsState(env);
   bool enabled = false;
   if (argc >= 1 && argv[0] != nullptr) {
     napi_get_value_bool(env, argv[0], &enabled);
@@ -223,7 +217,7 @@ napi_value ErrorsSetMaybeCacheGeneratedSourceMap(napi_env env, napi_callback_inf
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
-  auto& st = g_errors_states[env];
+  auto& st = EnsureErrorsState(env);
   if (argc >= 1) {
     ErrorsSetRef(env, &st.maybe_cache_generated_source_map_ref, argv[0]);
   }
@@ -234,7 +228,7 @@ napi_value ErrorsSetEnhanceStackForFatalException(napi_env env, napi_callback_in
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
-  auto& st = g_errors_states[env];
+  auto& st = EnsureErrorsState(env);
   if (argc >= 1) {
     ErrorsSetRef(env, &st.enhance_fatal_stack_before_inspector_ref, argv[0]);
   }
@@ -328,9 +322,9 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     }
   };
 
-  auto st_it = g_errors_states.find(env);
-  if (st_it != g_errors_states.end()) {
-    invoke_ref_callback(st_it->second.enhance_fatal_stack_before_inspector_ref);
+  auto* state = GetErrorsState(env);
+  if (state != nullptr) {
+    invoke_ref_callback(state->enhance_fatal_stack_before_inspector_ref);
   }
 
   napi_value global = nullptr;
@@ -358,8 +352,8 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
             (void)napi_get_and_clear_last_exception(env, &ignored);
           }
           (void)unofficial_napi_cancel_terminate_execution(env);
-          if (st_it != g_errors_states.end()) {
-            invoke_ref_callback(st_it->second.enhance_fatal_stack_after_inspector_ref);
+          if (state != nullptr) {
+            invoke_ref_callback(state->enhance_fatal_stack_after_inspector_ref);
           }
           return MakeUndefined(env);
         }
@@ -368,8 +362,8 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
       if (fatal_result != nullptr) {
         bool handled = false;
         if (napi_get_value_bool(env, fatal_result, &handled) == napi_ok && handled) {
-          if (st_it != g_errors_states.end()) {
-            invoke_ref_callback(st_it->second.enhance_fatal_stack_after_inspector_ref);
+          if (state != nullptr) {
+            invoke_ref_callback(state->enhance_fatal_stack_after_inspector_ref);
           }
           return MakeUndefined(env);
         }
@@ -377,8 +371,8 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     }
   }
 
-  if (st_it != g_errors_states.end()) {
-    invoke_ref_callback(st_it->second.enhance_fatal_stack_after_inspector_ref);
+  if (state != nullptr) {
+    invoke_ref_callback(state->enhance_fatal_stack_after_inspector_ref);
   }
 
   // Match Node's native fatal path by preserving the original engine-provided
@@ -389,8 +383,7 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
 }
 
 napi_value GetOrCreateErrorsBinding(napi_env env) {
-  EnsureErrorsCleanupHook(env);
-  auto& st = g_errors_states[env];
+  auto& st = EnsureErrorsState(env);
   if (st.binding_ref != nullptr) {
     napi_value existing = nullptr;
     if (napi_get_reference_value(env, st.binding_ref, &existing) == napi_ok && existing != nullptr) {

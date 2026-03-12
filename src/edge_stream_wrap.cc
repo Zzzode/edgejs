@@ -1,21 +1,28 @@
 #include "edge_stream_wrap.h"
 
 #include <cstdint>
-#include <mutex>
-#include <unordered_map>
 
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 
 namespace {
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct StreamWrapBindingState {
-  bool cleanup_hook_registered = false;
+  explicit StreamWrapBindingState(napi_env env_in) : env(env_in) {}
+  ~StreamWrapBindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+    if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+      DeleteRefIfPresent(env, &environment->stream_base_state()->ref);
+      environment->stream_base_state()->fields = nullptr;
+    }
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   int32_t* stream_state = nullptr;
 };
-
-std::mutex g_stream_wrap_mu;
-std::unordered_map<napi_env, StreamWrapBindingState> g_stream_wrap_bindings;
 
 struct StreamReqWrap {
   napi_env env = nullptr;
@@ -127,34 +134,23 @@ void SetNamedU32(napi_env env, napi_value obj, const char* key, uint32_t value) 
   }
 }
 
-void CleanupStreamWrapBindingState(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  if (env == nullptr) return;
-  std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
-  auto it = g_stream_wrap_bindings.find(env);
-  if (it == g_stream_wrap_bindings.end()) return;
-  DeleteRefIfPresent(env, &it->second.binding_ref);
-  g_stream_wrap_bindings.erase(it);
-}
-
 StreamWrapBindingState& EnsureBindingState(napi_env env) {
-  auto& state = g_stream_wrap_bindings[env];
-  if (!state.cleanup_hook_registered) {
-    if (napi_add_env_cleanup_hook(env, CleanupStreamWrapBindingState, env) == napi_ok) {
-      state.cleanup_hook_registered = true;
-    }
-  }
-  return state;
+  return EdgeEnvironmentGetOrCreateSlotData<StreamWrapBindingState>(
+      env, kEdgeEnvironmentSlotStreamWrapBindingState);
 }
 
 }  // namespace
 
 int32_t* EdgeGetStreamBaseState(napi_env env) {
   if (env == nullptr) return nullptr;
-  std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
-  auto it = g_stream_wrap_bindings.find(env);
-  if (it == g_stream_wrap_bindings.end()) return nullptr;
-  return it->second.stream_state;
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    if (environment->stream_base_state()->fields != nullptr) {
+      return environment->stream_base_state()->fields;
+    }
+  }
+  auto* state = EdgeEnvironmentGetSlotData<StreamWrapBindingState>(
+      env, kEdgeEnvironmentSlotStreamWrapBindingState);
+  return state != nullptr ? state->stream_state : nullptr;
 }
 
 napi_value EdgeCreateStreamReqObject(napi_env env) {
@@ -211,14 +207,11 @@ void EdgeStreamReqMarkDone(napi_env env, napi_value req_obj) {
 }
 
 napi_value EdgeInstallStreamWrapBinding(napi_env env) {
-  {
-    std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
-    StreamWrapBindingState& state = EnsureBindingState(env);
-    if (state.binding_ref != nullptr) {
-      napi_value cached = GetRefValue(env, state.binding_ref);
-      if (cached != nullptr) return cached;
-      DeleteRefIfPresent(env, &state.binding_ref);
-    }
+  StreamWrapBindingState& state = EnsureBindingState(env);
+  if (state.binding_ref != nullptr) {
+    napi_value cached = GetRefValue(env, state.binding_ref);
+    if (cached != nullptr) return cached;
+    DeleteRefIfPresent(env, &state.binding_ref);
   }
 
   napi_value binding = nullptr;
@@ -281,12 +274,13 @@ napi_value EdgeInstallStreamWrapBinding(napi_env env) {
   SetNamedU32(env, binding, "kBytesWritten", kEdgeBytesWritten);
   SetNamedU32(env, binding, "kLastWriteWasAsync", kEdgeLastWriteWasAsync);
 
-  {
-    std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
-    StreamWrapBindingState& state = EnsureBindingState(env);
-    state.stream_state = stream_state_data;
-    DeleteRefIfPresent(env, &state.binding_ref);
-    napi_create_reference(env, binding, 1, &state.binding_ref);
+  state.stream_state = stream_state_data;
+  DeleteRefIfPresent(env, &state.binding_ref);
+  napi_create_reference(env, binding, 1, &state.binding_ref);
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->stream_base_state()->fields = stream_state_data;
+    DeleteRefIfPresent(env, &environment->stream_base_state()->ref);
+    napi_create_reference(env, stream_state, 1, &environment->stream_base_state()->ref);
   }
 
   return binding;

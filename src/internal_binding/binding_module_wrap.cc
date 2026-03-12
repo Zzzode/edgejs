@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "unofficial_napi.h"
 #include "../edge_module_loader.h"
@@ -12,6 +13,8 @@
 namespace internal_binding {
 
 namespace {
+
+void ResetRef(napi_env env, napi_ref* ref_ptr);
 
 enum ModuleWrapStatus : int32_t {
   kUninstantiated = 0,
@@ -33,19 +36,29 @@ struct ModuleWrapInstance {
 };
 
 struct ModuleWrapBindingState {
+  explicit ModuleWrapBindingState(napi_env env_in) : env(env_in) {}
+  ~ModuleWrapBindingState() {
+    ResetRef(env, &binding_ref);
+    ResetRef(env, &module_wrap_ctor_ref);
+    ResetRef(env, &import_module_dynamically_ref);
+    ResetRef(env, &initialize_import_meta_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref module_wrap_ctor_ref = nullptr;
   napi_ref import_module_dynamically_ref = nullptr;
   napi_ref initialize_import_meta_ref = nullptr;
 };
 
-std::unordered_map<napi_env, ModuleWrapBindingState> g_module_wrap_states;
-std::unordered_set<napi_env> g_module_wrap_cleanup_hook_registered;
-
 ModuleWrapBindingState* GetBindingState(napi_env env) {
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<ModuleWrapBindingState>(
+      env, kEdgeEnvironmentSlotInternalModuleWrapBindingState);
+}
+
+ModuleWrapBindingState& EnsureBindingState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<ModuleWrapBindingState>(
+      env, kEdgeEnvironmentSlotInternalModuleWrapBindingState);
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -59,28 +72,6 @@ void ResetRef(napi_env env, napi_ref* ref_ptr) {
   if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
   napi_delete_reference(env, *ref_ptr);
   *ref_ptr = nullptr;
-}
-
-void OnModuleWrapEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_module_wrap_cleanup_hook_registered.erase(env);
-
-  auto it = g_module_wrap_states.find(env);
-  if (it == g_module_wrap_states.end()) return;
-  ResetRef(env, &it->second.binding_ref);
-  ResetRef(env, &it->second.module_wrap_ctor_ref);
-  ResetRef(env, &it->second.import_module_dynamically_ref);
-  ResetRef(env, &it->second.initialize_import_meta_ref);
-  g_module_wrap_states.erase(it);
-}
-
-void EnsureModuleWrapCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_module_wrap_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnModuleWrapEnvCleanup, env) != napi_ok) {
-    g_module_wrap_cleanup_hook_registered.erase(it);
-  }
 }
 
 void SetRef(napi_env env, napi_ref* ref_ptr, napi_value value, napi_valuetype required) {
@@ -697,8 +688,7 @@ napi_value ModuleWrapThrowIfPromiseRejected(napi_env env, napi_callback_info inf
 }  // namespace
 
 napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& /*options*/) {
-  EnsureModuleWrapCleanupHook(env);
-  auto& state = g_module_wrap_states[env];
+  auto& state = EnsureBindingState(env);
   if (state.binding_ref != nullptr) {
     napi_value existing = GetRefValue(env, state.binding_ref);
     if (existing != nullptr) return existing;

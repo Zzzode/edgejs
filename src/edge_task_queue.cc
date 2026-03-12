@@ -1,22 +1,32 @@
 #include "edge_task_queue.h"
 
-#include <unordered_map>
-#include <unordered_set>
-
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "unofficial_napi.h"
 
 namespace {
 
+void DeleteRefIfAny(napi_env env, napi_ref* ref_slot);
+
 struct TaskQueueBindingState {
+  explicit TaskQueueBindingState(napi_env env_in) : env(env_in) {}
+  ~TaskQueueBindingState() {
+    DeleteRefIfAny(env, &binding_ref);
+    DeleteRefIfAny(env, &tick_callback_ref);
+    DeleteRefIfAny(env, &promise_reject_callback_ref);
+    tick_info_fields = nullptr;
+    if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+      environment->tick_info()->fields = nullptr;
+      DeleteRefIfAny(env, &environment->tick_info()->ref);
+    }
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref tick_callback_ref = nullptr;
   napi_ref promise_reject_callback_ref = nullptr;
   int32_t* tick_info_fields = nullptr;
 };
-
-std::unordered_map<napi_env, TaskQueueBindingState> g_task_queue_states;
-std::unordered_set<napi_env> g_task_queue_cleanup_hook_registered;
 
 void DeleteRefIfAny(napi_env env, napi_ref* ref_slot) {
   if (env == nullptr || ref_slot == nullptr || *ref_slot == nullptr) return;
@@ -24,32 +34,9 @@ void DeleteRefIfAny(napi_env env, napi_ref* ref_slot) {
   *ref_slot = nullptr;
 }
 
-void OnTaskQueueEnvCleanup(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-  g_task_queue_cleanup_hook_registered.erase(env);
-
-  auto it = g_task_queue_states.find(env);
-  if (it == g_task_queue_states.end()) return;
-
-  DeleteRefIfAny(env, &it->second.binding_ref);
-  DeleteRefIfAny(env, &it->second.tick_callback_ref);
-  DeleteRefIfAny(env, &it->second.promise_reject_callback_ref);
-  it->second.tick_info_fields = nullptr;
-  g_task_queue_states.erase(it);
-}
-
-void EnsureTaskQueueCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_task_queue_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnTaskQueueEnvCleanup, env) != napi_ok) {
-    g_task_queue_cleanup_hook_registered.erase(it);
-  }
-}
-
 TaskQueueBindingState& GetTaskQueueState(napi_env env) {
-  EnsureTaskQueueCleanupHook(env);
-  return g_task_queue_states[env];
+  return EdgeEnvironmentGetOrCreateSlotData<TaskQueueBindingState>(
+      env, kEdgeEnvironmentSlotTaskQueueBindingState);
 }
 
 static napi_value TaskQueueEnqueueMicrotask(napi_env env, napi_callback_info info) {
@@ -162,12 +149,19 @@ napi_value EdgeGetOrCreateTaskQueueBinding(napi_env env) {
   fields[0] = 0;
   fields[1] = 0;
   st.tick_info_fields = fields;
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->tick_info()->fields = fields;
+  }
 
   napi_value tick_info = nullptr;
   if (napi_create_typedarray(env, napi_int32_array, 2, tick_ab, 0, &tick_info) != napi_ok || tick_info == nullptr) {
     return nullptr;
   }
   if (napi_set_named_property(env, binding, "tickInfo", tick_info) != napi_ok) return nullptr;
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    DeleteRefIfAny(env, &environment->tick_info()->ref);
+    napi_create_reference(env, tick_info, 1, &environment->tick_info()->ref);
+  }
 
   napi_value promise_events = nullptr;
   if (napi_create_object(env, &promise_events) != napi_ok || promise_events == nullptr) return nullptr;
@@ -200,13 +194,14 @@ napi_status EdgeRunTaskQueueTickCallback(napi_env env, bool* called) {
     return napi_invalid_arg;
   }
 
-  auto it = g_task_queue_states.find(env);
-  if (it == g_task_queue_states.end() || it->second.tick_callback_ref == nullptr) {
+  auto* state = EdgeEnvironmentGetSlotData<TaskQueueBindingState>(
+      env, kEdgeEnvironmentSlotTaskQueueBindingState);
+  if (state == nullptr || state->tick_callback_ref == nullptr) {
     return napi_ok;
   }
 
   napi_value tick_cb = nullptr;
-  napi_status status = napi_get_reference_value(env, it->second.tick_callback_ref, &tick_cb);
+  napi_status status = napi_get_reference_value(env, state->tick_callback_ref, &tick_cb);
   if (status != napi_ok || tick_cb == nullptr) {
     return status == napi_ok ? napi_generic_failure : status;
   }
@@ -241,16 +236,22 @@ bool EdgeGetTaskQueueFlags(napi_env env, bool* has_tick_scheduled, bool* has_rej
     return false;
   }
 
-  auto it = g_task_queue_states.find(env);
-  if (it == g_task_queue_states.end() || it->second.tick_info_fields == nullptr) {
+  int32_t* tick_info_fields = nullptr;
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    tick_info_fields = environment->tick_info()->fields;
+  }
+  auto* state = EdgeEnvironmentGetSlotData<TaskQueueBindingState>(
+      env, kEdgeEnvironmentSlotTaskQueueBindingState);
+  if (tick_info_fields == nullptr && (state == nullptr || state->tick_info_fields == nullptr)) {
     return false;
   }
+  if (tick_info_fields == nullptr) tick_info_fields = state->tick_info_fields;
 
   if (has_tick_scheduled != nullptr) {
-    *has_tick_scheduled = it->second.tick_info_fields[0] != 0;
+    *has_tick_scheduled = tick_info_fields[0] != 0;
   }
   if (has_rejection_to_warn != nullptr) {
-    *has_rejection_to_warn = it->second.tick_info_fields[1] != 0;
+    *has_rejection_to_warn = tick_info_fields[1] != 0;
   }
   return true;
 }

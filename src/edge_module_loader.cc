@@ -25,6 +25,7 @@
 #include "edge_tty_wrap.h"
 #include "edge_udp_wrap.h"
 #include "edge_url.h"
+#include "edge_environment.h"
 #include "edge_util.h"
 #include "edge_worker_env.h"
 #include "edge_option_helpers.h"
@@ -76,8 +77,16 @@ namespace {
 namespace fs = std::filesystem;
 
 struct RequireContext;
+struct ModuleLoaderState;
+
+static bool IsUndefinedValue(napi_env env, napi_value value);
+static void ResetModuleLoaderState(napi_env env, ModuleLoaderState* state);
+static void DeleteModuleLoaderState(void* data);
 
 struct ModuleLoaderState {
+  explicit ModuleLoaderState(napi_env env_in) : env(env_in) {}
+
+  napi_env env = nullptr;
   std::unordered_map<std::string, napi_ref> module_cache;
   std::unordered_map<std::string, napi_ref> binding_cache;
   std::unordered_map<std::string, napi_ref> internal_binding_cache;
@@ -104,7 +113,6 @@ struct ModuleLoaderState {
   } trace_events_state;
   std::vector<RequireContext*> require_contexts;
   std::string entry_dir;
-  bool cleanup_hook_registered = false;
   bool finalized = false;
 };
 
@@ -114,78 +122,22 @@ struct RequireContext {
 };
 using TraceEventsBindingState = ModuleLoaderState::TraceEventsBindingState;
 
-constexpr char kModuleLoaderStateHolderSymbol[] = "node:module_loader_state_holder";
-
-static bool IsUndefinedValue(napi_env env, napi_value value);
-
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
 }
 
-static napi_value GetGlobalObject(napi_env env) {
-  napi_value global = nullptr;
-  if (env == nullptr || napi_get_global(env, &global) != napi_ok || global == nullptr) {
-    return nullptr;
-  }
-  return global;
-}
-
-static napi_value GetModuleLoaderStateHolderKey(napi_env env) {
-  napi_value key = nullptr;
-  if (unofficial_napi_create_private_symbol(
-          env, kModuleLoaderStateHolderSymbol, NAPI_AUTO_LENGTH, &key) != napi_ok ||
-      key == nullptr) {
-    return nullptr;
-  }
-  return key;
-}
-
 static ModuleLoaderState* GetModuleLoaderState(napi_env env) {
-  napi_value global = GetGlobalObject(env);
-  napi_value key = GetModuleLoaderStateHolderKey(env);
-  if (global == nullptr || key == nullptr) return nullptr;
-
-  napi_value holder = nullptr;
-  if (napi_get_property(env, global, key, &holder) != napi_ok ||
-      holder == nullptr ||
-      IsUndefinedValue(env, holder)) {
-    return nullptr;
-  }
-
-  void* data = nullptr;
-  if (napi_unwrap(env, holder, &data) != napi_ok || data == nullptr) {
-    return nullptr;
-  }
-  return static_cast<ModuleLoaderState*>(data);
+  return EdgeEnvironmentGetSlotData<ModuleLoaderState>(
+      env, kEdgeEnvironmentSlotModuleLoaderState);
 }
 
 static bool SetModuleLoaderState(napi_env env, ModuleLoaderState* state) {
-  napi_value global = GetGlobalObject(env);
-  napi_value key = GetModuleLoaderStateHolderKey(env);
-  if (global == nullptr || key == nullptr || state == nullptr) return false;
-
-  napi_value holder = nullptr;
-  if (napi_create_object(env, &holder) != napi_ok || holder == nullptr) return false;
-  if (napi_wrap(env, holder, state, nullptr, nullptr, nullptr) != napi_ok) return false;
-  return napi_set_property(env, global, key, holder) == napi_ok;
-}
-
-static void ClearModuleLoaderStateHolder(napi_env env) {
-  napi_value global = GetGlobalObject(env);
-  napi_value key = GetModuleLoaderStateHolderKey(env);
-  if (global == nullptr || key == nullptr) return;
-
-  napi_value holder = nullptr;
-  if (napi_get_property(env, global, key, &holder) == napi_ok &&
-      holder != nullptr &&
-      !IsUndefinedValue(env, holder)) {
-    void* removed = nullptr;
-    (void)napi_remove_wrap(env, holder, &removed);
-  }
-  bool ignored = false;
-  (void)napi_delete_property(env, global, key, &ignored);
+  if (env == nullptr || state == nullptr) return false;
+  EdgeEnvironmentSetOpaqueSlot(
+      env, kEdgeEnvironmentSlotModuleLoaderState, state, DeleteModuleLoaderState);
+  return true;
 }
 
 static RequireContext* AddRequireContext(ModuleLoaderState* state, std::string base_dir) {
@@ -253,25 +205,19 @@ static void ResetModuleLoaderState(napi_env env, ModuleLoaderState* state) {
   state->entry_dir.clear();
 }
 
+static void DeleteModuleLoaderState(void* data) {
+  auto* state = static_cast<ModuleLoaderState*>(data);
+  if (state == nullptr) return;
+  state->finalized = true;
+  ResetModuleLoaderState(state->env, state);
+  delete state;
+}
+
 static void FinalizeModuleLoaderState(napi_env env) {
   ModuleLoaderState* state = GetModuleLoaderState(env);
   if (state == nullptr || state->finalized) return;
   state->finalized = true;
-  state->cleanup_hook_registered = false;
-  ResetModuleLoaderState(env, state);
-  ClearModuleLoaderStateHolder(env);
-  delete state;
-}
-
-static void OnModuleLoaderEnvCleanup(void* arg) {
-  FinalizeModuleLoaderState(static_cast<napi_env>(arg));
-}
-
-static void EnsureModuleLoaderCleanupHook(napi_env env, ModuleLoaderState* state) {
-  if (env == nullptr || state == nullptr || state->cleanup_hook_registered) return;
-  if (napi_add_env_cleanup_hook(env, OnModuleLoaderEnvCleanup, env) == napi_ok) {
-    state->cleanup_hook_registered = true;
-  }
+  EdgeEnvironmentClearOpaqueSlot(env, kEdgeEnvironmentSlotModuleLoaderState);
 }
 
 std::string ReadTextFile(const fs::path& path) {
@@ -4829,7 +4775,7 @@ napi_status EdgeInstallModuleLoader(napi_env env, const char* entry_script_path)
   }
   ModuleLoaderState* state = GetModuleLoaderState(env);
   if (state == nullptr) {
-    auto* state_ptr = new ModuleLoaderState();
+    auto* state_ptr = new ModuleLoaderState(env);
     if (!SetModuleLoaderState(env, state_ptr)) {
       delete state_ptr;
       return napi_generic_failure;
@@ -4837,7 +4783,6 @@ napi_status EdgeInstallModuleLoader(napi_env env, const char* entry_script_path)
     state = state_ptr;
   }
   state->finalized = false;
-  EnsureModuleLoaderCleanupHook(env, state);
 
   const bool is_eval_entry = entry_script_path == nullptr || entry_script_path[0] == '\0';
   fs::path entry_path;

@@ -1,39 +1,60 @@
 #include "edge_handle_wrap.h"
 
 #include <mutex>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "internal_binding/helpers.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_module_loader.h"
 #include "edge_runtime.h"
 
 namespace {
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct HandleSymbolCache {
+  explicit HandleSymbolCache(napi_env env_in) : env(env_in) {}
+  ~HandleSymbolCache() {
+    DeleteRefIfPresent(env, &symbols_ref);
+    DeleteRefIfPresent(env, &owner_symbol_ref);
+    DeleteRefIfPresent(env, &handle_onclose_symbol_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref symbols_ref = nullptr;
   napi_ref owner_symbol_ref = nullptr;
   napi_ref handle_onclose_symbol_ref = nullptr;
 };
 
-std::unordered_map<napi_env, HandleSymbolCache> g_handle_symbols;
-std::unordered_set<napi_env> g_handle_symbol_cleanup_hook_registered;
-
 struct HandleWrapEnvState {
+  explicit HandleWrapEnvState(napi_env /*env_in*/) {}
+
   EdgeHandleWrap* head = nullptr;
-  bool cleanup_hook_registered = false;
   bool cleanup_started = false;
 };
 
 std::mutex g_handle_wrap_env_states_mutex;
-std::unordered_map<napi_env, HandleWrapEnvState> g_handle_wrap_env_states;
 
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
+}
+
+HandleSymbolCache& GetHandleSymbolCache(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<HandleSymbolCache>(
+      env, kEdgeEnvironmentSlotHandleSymbolCache);
+}
+
+HandleWrapEnvState* GetHandleWrapState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<HandleWrapEnvState>(
+      env, kEdgeEnvironmentSlotHandleWrapEnvState);
+}
+
+HandleWrapEnvState& EnsureHandleWrapState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<HandleWrapEnvState>(
+      env, kEdgeEnvironmentSlotHandleWrapEnvState);
 }
 
 void UnlinkHandleWrapLocked(HandleWrapEnvState* state, EdgeHandleWrap* wrap) {
@@ -51,23 +72,15 @@ void UnlinkHandleWrapLocked(HandleWrapEnvState* state, EdgeHandleWrap* wrap) {
   wrap->attached = false;
 }
 
-void MaybeEraseHandleWrapStateLocked(napi_env env) {
-  auto it = g_handle_wrap_env_states.find(env);
-  if (it == g_handle_wrap_env_states.end()) return;
-  if (it->second.head != nullptr || it->second.cleanup_hook_registered) return;
-  g_handle_wrap_env_states.erase(it);
-}
-
 void RunHandleWrapEnvCleanup(napi_env env) {
   if (env == nullptr) return;
   std::vector<EdgeHandleWrap*> wraps_to_close;
   {
     std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
-    auto it = g_handle_wrap_env_states.find(env);
-    if (it == g_handle_wrap_env_states.end()) return;
-    it->second.cleanup_hook_registered = false;
-    it->second.cleanup_started = true;
-    for (EdgeHandleWrap* wrap = it->second.head; wrap != nullptr; wrap = wrap->next) {
+    auto* state = GetHandleWrapState(env);
+    if (state == nullptr) return;
+    state->cleanup_started = true;
+    for (EdgeHandleWrap* wrap = state->head; wrap != nullptr; wrap = wrap->next) {
       wraps_to_close.push_back(wrap);
     }
   }
@@ -87,49 +100,11 @@ void RunHandleWrapEnvCleanup(napi_env env) {
     bool empty = false;
     {
       std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
-      auto it = g_handle_wrap_env_states.find(env);
-      empty = (it == g_handle_wrap_env_states.end()) || (it->second.head == nullptr);
-      if (empty) {
-        MaybeEraseHandleWrapStateLocked(env);
-      }
+      auto* state = GetHandleWrapState(env);
+      empty = state == nullptr || state->head == nullptr;
     }
     if (empty) break;
     (void)uv_run(loop, UV_RUN_ONCE);
-  }
-}
-
-void OnHandleWrapEnvCleanup(void* data) {
-  RunHandleWrapEnvCleanup(static_cast<napi_env>(data));
-}
-
-void EnsureHandleWrapCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
-  auto& state = g_handle_wrap_env_states[env];
-  if (state.cleanup_hook_registered || state.cleanup_started) return;
-  if (napi_add_env_cleanup_hook(env, OnHandleWrapEnvCleanup, env) == napi_ok) {
-    state.cleanup_hook_registered = true;
-  }
-}
-
-void OnHandleSymbolsEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_handle_symbol_cleanup_hook_registered.erase(env);
-
-  auto it = g_handle_symbols.find(env);
-  if (it == g_handle_symbols.end()) return;
-  DeleteRefIfPresent(env, &it->second.symbols_ref);
-  DeleteRefIfPresent(env, &it->second.owner_symbol_ref);
-  DeleteRefIfPresent(env, &it->second.handle_onclose_symbol_ref);
-  g_handle_symbols.erase(it);
-}
-
-void EnsureHandleSymbolsCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_handle_symbol_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnHandleSymbolsEnvCleanup, env) != napi_ok) {
-    g_handle_symbol_cleanup_hook_registered.erase(it);
   }
 }
 
@@ -170,11 +145,6 @@ napi_value ResolveInternalBinding(napi_env env, const char* name) {
     return nullptr;
   }
   return binding;
-}
-
-HandleSymbolCache& GetHandleSymbolCache(napi_env env) {
-  EnsureHandleSymbolsCleanupHook(env);
-  return g_handle_symbols[env];
 }
 
 napi_value GetSymbolsBinding(napi_env env) {
@@ -245,9 +215,8 @@ void EdgeHandleWrapAttach(EdgeHandleWrap* wrap,
                          uv_handle_t* handle,
                          EdgeHandleWrapCloseCallback close_callback) {
   if (wrap == nullptr || wrap->env == nullptr || handle == nullptr || close_callback == nullptr) return;
-  EnsureHandleWrapCleanupHook(wrap->env);
   std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
-  auto& state = g_handle_wrap_env_states[wrap->env];
+  auto& state = EnsureHandleWrapState(wrap->env);
   if (state.cleanup_started) return;
   if (wrap->attached) {
     UnlinkHandleWrapLocked(&state, wrap);
@@ -267,8 +236,8 @@ void EdgeHandleWrapAttach(EdgeHandleWrap* wrap,
 void EdgeHandleWrapDetach(EdgeHandleWrap* wrap) {
   if (wrap == nullptr || wrap->env == nullptr || !wrap->attached) return;
   std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
-  auto it = g_handle_wrap_env_states.find(wrap->env);
-  if (it == g_handle_wrap_env_states.end()) {
+  auto* state = GetHandleWrapState(wrap->env);
+  if (state == nullptr) {
     wrap->close_data = nullptr;
     wrap->uv_handle = nullptr;
     wrap->close_callback = nullptr;
@@ -277,11 +246,10 @@ void EdgeHandleWrapDetach(EdgeHandleWrap* wrap) {
     wrap->attached = false;
     return;
   }
-  UnlinkHandleWrapLocked(&it->second, wrap);
+  UnlinkHandleWrapLocked(state, wrap);
   wrap->close_data = nullptr;
   wrap->uv_handle = nullptr;
   wrap->close_callback = nullptr;
-  MaybeEraseHandleWrapStateLocked(wrap->env);
 }
 
 napi_value EdgeHandleWrapGetRefValue(napi_env env, napi_ref ref) {
@@ -402,20 +370,11 @@ bool EdgeHandleWrapHasRef(const EdgeHandleWrap* wrap, const uv_handle_t* handle)
 bool EdgeHandleWrapEnvCleanupStarted(napi_env env) {
   if (env == nullptr) return false;
   std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
-  auto it = g_handle_wrap_env_states.find(env);
-  return it != g_handle_wrap_env_states.end() && it->second.cleanup_started;
+  auto* state = GetHandleWrapState(env);
+  return state != nullptr && state->cleanup_started;
 }
 
 void EdgeHandleWrapRunEnvCleanup(napi_env env) {
   if (env == nullptr) return;
-  {
-    std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
-    auto it = g_handle_wrap_env_states.find(env);
-    if (it == g_handle_wrap_env_states.end()) return;
-    if (it->second.cleanup_hook_registered) {
-      (void)napi_remove_env_cleanup_hook(env, OnHandleWrapEnvCleanup, env);
-      it->second.cleanup_hook_registered = false;
-    }
-  }
   RunHandleWrapEnvCleanup(env);
 }

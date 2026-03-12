@@ -11,6 +11,7 @@
 #include <uv.h>
 
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_runtime.h"
 #include "edge_stream_base.h"
@@ -38,44 +39,26 @@ struct TcpWrap {
 };
 
 struct TcpBindingState {
+  explicit TcpBindingState(napi_env env_in) : env(env_in) {}
+  ~TcpBindingState() {
+    if (tcp_ctor_ref != nullptr) napi_delete_reference(env, tcp_ctor_ref);
+    if (connect_wrap_ctor_ref != nullptr) napi_delete_reference(env, connect_wrap_ctor_ref);
+    if (tcp_binding_ref != nullptr) napi_delete_reference(env, tcp_binding_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref tcp_ctor_ref = nullptr;
   napi_ref connect_wrap_ctor_ref = nullptr;
   napi_ref tcp_binding_ref = nullptr;
 };
 
-std::unordered_map<napi_env, TcpBindingState> g_tcp_states;
-std::unordered_set<napi_env> g_tcp_cleanup_hook_registered;
-
-void OnTcpEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_tcp_cleanup_hook_registered.erase(env);
-
-  auto it = g_tcp_states.find(env);
-  if (it == g_tcp_states.end()) return;
-  if (it->second.tcp_ctor_ref != nullptr) napi_delete_reference(env, it->second.tcp_ctor_ref);
-  if (it->second.connect_wrap_ctor_ref != nullptr) napi_delete_reference(env, it->second.connect_wrap_ctor_ref);
-  if (it->second.tcp_binding_ref != nullptr) napi_delete_reference(env, it->second.tcp_binding_ref);
-  g_tcp_states.erase(it);
-}
-
-void EnsureTcpCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_tcp_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnTcpEnvCleanup, env) != napi_ok) {
-    g_tcp_cleanup_hook_registered.erase(it);
-  }
-}
-
 TcpBindingState* GetBindingState(napi_env env) {
-  auto it = g_tcp_states.find(env);
-  if (it == g_tcp_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<TcpBindingState>(env, kEdgeEnvironmentSlotTcpBindingState);
 }
 
 TcpBindingState& EnsureBindingState(napi_env env) {
-  EnsureTcpCleanupHook(env);
-  return g_tcp_states[env];
+  return EdgeEnvironmentGetOrCreateSlotData<TcpBindingState>(
+      env, kEdgeEnvironmentSlotTcpBindingState);
 }
 
 TcpWrap* FromBase(EdgeStreamBase* base) {

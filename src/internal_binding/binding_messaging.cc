@@ -15,6 +15,7 @@
 
 #include <uv.h>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "unofficial_napi.h"
 #include "../edge_module_loader.h"
@@ -70,7 +71,27 @@ struct MessagePortWrap {
 
 namespace {
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct MessagingState {
+  explicit MessagingState(napi_env env_in) : env(env_in) {}
+  ~MessagingState() {
+    for (auto& entry : shared_handle_refs) {
+      DeleteRefIfPresent(env, &entry.second);
+    }
+    shared_handle_refs.clear();
+    DeleteRefIfPresent(env, &binding_ref);
+    DeleteRefIfPresent(env, &deserializer_create_object_ref);
+    DeleteRefIfPresent(env, &emit_message_ref);
+    DeleteRefIfPresent(env, &message_port_ctor_ref);
+    DeleteRefIfPresent(env, &message_port_ctor_token_ref);
+    DeleteRefIfPresent(env, &no_message_symbol_ref);
+    DeleteRefIfPresent(env, &oninit_symbol_ref);
+    DeleteRefIfPresent(env, &hybrid_dispatch_symbol_ref);
+    DeleteRefIfPresent(env, &currently_receiving_ports_symbol_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref deserializer_create_object_ref = nullptr;
   napi_ref emit_message_ref = nullptr;
@@ -89,8 +110,6 @@ constexpr napi_type_tag kMessagePortTypeTag = {
     0x9ab22b54f44c7dd3ULL,
 };
 
-std::unordered_map<napi_env, MessagingState> g_messaging_states;
-std::unordered_set<napi_env> g_messaging_cleanup_hook_registered;
 std::mutex g_messaging_mu;
 std::mutex g_broadcast_groups_mutex;
 std::unordered_map<std::string, std::weak_ptr<BroadcastChannelGroup>> g_broadcast_groups;
@@ -120,7 +139,6 @@ bool ValueUsesTransferArrayBuffer(napi_env env,
                                   napi_value value,
                                   napi_value target_arraybuffer,
                                   std::vector<napi_value>* seen);
-void OnMessagingEnvCleanup(void* data);
 napi_value GetRefValue(napi_env env, napi_ref ref);
 void SetRefToValue(napi_env env, napi_ref* slot, napi_value value);
 
@@ -196,23 +214,13 @@ void DeleteTransferredPortRefs(napi_env env,
   }
 }
 
-void EnsureMessagingCleanupHookLocked(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_messaging_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnMessagingEnvCleanup, env) != napi_ok) {
-    g_messaging_cleanup_hook_registered.erase(it);
-  }
-}
-
 MessagingState& EnsureMessagingStateLocked(napi_env env) {
-  EnsureMessagingCleanupHookLocked(env);
-  return g_messaging_states[env];
+  return EdgeEnvironmentGetOrCreateSlotData<MessagingState>(
+      env, kEdgeEnvironmentSlotMessagingBindingState);
 }
 
 MessagingState* FindMessagingStateLocked(napi_env env) {
-  auto it = g_messaging_states.find(env);
-  return it == g_messaging_states.end() ? nullptr : &it->second;
+  return EdgeEnvironmentGetSlotData<MessagingState>(env, kEdgeEnvironmentSlotMessagingBindingState);
 }
 
 template <typename Callback>
@@ -289,35 +297,6 @@ napi_value GetSharedHandleValue(napi_env env, uint32_t handle_id) {
         if (ref_it == state->shared_handle_refs.end()) return nullptr;
         return GetRefValue(env, ref_it->second);
       });
-}
-
-void OnMessagingEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  std::lock_guard<std::mutex> lock(g_messaging_mu);
-  g_messaging_cleanup_hook_registered.erase(env);
-
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return;
-  for (auto& entry : it->second.shared_handle_refs) {
-    if (entry.second != nullptr) {
-      napi_delete_reference(env, entry.second);
-    }
-  }
-  DeleteRefIfPresent(env, &it->second.binding_ref);
-  DeleteRefIfPresent(env, &it->second.deserializer_create_object_ref);
-  DeleteRefIfPresent(env, &it->second.emit_message_ref);
-  DeleteRefIfPresent(env, &it->second.message_port_ctor_ref);
-  DeleteRefIfPresent(env, &it->second.message_port_ctor_token_ref);
-  DeleteRefIfPresent(env, &it->second.no_message_symbol_ref);
-  DeleteRefIfPresent(env, &it->second.oninit_symbol_ref);
-  DeleteRefIfPresent(env, &it->second.hybrid_dispatch_symbol_ref);
-  DeleteRefIfPresent(env, &it->second.currently_receiving_ports_symbol_ref);
-  g_messaging_states.erase(it);
-}
-
-void EnsureMessagingCleanupHook(napi_env env) {
-  std::lock_guard<std::mutex> lock(g_messaging_mu);
-  EnsureMessagingCleanupHookLocked(env);
 }
 
 void ThrowTypeErrorWithCode(napi_env env, const char* code, const char* message) {
@@ -4610,7 +4589,6 @@ napi_value ResolveMessaging(napi_env env, const ResolveOptions& options) {
   napi_value cached = GetCachedMessaging(env);
   if (cached != nullptr) return cached;
 
-  EnsureMessagingCleanupHook(env);
   EnsureMessagingSymbols(env, options);
 
   napi_value out = nullptr;

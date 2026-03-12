@@ -1,5 +1,6 @@
 #include "crypto/edge_crypto_binding.h"
 #include "crypto/edge_secure_context_bridge.h"
+#include "edge_environment.h"
 #include "edge_option_helpers.h"
 
 #include <algorithm>
@@ -621,7 +622,9 @@ void EnsureRootCertThreadCleanupHook(napi_env env) {
   if (env == nullptr) return;
   bool expected = false;
   if (g_cert_loading_cleanup_hook_installed.compare_exchange_strong(expected, true)) {
-    if (napi_add_env_cleanup_hook(env, CleanupRootCertLoading, nullptr) != napi_ok) {
+    if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+      environment->AddCleanupHook(CleanupRootCertLoading, nullptr);
+    } else if (napi_add_env_cleanup_hook(env, CleanupRootCertLoading, nullptr) != napi_ok) {
       g_cert_loading_cleanup_hook_installed.store(false);
     }
   }

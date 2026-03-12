@@ -18,6 +18,7 @@
 #include <uv.h>
 #include "ada.h"
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "../edge_env_loop.h"
 #include "../edge_handle_wrap.h"
@@ -35,7 +36,23 @@ namespace {
 constexpr size_t kFsStatsLength = 18;
 constexpr size_t kFsStatFsLength = 7;
 
+void ResetRef(napi_env env, napi_ref* ref_ptr);
+
 struct FsBindingState {
+  explicit FsBindingState(napi_env env_in) : env(env_in) {}
+  ~FsBindingState() {
+    for (auto& entry : raw_methods) {
+      ResetRef(env, &entry.second);
+    }
+    raw_methods.clear();
+    ResetRef(env, &binding_ref);
+    ResetRef(env, &file_handle_ctor_ref);
+    ResetRef(env, &fs_req_ctor_ref);
+    ResetRef(env, &stat_watcher_ctor_ref);
+    ResetRef(env, &k_use_promises_symbol_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   std::unordered_map<std::string, napi_ref> raw_methods;
   napi_ref file_handle_ctor_ref = nullptr;
@@ -43,16 +60,16 @@ struct FsBindingState {
   napi_ref stat_watcher_ctor_ref = nullptr;
   napi_ref k_use_promises_symbol_ref = nullptr;
 };
-
-std::unordered_map<napi_env, FsBindingState> g_fs_states;
-std::unordered_set<napi_env> g_fs_cleanup_hook_registered;
 int64_t g_next_file_handle_async_id = 600000;
 int64_t g_next_stat_watcher_async_id = 700000;
 
 FsBindingState* GetState(napi_env env) {
-  auto it = g_fs_states.find(env);
-  if (it == g_fs_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<FsBindingState>(env, kEdgeEnvironmentSlotFsBindingState);
+}
+
+FsBindingState& EnsureState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<FsBindingState>(
+      env, kEdgeEnvironmentSlotFsBindingState);
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -71,33 +88,6 @@ void ResetRef(napi_env env, napi_ref* ref_ptr) {
   if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
   napi_delete_reference(env, *ref_ptr);
   *ref_ptr = nullptr;
-}
-
-void OnFsEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_fs_cleanup_hook_registered.erase(env);
-
-  auto it = g_fs_states.find(env);
-  if (it == g_fs_states.end()) return;
-  for (auto& entry : it->second.raw_methods) {
-    ResetRef(env, &entry.second);
-  }
-  it->second.raw_methods.clear();
-  ResetRef(env, &it->second.binding_ref);
-  ResetRef(env, &it->second.file_handle_ctor_ref);
-  ResetRef(env, &it->second.fs_req_ctor_ref);
-  ResetRef(env, &it->second.stat_watcher_ctor_ref);
-  ResetRef(env, &it->second.k_use_promises_symbol_ref);
-  g_fs_states.erase(it);
-}
-
-void EnsureFsCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_fs_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnFsEnvCleanup, env) != napi_ok) {
-    g_fs_cleanup_hook_registered.erase(it);
-  }
 }
 
 void SetNamedMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
@@ -3896,12 +3886,11 @@ void EnsureClassProperty(napi_env env,
 }  // namespace
 
 napi_value ResolveFs(napi_env env, const ResolveOptions& options) {
-  EnsureFsCleanupHook(env);
   if (options.callbacks.resolve_binding == nullptr) return Undefined(env);
   napi_value binding = options.callbacks.resolve_binding(env, options.state, "fs");
   if (binding == nullptr || IsUndefined(env, binding)) return Undefined(env);
 
-  auto& state = g_fs_states[env];
+  auto& state = EnsureState(env);
   if (state.binding_ref == nullptr) {
     napi_create_reference(env, binding, 1, &state.binding_ref);
   }

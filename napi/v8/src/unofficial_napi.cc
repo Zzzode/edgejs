@@ -21,6 +21,7 @@
 #include "internal/napi_v8_env.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "unofficial_napi_error_utils.h"
+#include "edge_environment.h"
 #include "edge_v8_platform.h"
 
 namespace {
@@ -1278,8 +1279,22 @@ napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_set_edge_environment(napi_env env, void* environment) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->edge_environment = environment;
+  return napi_ok;
+}
+
+void* unofficial_napi_get_edge_environment(napi_env env) {
+  return env == nullptr ? nullptr : env->edge_environment;
+}
+
 napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
+  if (EdgeEnvironmentGet(env) != nullptr) {
+    EdgeEnvironmentRunCleanup(env);
+    EdgeEnvironmentRunAtExitCallbacks(env);
+  }
   ProfilerState profiler_state;
   bool has_profiler_state = false;
   {
@@ -2569,3 +2584,29 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
 }
 
 }  // extern "C"
+
+void* NapiV8GetCurrentEdgeEnvironment(v8::Isolate* isolate) {
+  if (isolate == nullptr) return nullptr;
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  auto it = g_env_by_isolate.find(isolate);
+  if (it == g_env_by_isolate.end()) return nullptr;
+  napi_env env = it->second;
+  return env != nullptr ? env->edge_environment : nullptr;
+}
+
+void* NapiV8GetCurrentEdgeEnvironment(v8::Local<v8::Context> context) {
+  if (context.IsEmpty()) return nullptr;
+  napi_env env = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_env_by_isolate.find(context->GetIsolate());
+    if (it == g_env_by_isolate.end()) return nullptr;
+    env = it->second;
+  }
+  if (env == nullptr) return nullptr;
+  v8::Local<v8::Context> principal_context = env->context();
+  if (context != principal_context && !NapiV8IsContextifyContext(env, context)) {
+    return nullptr;
+  }
+  return env->edge_environment;
+}

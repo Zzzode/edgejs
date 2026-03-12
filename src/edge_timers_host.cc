@@ -4,20 +4,27 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
-#include <unordered_map>
-#include <unordered_set>
 
 #include <uv.h>
 
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_runtime.h"
 #include "edge_runtime_platform.h"
 
 namespace {
 
+void DeleteRefIfAny(napi_env env, napi_ref* ref_slot);
+
 struct TimersHostState {
-  napi_env env_key = nullptr;
+  explicit TimersHostState(napi_env env_in) : env(env_in) {}
+  ~TimersHostState() {
+    DeleteRefIfAny(env, &timers_callback_ref);
+    DeleteRefIfAny(env, &immediate_callback_ref);
+    DeleteRefIfAny(env, &immediate_info_ref);
+    DeleteRefIfAny(env, &timeout_info_ref);
+  }
+
   napi_env env = nullptr;
   napi_ref timers_callback_ref = nullptr;
   napi_ref immediate_callback_ref = nullptr;
@@ -45,9 +52,6 @@ bool TimersHostStateIsUnavailable(const TimersHostState* st) {
 constexpr int kImmediateCount = 0;
 constexpr int kImmediateRefCount = 1;
 constexpr int kImmediateHasOutstanding = 2;
-
-std::unordered_map<napi_env, std::unique_ptr<TimersHostState>> g_timers_states;
-std::unordered_set<napi_env> g_timers_cleanup_hook_registered;
 
 bool TimersDebugEnabled() {
   static int enabled = -1;
@@ -85,8 +89,8 @@ void DeleteRefIfAny(napi_env env, napi_ref* ref_slot) {
 }
 
 TimersHostState* GetState(napi_env env) {
-  auto it = g_timers_states.find(env);
-  return it == g_timers_states.end() ? nullptr : it->second.get();
+  return EdgeEnvironmentGetSlotData<TimersHostState>(
+      env, kEdgeEnvironmentSlotTimersHostState);
 }
 
 double GetNowMs(TimersHostState* st) {
@@ -102,8 +106,7 @@ double GetNowMs(TimersHostState* st) {
 }
 
 void MaybeDestroyState(TimersHostState* st) {
-  if (st == nullptr || !st->cleanup_started || st->pending_handle_closes != 0) return;
-  g_timers_states.erase(st->env_key);
+  (void)st;
 }
 
 void OnHandleClosed(uv_handle_t* handle) {
@@ -136,8 +139,6 @@ void CloseHandleIfInitialized(TimersHostState* st, uv_handle_t* handle, bool* in
 
 void OnTimersEnvCleanup(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
-  g_timers_cleanup_hook_registered.erase(env);
-
   TimersHostState* st = GetState(env);
   if (st == nullptr) return;
 
@@ -146,6 +147,12 @@ void OnTimersEnvCleanup(void* arg) {
   DeleteRefIfAny(st->env, &st->immediate_callback_ref);
   DeleteRefIfAny(st->env, &st->immediate_info_ref);
   DeleteRefIfAny(st->env, &st->timeout_info_ref);
+  if (auto* environment = EdgeEnvironmentGet(st->env); environment != nullptr) {
+    DeleteRefIfAny(st->env, &environment->immediate_info()->ref);
+    DeleteRefIfAny(st->env, &environment->timeout_info()->ref);
+    environment->immediate_info()->fields = nullptr;
+    environment->timeout_info()->fields = nullptr;
+  }
 
   if (st->timer_initialized) {
     uv_timer_stop(&st->timer_handle);
@@ -166,27 +173,11 @@ void OnTimersEnvCleanup(void* arg) {
   MaybeDestroyState(st);
 }
 
-void EnsureTimersCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  (void)EdgeEnsureEnvLoop(env, nullptr);
-  auto [it, inserted] = g_timers_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnTimersEnvCleanup, env) != napi_ok) {
-    g_timers_cleanup_hook_registered.erase(it);
-  }
-}
-
 TimersHostState* GetOrCreateState(napi_env env) {
   if (env == nullptr) return nullptr;
-  EnsureTimersCleanupHook(env);
-  auto [it, inserted] = g_timers_states.emplace(env, nullptr);
-  if (inserted || it->second == nullptr) {
-    auto state = std::make_unique<TimersHostState>();
-    state->env_key = env;
-    state->env = env;
-    it->second = std::move(state);
-  }
-  return it->second.get();
+  (void)EdgeEnsureEnvLoop(env, nullptr);
+  return &EdgeEnvironmentGetOrCreateSlotData<TimersHostState>(
+      env, kEdgeEnvironmentSlotTimersHostState);
 }
 
 TimersHostState* GetStateForJsBindingCall(napi_env env) {
@@ -601,6 +592,11 @@ void AttachInfoArrays(napi_env env, napi_value binding, TimersHostState* st) {
       napi_set_named_property(env, binding, "immediateInfo", immediate_info);
       DeleteRefIfAny(env, &st->immediate_info_ref);
       napi_create_reference(env, immediate_info, 1, &st->immediate_info_ref);
+      if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+        environment->immediate_info()->fields = ptr;
+        DeleteRefIfAny(env, &environment->immediate_info()->ref);
+        napi_create_reference(env, immediate_info, 1, &environment->immediate_info()->ref);
+      }
     }
   }
 
@@ -616,6 +612,11 @@ void AttachInfoArrays(napi_env env, napi_value binding, TimersHostState* st) {
       napi_set_named_property(env, binding, "timeoutInfo", timeout_info);
       DeleteRefIfAny(env, &st->timeout_info_ref);
       napi_create_reference(env, timeout_info, 1, &st->timeout_info_ref);
+      if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+        environment->timeout_info()->fields = ptr;
+        DeleteRefIfAny(env, &environment->timeout_info()->ref);
+        napi_create_reference(env, timeout_info, 1, &environment->timeout_info()->ref);
+      }
     }
   }
 }
@@ -686,9 +687,6 @@ void EdgeToggleImmediateRefFromNative(napi_env env, bool ref) {
 
 void EdgeRunTimersHostEnvCleanup(napi_env env) {
   if (env == nullptr) return;
-  if (g_timers_cleanup_hook_registered.erase(env) != 0) {
-    (void)napi_remove_env_cleanup_hook(env, OnTimersEnvCleanup, env);
-  }
   OnTimersEnvCleanup(env);
   uv_loop_t* loop = EdgeGetExistingEnvLoop(env);
   TimersHostState* st = GetState(env);

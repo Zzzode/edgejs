@@ -364,6 +364,20 @@ if(EDGE_NAPI_PROVIDER STREQUAL "imports")
     COMPILE_DEFINITIONS "NAPI_EXTERN=")
 endif()
 
+add_library(edge_environment_core STATIC
+  src/edge_environment.cc
+)
+target_include_directories(edge_environment_core
+  PUBLIC
+    "${EDGE_ROOT}/src"
+  PRIVATE
+    "${NAPI_INCLUDE_ROOT}"
+)
+target_link_libraries(edge_environment_core PUBLIC uv_a)
+if(EDGE_NAPI_PROVIDER STREQUAL "bundled-v8")
+  target_compile_definitions(edge_environment_core PUBLIC EDGE_BUNDLED_NAPI_V8=1)
+endif()
+
 set(EDGE_ICU_ROOT "${PROJECT_ROOT}/deps/icu-small")
 set(EDGE_ICU_INCLUDE_DIRS
   "${EDGE_ICU_ROOT}/source/common"
@@ -488,13 +502,20 @@ target_include_directories(edge_node_api
     "${NAPI_INCLUDE_ROOT}"
 )
 
-target_link_libraries(edge_node_api PRIVATE uv_a)
+target_link_libraries(edge_node_api
+  PUBLIC
+    edge_environment_core
+  PRIVATE
+    uv_a
+)
 if(EDGE_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_link_libraries(edge_node_api PUBLIC napi_v8)
+  target_link_libraries(napi_v8 PUBLIC edge_environment_core)
 endif()
 
 add_library(edge_runtime STATIC
   src/builtin_catalog.cc
+  src/edge_environment_runtime.cc
   src/edge_runtime.cc
   src/edge_runtime_platform_v8.cc
   src/edge_node_compat.cc
@@ -611,6 +632,7 @@ target_include_directories(edge_runtime
 )
 target_link_libraries(edge_runtime
   PUBLIC
+    edge_environment_core
     edge_node_api
     ${EDGE_ICU_LINK_LIBS}
   PRIVATE

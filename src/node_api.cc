@@ -1,6 +1,7 @@
 #include "node_api.h"
 #include "node_api_types.h"
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_module_loader.h"
 #include "edge_runtime.h"
@@ -51,13 +52,6 @@ struct napi_threadsafe_function__ {
   std::atomic<bool> finalized{false};
 };
 
-struct napi_async_cleanup_hook_handle__ {
-  napi_env env = nullptr;
-  napi_async_cleanup_hook hook = nullptr;
-  void* arg = nullptr;
-  bool removed = false;
-};
-
 struct napi_callback_scope__ {
   napi_env env = nullptr;
   napi_async_context async_context = nullptr;
@@ -68,7 +62,7 @@ void napi_v8_run_async_cleanup_hooks(napi_env env);
 
 namespace {
 
-struct EdgeEnvState {
+struct DetachedEnvState {
   std::vector<napi_async_cleanup_hook_handle> async_cleanup_hooks;
   bool async_cleanup_hook_registered = false;
   uv_loop_t* loop = nullptr;
@@ -77,33 +71,37 @@ struct EdgeEnvState {
   size_t open_callback_scopes = 0;
 };
 
-std::unordered_map<napi_env, EdgeEnvState> g_edge_env_state;
+std::unordered_map<napi_env, DetachedEnvState> g_detached_env_state;
 
 inline bool CheckEnv(napi_env env) {
   return env != nullptr;
 }
 
-EdgeEnvState& GetOrCreateEnvState(napi_env env) {
-  return g_edge_env_state[env];
+edge::Environment* GetAttachedEnvironment(napi_env env) {
+  return EdgeEnvironmentGet(env);
 }
 
-EdgeEnvState* GetEnvState(napi_env env) {
-  auto it = g_edge_env_state.find(env);
-  if (it == g_edge_env_state.end()) return nullptr;
+DetachedEnvState& GetOrCreateDetachedEnvState(napi_env env) {
+  return g_detached_env_state[env];
+}
+
+DetachedEnvState* GetDetachedEnvState(napi_env env) {
+  auto it = g_detached_env_state.find(env);
+  if (it == g_detached_env_state.end()) return nullptr;
   return &it->second;
 }
 
-void MaybeEraseEnvState(napi_env env) {
-  auto it = g_edge_env_state.find(env);
-  if (it == g_edge_env_state.end()) return;
-  const EdgeEnvState& state = it->second;
+void MaybeEraseDetachedEnvState(napi_env env) {
+  auto it = g_detached_env_state.find(env);
+  if (it == g_detached_env_state.end()) return;
+  const DetachedEnvState& state = it->second;
   if (!state.async_cleanup_hook_registered &&
       state.async_cleanup_hooks.empty() &&
       !state.loop_cleanup_hook_registered &&
       state.loop == nullptr &&
       state.callback_scope_depth == 0 &&
       state.open_callback_scopes == 0) {
-    g_edge_env_state.erase(it);
+    g_detached_env_state.erase(it);
   }
 }
 
@@ -138,7 +136,7 @@ void DrainAndCloseEnvLoop(uv_loop_t* loop) {
 void CleanupEnvLoopOnTeardown(void* arg) {
   auto* env = static_cast<napi_env>(arg);
   if (!CheckEnv(env)) return;
-  auto* state = GetEnvState(env);
+  auto* state = GetDetachedEnvState(env);
   if (state == nullptr) return;
 
   uv_loop_t* loop = state->loop;
@@ -149,7 +147,7 @@ void CleanupEnvLoopOnTeardown(void* arg) {
     delete loop;
   }
   EdgeFinalizeModuleLoaderEnv(env);
-  MaybeEraseEnvState(env);
+  MaybeEraseDetachedEnvState(env);
 }
 
 void RunAsyncCleanupHooksOnEnvTeardown(void* arg) {
@@ -290,7 +288,11 @@ napi_status EnterAsyncContextScope(napi_env env, napi_async_context async_contex
   if (async_context->async_id > 0) {
     EdgeAsyncWrapEmitBefore(env, async_context->async_id);
   }
-  GetOrCreateEnvState(env).callback_scope_depth++;
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    environment->IncrementCallbackScopeDepth();
+  } else {
+    GetOrCreateDetachedEnvState(env).callback_scope_depth++;
+  }
   return napi_ok;
 }
 
@@ -299,8 +301,10 @@ void ExitAsyncContextScope(napi_env env,
                            bool failed) {
   if (!CheckEnv(env) || async_context == nullptr) return;
 
-  auto* state = GetEnvState(env);
-  if (state != nullptr && state->callback_scope_depth > 0) {
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    environment->DecrementCallbackScopeDepth();
+  } else if (auto* state = GetDetachedEnvState(env);
+             state != nullptr && state->callback_scope_depth > 0) {
     state->callback_scope_depth--;
   }
 
@@ -309,11 +313,13 @@ void ExitAsyncContextScope(napi_env env,
   }
   (void)EdgeAsyncWrapPopContext(env, async_context->async_id);
 
-  state = GetEnvState(env);
-  if (failed ||
-      state == nullptr ||
-      state->callback_scope_depth != 0 ||
-      HasPendingException(env)) {
+  size_t callback_scope_depth = 0;
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    callback_scope_depth = environment->callback_scope_depth();
+  } else if (auto* state = GetDetachedEnvState(env); state != nullptr) {
+    callback_scope_depth = state->callback_scope_depth;
+  }
+  if (failed || callback_scope_depth != 0 || HasPendingException(env)) {
     return;
   }
   (void)EdgeRunCallbackScopeCheckpoint(env);
@@ -359,7 +365,12 @@ void UvAfterWork(uv_work_t* req, int status) {
 void napi_v8_run_async_cleanup_hooks(napi_env env) {
   if (!CheckEnv(env)) return;
 
-  auto* state = GetEnvState(env);
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    environment->RunAsyncCleanupHooks();
+    return;
+  }
+
+  auto* state = GetDetachedEnvState(env);
   if (state == nullptr) return;
 
   std::vector<napi_async_cleanup_hook_handle> pending;
@@ -376,7 +387,6 @@ void napi_v8_run_async_cleanup_hooks(napi_env env) {
     }
   }
 
-  // Drive libuv callbacks queued by async cleanup hooks until hooks are removed.
   size_t guard = 0;
   uv_loop_t* loop = EdgeGetExistingEnvLoop(env);
   while (!state->async_cleanup_hooks.empty() && guard++ < 128) {
@@ -398,7 +408,7 @@ void napi_v8_run_async_cleanup_hooks(napi_env env) {
   }
   state->async_cleanup_hooks.clear();
   state->async_cleanup_hook_registered = false;
-  MaybeEraseEnvState(env);
+  MaybeEraseDetachedEnvState(env);
 }
 
 extern "C" {
@@ -596,12 +606,16 @@ napi_status NAPI_CDECL napi_add_async_cleanup_hook(
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || hook == nullptr) return napi_invalid_arg;
   (void)EdgeEnsureEnvLoop(napiEnv, nullptr);
-  auto& state = GetOrCreateEnvState(napiEnv);
-  if (!state.async_cleanup_hook_registered) {
-    napi_status status =
-        napi_add_env_cleanup_hook(napiEnv, RunAsyncCleanupHooksOnEnvTeardown, napiEnv);
-    if (status != napi_ok) return status;
-    state.async_cleanup_hook_registered = true;
+  if (auto* environment = GetAttachedEnvironment(napiEnv); environment != nullptr) {
+    environment->set_async_cleanup_hook_registered(true);
+  } else {
+    auto& state = GetOrCreateDetachedEnvState(napiEnv);
+    if (!state.async_cleanup_hook_registered) {
+      napi_status status =
+          napi_add_env_cleanup_hook(napiEnv, RunAsyncCleanupHooksOnEnvTeardown, napiEnv);
+      if (status != napi_ok) return status;
+      state.async_cleanup_hook_registered = true;
+    }
   }
 
   auto* handle = new (std::nothrow) napi_async_cleanup_hook_handle__();
@@ -610,7 +624,11 @@ napi_status NAPI_CDECL napi_add_async_cleanup_hook(
   handle->hook = hook;
   handle->arg = arg;
 
-  state.async_cleanup_hooks.push_back(handle);
+  if (auto* environment = GetAttachedEnvironment(napiEnv); environment != nullptr) {
+    environment->AddAsyncCleanupHook(handle);
+  } else {
+    GetOrCreateDetachedEnvState(napiEnv).async_cleanup_hooks.push_back(handle);
+  }
   if (remove_handle != nullptr) *remove_handle = handle;
   return napi_ok;
 }
@@ -622,20 +640,30 @@ napi_status NAPI_CDECL napi_remove_async_cleanup_hook(
   remove_handle->removed = true;
 
   auto* env = remove_handle->env;
-  auto* state = GetEnvState(env);
-  if (state == nullptr) return napi_invalid_arg;
-  auto& hooks = state->async_cleanup_hooks;
-  for (auto it = hooks.begin(); it != hooks.end(); ++it) {
-    if (*it == remove_handle) {
-      hooks.erase(it);
-      break;
+  bool hooks_empty = false;
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    if (!environment->RemoveAsyncCleanupHook(remove_handle)) return napi_invalid_arg;
+    hooks_empty = environment->async_cleanup_hooks().empty();
+  } else {
+    auto* state = GetDetachedEnvState(env);
+    if (state == nullptr) return napi_invalid_arg;
+    auto& hooks = state->async_cleanup_hooks;
+    for (auto it = hooks.begin(); it != hooks.end(); ++it) {
+      if (*it == remove_handle) {
+        hooks.erase(it);
+        break;
+      }
+    }
+    hooks_empty = hooks.empty();
+    if (hooks_empty && state->async_cleanup_hook_registered) {
+      napi_remove_env_cleanup_hook(env, RunAsyncCleanupHooksOnEnvTeardown, env);
+      state->async_cleanup_hook_registered = false;
+      MaybeEraseDetachedEnvState(env);
     }
   }
   delete remove_handle;
-  if (hooks.empty() && state->async_cleanup_hook_registered) {
-    napi_remove_env_cleanup_hook(env, RunAsyncCleanupHooksOnEnvTeardown, env);
-    state->async_cleanup_hook_registered = false;
-    MaybeEraseEnvState(env);
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr && hooks_empty) {
+    environment->set_async_cleanup_hook_registered(false);
   }
   return napi_ok;
 }
@@ -702,23 +730,42 @@ napi_status NAPI_CDECL napi_open_callback_scope(napi_env env,
     return status;
   }
   scope->entered = true;
-  GetOrCreateEnvState(env).open_callback_scopes++;
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    environment->IncrementOpenCallbackScopes();
+  } else {
+    GetOrCreateDetachedEnvState(env).open_callback_scopes++;
+  }
   *result = scope;
   return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_close_callback_scope(napi_env env, napi_callback_scope scope) {
   if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
-  auto* state = GetEnvState(env);
-  if (state == nullptr || state->open_callback_scopes == 0) {
-    return napi_callback_scope_mismatch;
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    if (environment->open_callback_scopes() == 0) {
+      return napi_callback_scope_mismatch;
+    }
+  } else {
+    auto* state = GetDetachedEnvState(env);
+    if (state == nullptr || state->open_callback_scopes == 0) {
+      return napi_callback_scope_mismatch;
+    }
   }
   if (scope->entered) {
     ExitAsyncContextScope(env, scope->async_context, HasPendingException(env));
   }
-  state->open_callback_scopes--;
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    environment->DecrementOpenCallbackScopes();
+  } else {
+    auto* state = GetDetachedEnvState(env);
+    if (state == nullptr) {
+      delete scope;
+      return napi_callback_scope_mismatch;
+    }
+    state->open_callback_scopes--;
+    MaybeEraseDetachedEnvState(env);
+  }
   delete scope;
-  MaybeEraseEnvState(env);
   return napi_ok;
 }
 
@@ -726,7 +773,11 @@ napi_status NAPI_CDECL napi_close_callback_scope(napi_env env, napi_callback_sco
 
 napi_status EdgeEnsureEnvLoop(napi_env env, uv_loop_t** loop_out) {
   if (!CheckEnv(env)) return napi_invalid_arg;
-  auto& state = GetOrCreateEnvState(env);
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    return environment->EnsureEventLoop(loop_out);
+  }
+
+  auto& state = GetOrCreateDetachedEnvState(env);
   if (!state.loop_cleanup_hook_registered) {
     if (napi_add_env_cleanup_hook(env, CleanupEnvLoopOnTeardown, env) != napi_ok) {
       return napi_generic_failure;
@@ -754,6 +805,9 @@ uv_loop_t* EdgeGetEnvLoop(napi_env env) {
 
 uv_loop_t* EdgeGetExistingEnvLoop(napi_env env) {
   if (!CheckEnv(env)) return nullptr;
-  auto* state = GetEnvState(env);
+  if (auto* environment = GetAttachedEnvironment(env); environment != nullptr) {
+    return environment->GetExistingEventLoop();
+  }
+  auto* state = GetDetachedEnvState(env);
   return state != nullptr ? state->loop : nullptr;
 }

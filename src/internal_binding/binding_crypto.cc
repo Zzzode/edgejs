@@ -35,6 +35,7 @@
 #include "ncrypto.h"
 #include "crypto/edge_crypto_binding.h"
 #include "internal_binding/helpers.h"
+#include "edge_environment.h"
 #include "crypto/edge_secure_context_bridge.h"
 #include "edge_async_wrap.h"
 #include "edge_runtime.h"
@@ -62,38 +63,26 @@ constexpr int32_t kKeyVariantRSA_SSA_PKCS1_v1_5 = 0;
 constexpr int32_t kKeyVariantRSA_PSS = 1;
 constexpr int32_t kKeyVariantRSA_OAEP = 2;
 
+void ResetRef(napi_env env, napi_ref* ref_ptr);
+
 struct CryptoBindingState {
+  explicit CryptoBindingState(napi_env env_in) : env(env_in) {}
+  ~CryptoBindingState() {
+    ResetRef(env, &binding_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   int32_t fips_mode = 0;
 };
 
-std::unordered_map<napi_env, CryptoBindingState> g_crypto_states;
-std::unordered_set<napi_env> g_crypto_cleanup_hooks;
-
-void ResetRef(napi_env env, napi_ref* ref_ptr);
-
-void OnCryptoEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_crypto_cleanup_hooks.erase(env);
-  auto it = g_crypto_states.find(env);
-  if (it == g_crypto_states.end()) return;
-  ResetRef(env, &it->second.binding_ref);
-  g_crypto_states.erase(it);
-}
-
-void EnsureCryptoCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_crypto_cleanup_hooks.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnCryptoEnvCleanup, env) != napi_ok) {
-    g_crypto_cleanup_hooks.erase(it);
-  }
-}
-
 CryptoBindingState* GetState(napi_env env) {
-  auto it = g_crypto_states.find(env);
-  if (it == g_crypto_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<CryptoBindingState>(env, kEdgeEnvironmentSlotCryptoBindingState);
+}
+
+CryptoBindingState& EnsureState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<CryptoBindingState>(
+      env, kEdgeEnvironmentSlotCryptoBindingState);
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -8648,8 +8637,7 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
   napi_value out = options.callbacks.resolve_binding(env, options.state, "crypto");
   if (out == nullptr || IsUndefined(env, out)) return Undefined(env);
 
-  EnsureCryptoCleanupHook(env);
-  auto& st = g_crypto_states[env];
+  auto& st = EnsureState(env);
   if (st.binding_ref == nullptr) napi_create_reference(env, out, 1, &st.binding_ref);
 
   // Core constants.

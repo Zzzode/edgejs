@@ -22,6 +22,7 @@
 #include "edge_runtime.h"
 #include "edge_active_resource.h"
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_handle_wrap.h"
 #include "edge_udp_listener.h"
@@ -29,6 +30,18 @@
 namespace {
 
 class UdpWrap;
+
+void DeleteRef(napi_env env, napi_ref* ref);
+
+struct UdpBindingState {
+  explicit UdpBindingState(napi_env env_in) : env(env_in) {}
+  ~UdpBindingState() {
+    DeleteRef(env, &ctor_ref);
+  }
+
+  napi_env env = nullptr;
+  napi_ref ctor_ref = nullptr;
+};
 
 struct SendWrap final : public EdgeUdpSendWrap {
   napi_env env = nullptr;
@@ -42,9 +55,6 @@ struct SendWrap final : public EdgeUdpSendWrap {
 
   napi_value object(napi_env env_in) const override;
 };
-
-std::unordered_map<napi_env, napi_ref> g_udp_ctor_refs;
-std::unordered_set<napi_env> g_udp_cleanup_hook_registered;
 
 void OnClosed(uv_handle_t* h);
 void CloseUdpWrapForCleanup(void* data);
@@ -138,23 +148,13 @@ void DeleteRef(napi_env env, napi_ref* ref) {
   *ref = nullptr;
 }
 
-void OnUdpEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_udp_cleanup_hook_registered.erase(env);
-
-  auto it = g_udp_ctor_refs.find(env);
-  if (it == g_udp_ctor_refs.end()) return;
-  DeleteRef(env, &it->second);
-  g_udp_ctor_refs.erase(it);
+UdpBindingState& EnsureUdpBindingState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<UdpBindingState>(
+      env, kEdgeEnvironmentSlotUdpBindingState);
 }
 
-void EnsureUdpCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_udp_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnUdpEnvCleanup, env) != napi_ok) {
-    g_udp_cleanup_hook_registered.erase(it);
-  }
+UdpBindingState* GetUdpBindingState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<UdpBindingState>(env, kEdgeEnvironmentSlotUdpBindingState);
 }
 
 napi_value SendWrap::object(napi_env env_in) const {
@@ -1471,10 +1471,9 @@ napi_value EdgeInstallUdpWrapBinding(napi_env env) {
       udp_ctor == nullptr) {
     return nullptr;
   }
-  EnsureUdpCleanupHook(env);
-  auto& ctor_ref = g_udp_ctor_refs[env];
-  DeleteRef(env, &ctor_ref);
-  napi_create_reference(env, udp_ctor, 1, &ctor_ref);
+  auto& state = EnsureUdpBindingState(env);
+  DeleteRef(env, &state.ctor_ref);
+  napi_create_reference(env, udp_ctor, 1, &state.ctor_ref);
 
   napi_property_descriptor send_wrap_props[] = {
       {"getAsyncId", nullptr, SendWrapGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
@@ -1517,9 +1516,9 @@ napi_value EdgeInstallUdpWrapBinding(napi_env env) {
 
 napi_value EdgeGetUdpWrapConstructor(napi_env env) {
   if (env == nullptr) return nullptr;
-  auto it = g_udp_ctor_refs.find(env);
-  if (it == g_udp_ctor_refs.end() || it->second == nullptr) return nullptr;
-  return GetRefValue(env, it->second);
+  auto* state = GetUdpBindingState(env);
+  if (state == nullptr || state->ctor_ref == nullptr) return nullptr;
+  return GetRefValue(env, state->ctor_ref);
 }
 
 uv_handle_t* EdgeUdpWrapGetHandle(napi_env env, napi_value value) {

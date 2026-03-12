@@ -4,15 +4,13 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
-#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 
 #include <uv.h>
 
+#include "edge_environment.h"
 #include "edge_runtime.h"
 #include "edge_env_loop.h"
 #include "edge_timers_host.h"
@@ -29,6 +27,8 @@ struct PlatformTask {
   bool refed = false;
 };
 
+void CleanupTask(napi_env env, PlatformTask* task);
+
 struct DelayedPlatformTask {
   PlatformTask task;
   uint64_t seq = 0;
@@ -43,7 +43,27 @@ struct DelayedPlatformTaskCompare {
 };
 
 struct PlatformTaskState {
-  napi_env env_key = nullptr;
+  explicit PlatformTaskState(napi_env env_in)
+      : env(env_in), owning_thread(std::this_thread::get_id()) {}
+  ~PlatformTaskState() {
+    while (!immediate_tasks.empty()) {
+      PlatformTask task = std::move(immediate_tasks.front());
+      immediate_tasks.pop_front();
+      CleanupTask(env, &task);
+    }
+    while (!foreground_tasks.empty()) {
+      PlatformTask task = std::move(foreground_tasks.front());
+      foreground_tasks.pop_front();
+      CleanupTask(env, &task);
+    }
+    while (!delayed_foreground_tasks.empty()) {
+      DelayedPlatformTask delayed =
+          std::move(const_cast<DelayedPlatformTask&>(delayed_foreground_tasks.top()));
+      delayed_foreground_tasks.pop();
+      CleanupTask(env, &delayed.task);
+    }
+  }
+
   napi_env env = nullptr;
   std::thread::id owning_thread;
   std::mutex foreground_mutex;
@@ -72,9 +92,6 @@ struct PlatformTaskState {
   uint32_t pending_handle_closes = 0;
 };
 
-std::unordered_map<napi_env, std::unique_ptr<PlatformTaskState>> g_platform_states;
-std::unordered_set<napi_env> g_platform_cleanup_hook_registered;
-
 size_t DrainForegroundTasksFromState(PlatformTaskState* state,
                                      bool run_checkpoint,
                                      bool clear_async_pending,
@@ -82,8 +99,13 @@ size_t DrainForegroundTasksFromState(PlatformTaskState* state,
                                      size_t* ran_out);
 
 PlatformTaskState* GetState(napi_env env) {
-  auto it = g_platform_states.find(env);
-  return it == g_platform_states.end() ? nullptr : it->second.get();
+  return EdgeEnvironmentGetSlotData<PlatformTaskState>(
+      env, kEdgeEnvironmentSlotPlatformTaskState);
+}
+
+PlatformTaskState& EnsureState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<PlatformTaskState>(
+      env, kEdgeEnvironmentSlotPlatformTaskState);
 }
 
 void AssertOwningThread(const PlatformTaskState* state, const char* where) {
@@ -106,11 +128,7 @@ bool HasPendingException(napi_env env) {
 }
 
 void MaybeDestroyState(PlatformTaskState* state) {
-  if (state == nullptr || !state->cleanup_started.load(std::memory_order_acquire) ||
-      state->pending_handle_closes != 0) {
-    return;
-  }
-  g_platform_states.erase(state->env_key);
+  (void)state;
 }
 
 void OnForegroundHandleClosed(uv_handle_t* handle) {
@@ -310,33 +328,20 @@ napi_status EnqueueForegroundTaskFromEngine(void* target,
                                            void* data,
                                            unofficial_napi_foreground_task_cleanup cleanup,
                                            uint64_t delay_millis);
-void EnsurePlatformCleanupHook(napi_env env);
 
 napi_status InstallForegroundEnqueueHook(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  PlatformTaskState* state = nullptr;
-  auto [it, inserted] = g_platform_states.emplace(env, nullptr);
-  if (inserted || it->second == nullptr) {
-    auto created = std::make_unique<PlatformTaskState>();
-    created->env_key = env;
-    created->env = env;
-    created->owning_thread = std::this_thread::get_id();
-    it->second = std::move(created);
-  }
-  state = it->second.get();
+  PlatformTaskState* state = &EnsureState(env);
   if (state == nullptr || state->cleanup_started.load(std::memory_order_acquire)) {
     return napi_generic_failure;
   }
   if (state == nullptr || !EnsureForegroundHandles(state)) return napi_generic_failure;
-  EnsurePlatformCleanupHook(env);
   return unofficial_napi_set_enqueue_foreground_task_callback(
       env, EnqueueForegroundTaskFromEngine, state);
 }
 
 void OnPlatformEnvCleanup(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
-  g_platform_cleanup_hook_registered.erase(env);
-
   PlatformTaskState* state = GetState(env);
   if (state == nullptr) return;
   AssertOwningThread(state, "OnPlatformEnvCleanup");
@@ -379,15 +384,6 @@ void OnPlatformEnvCleanup(void* arg) {
                            &state->foreground_timer_initialized);
 
   MaybeDestroyState(state);
-}
-
-void EnsurePlatformCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_platform_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnPlatformEnvCleanup, env) != napi_ok) {
-    g_platform_cleanup_hook_registered.erase(it);
-  }
 }
 
 size_t DrainForegroundTasks(napi_env env, bool run_checkpoint, napi_status* status_out) {
@@ -617,9 +613,6 @@ napi_status EdgeRuntimePlatformDrainTasks(napi_env env) {
 
 void EdgeRunRuntimePlatformEnvCleanup(napi_env env) {
   if (env == nullptr) return;
-  if (g_platform_cleanup_hook_registered.erase(env) != 0) {
-    (void)napi_remove_env_cleanup_hook(env, OnPlatformEnvCleanup, env);
-  }
   OnPlatformEnvCleanup(env);
   uv_loop_t* loop = EdgeGetExistingEnvLoop(env);
   PlatformTaskState* state = GetState(env);

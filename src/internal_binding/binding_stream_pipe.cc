@@ -8,9 +8,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "../edge_stream_wrap.h"
 #include "uv.h"
@@ -24,7 +24,15 @@ bool IsStreamPipeDebugEnabled() {
   return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
 }
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct StreamPipeBindingState {
+  explicit StreamPipeBindingState(napi_env env_in) : env(env_in) {}
+  ~StreamPipeBindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
 };
 
@@ -42,32 +50,15 @@ struct StreamPipeWrap {
   uint32_t pending_writes = 0;
 };
 
-std::unordered_map<napi_env, StreamPipeBindingState> g_stream_pipe_states;
-std::unordered_set<napi_env> g_stream_pipe_cleanup_hooks;
-
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
 }
 
-void CleanupStreamPipeEnv(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_stream_pipe_cleanup_hooks.erase(env);
-  auto it = g_stream_pipe_states.find(env);
-  if (it == g_stream_pipe_states.end()) return;
-  DeleteRefIfPresent(env, &it->second.binding_ref);
-  g_stream_pipe_states.erase(it);
-}
-
 StreamPipeBindingState& EnsureState(napi_env env) {
-  auto& state = g_stream_pipe_states[env];
-  if (g_stream_pipe_cleanup_hooks.emplace(env).second) {
-    if (napi_add_env_cleanup_hook(env, CleanupStreamPipeEnv, env) != napi_ok) {
-      g_stream_pipe_cleanup_hooks.erase(env);
-    }
-  }
-  return state;
+  return EdgeEnvironmentGetOrCreateSlotData<StreamPipeBindingState>(
+      env, kEdgeEnvironmentSlotStreamPipeBindingState);
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {

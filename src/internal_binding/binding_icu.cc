@@ -18,6 +18,7 @@
 #include <unicode/utf16.h>
 #include <unicode/utypes.h>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 
 namespace internal_binding {
@@ -33,7 +34,15 @@ constexpr uint32_t kConverterFlagsFlush = 0x1;
 constexpr uint32_t kConverterFlagsFatal = 0x2;
 constexpr uint32_t kConverterFlagsIgnoreBom = 0x4;
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct IcuBindingState {
+  explicit IcuBindingState(napi_env env_in) : env(env_in) {}
+  ~IcuBindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
 };
 
@@ -44,32 +53,19 @@ struct ConverterWrap {
   bool unicode = false;
 };
 
-std::unordered_map<napi_env, IcuBindingState> g_icu_states;
-std::unordered_set<napi_env> g_icu_cleanup_hook_registered;
-
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
 }
 
-void OnIcuEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_icu_cleanup_hook_registered.erase(env);
-
-  auto it = g_icu_states.find(env);
-  if (it == g_icu_states.end()) return;
-  DeleteRefIfPresent(env, &it->second.binding_ref);
-  g_icu_states.erase(it);
+IcuBindingState* GetIcuState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<IcuBindingState>(env, kEdgeEnvironmentSlotIcuBindingState);
 }
 
-void EnsureIcuCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_icu_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnIcuEnvCleanup, env) != napi_ok) {
-    g_icu_cleanup_hook_registered.erase(it);
-  }
+IcuBindingState& EnsureIcuState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<IcuBindingState>(
+      env, kEdgeEnvironmentSlotIcuBindingState);
 }
 
 bool IsBigEndian() {
@@ -656,11 +652,10 @@ bool SetFunction(napi_env env, napi_value object, const char* name, napi_callbac
 }  // namespace
 
 napi_value ResolveIcu(napi_env env, const ResolveOptions& /*options*/) {
-  EnsureIcuCleanupHook(env);
-  auto cached_it = g_icu_states.find(env);
-  if (cached_it != g_icu_states.end() && cached_it->second.binding_ref != nullptr) {
+  auto* state = GetIcuState(env);
+  if (state != nullptr && state->binding_ref != nullptr) {
     napi_value cached = nullptr;
-    if (napi_get_reference_value(env, cached_it->second.binding_ref, &cached) == napi_ok && cached != nullptr) {
+    if (napi_get_reference_value(env, state->binding_ref, &cached) == napi_ok && cached != nullptr) {
       return cached;
     }
   }
@@ -677,9 +672,9 @@ napi_value ResolveIcu(napi_env env, const ResolveOptions& /*options*/) {
     return Undefined(env);
   }
 
-  auto& state = g_icu_states[env];
-  DeleteRefIfPresent(env, &state.binding_ref);
-  napi_create_reference(env, out, 1, &state.binding_ref);
+  auto& state_ref = EnsureIcuState(env);
+  DeleteRefIfPresent(env, &state_ref.binding_ref);
+  napi_create_reference(env, out, 1, &state_ref.binding_ref);
   return out;
 }
 

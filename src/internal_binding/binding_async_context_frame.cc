@@ -1,7 +1,6 @@
 #include "internal_binding/dispatch.h"
 
-#include <unordered_map>
-
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "unofficial_napi.h"
 
@@ -10,37 +9,21 @@ namespace internal_binding {
 namespace {
 
 struct AsyncContextFrameBindingState {
+  explicit AsyncContextFrameBindingState(napi_env env_in) : env(env_in) {}
+  ~AsyncContextFrameBindingState() {
+    if (binding_ref != nullptr) {
+      napi_delete_reference(env, binding_ref);
+      binding_ref = nullptr;
+    }
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
 };
 
-std::unordered_map<napi_env, AsyncContextFrameBindingState> g_async_context_frame_states;
-std::unordered_map<napi_env, bool> g_async_context_frame_cleanup_installed;
-
 AsyncContextFrameBindingState& GetState(napi_env env) {
-  return g_async_context_frame_states[env];
-}
-
-void OnAsyncContextFrameEnvCleanup(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-  auto installed_it = g_async_context_frame_cleanup_installed.find(env);
-  if (installed_it != g_async_context_frame_cleanup_installed.end()) {
-    g_async_context_frame_cleanup_installed.erase(installed_it);
-  }
-
-  auto it = g_async_context_frame_states.find(env);
-  if (it == g_async_context_frame_states.end()) return;
-  if (it->second.binding_ref != nullptr) {
-    napi_delete_reference(env, it->second.binding_ref);
-    it->second.binding_ref = nullptr;
-  }
-  g_async_context_frame_states.erase(it);
-}
-
-void EnsureAsyncContextFrameCleanupHook(napi_env env) {
-  if (g_async_context_frame_cleanup_installed[env]) return;
-  if (napi_add_env_cleanup_hook(env, OnAsyncContextFrameEnvCleanup, env) == napi_ok) {
-    g_async_context_frame_cleanup_installed[env] = true;
-  }
+  return EdgeEnvironmentGetOrCreateSlotData<AsyncContextFrameBindingState>(
+      env, kEdgeEnvironmentSlotAsyncContextFrameBindingState);
 }
 
 napi_value GetContinuationPreservedEmbedderData(napi_env env, napi_callback_info info) {
@@ -70,7 +53,6 @@ napi_value SetContinuationPreservedEmbedderData(napi_env env, napi_callback_info
 
 napi_value ResolveAsyncContextFrame(napi_env env, const ResolveOptions& options) {
   (void)options;
-  EnsureAsyncContextFrameCleanupHook(env);
   AsyncContextFrameBindingState& state = GetState(env);
   if (state.binding_ref != nullptr) {
     napi_value cached = nullptr;

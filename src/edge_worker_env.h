@@ -1,27 +1,7 @@
 #ifndef EDGE_WORKER_ENV_H_
 #define EDGE_WORKER_ENV_H_
 
-#include <array>
-#include <map>
-#include <string>
-
-#include "node_api.h"
-#include "internal_binding/binding_messaging.h"
-
-struct EdgeWorkerEnvConfig {
-  bool is_main_thread = true;
-  bool is_internal_thread = false;
-  bool owns_process_state = true;
-  bool share_env = true;
-  bool tracks_unmanaged_fds = false;
-  int32_t thread_id = 0;
-  std::string thread_name = "main";
-  std::array<double, 4> resource_limits = {-1, -1, -1, -1};
-  std::map<std::string, std::string> env_vars;
-  internal_binding::EdgeMessagePortDataPtr env_message_port_data;
-  std::string local_process_title;
-  uint32_t local_debug_port = 0;
-};
+#include "edge_environment.h"
 
 void EdgeWorkerEnvConfigure(napi_env env, const EdgeWorkerEnvConfig& config);
 bool EdgeWorkerEnvGetConfig(napi_env env, EdgeWorkerEnvConfig* out);

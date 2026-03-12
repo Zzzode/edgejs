@@ -1,16 +1,11 @@
 #include "internal_binding/dispatch.h"
 
-#include <unordered_map>
-#include <unordered_set>
-
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 
 namespace internal_binding {
 
 namespace {
-
-std::unordered_map<napi_env, napi_ref> g_mksnapshot_refs;
-std::unordered_set<napi_env> g_mksnapshot_cleanup_hook_registered;
 
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
@@ -18,23 +13,24 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   *ref = nullptr;
 }
 
-void OnMksnapshotEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_mksnapshot_cleanup_hook_registered.erase(env);
+struct MksnapshotBindingState {
+  explicit MksnapshotBindingState(napi_env env_in) : env(env_in) {}
+  ~MksnapshotBindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+  }
 
-  auto it = g_mksnapshot_refs.find(env);
-  if (it == g_mksnapshot_refs.end()) return;
-  DeleteRefIfPresent(env, &it->second);
-  g_mksnapshot_refs.erase(it);
+  napi_env env = nullptr;
+  napi_ref binding_ref = nullptr;
+};
+
+MksnapshotBindingState* GetMksnapshotState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<MksnapshotBindingState>(
+      env, kEdgeEnvironmentSlotMksnapshotBindingState);
 }
 
-void EnsureMksnapshotCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_mksnapshot_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnMksnapshotEnvCleanup, env) != napi_ok) {
-    g_mksnapshot_cleanup_hook_registered.erase(it);
-  }
+MksnapshotBindingState& EnsureMksnapshotState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<MksnapshotBindingState>(
+      env, kEdgeEnvironmentSlotMksnapshotBindingState);
 }
 
 napi_value ReturnUndefined(napi_env env, napi_callback_info /*info*/) {
@@ -42,17 +38,16 @@ napi_value ReturnUndefined(napi_env env, napi_callback_info /*info*/) {
 }
 
 napi_value GetCachedMksnapshot(napi_env env) {
-  auto it = g_mksnapshot_refs.find(env);
-  if (it == g_mksnapshot_refs.end() || it->second == nullptr) return nullptr;
+  auto* state = GetMksnapshotState(env);
+  if (state == nullptr || state->binding_ref == nullptr) return nullptr;
   napi_value out = nullptr;
-  if (napi_get_reference_value(env, it->second, &out) != napi_ok || out == nullptr) return nullptr;
+  if (napi_get_reference_value(env, state->binding_ref, &out) != napi_ok || out == nullptr) return nullptr;
   return out;
 }
 
 }  // namespace
 
 napi_value ResolveMksnapshot(napi_env env, const ResolveOptions& /*options*/) {
-  EnsureMksnapshotCleanupHook(env);
   const napi_value undefined = Undefined(env);
   napi_value cached = GetCachedMksnapshot(env);
   if (cached != nullptr) return cached;
@@ -86,9 +81,9 @@ napi_value ResolveMksnapshot(napi_env env, const ResolveOptions& /*options*/) {
 
   SetString(env, out, "anonymousMainPath", "<anonymous>");
 
-  auto& ref = g_mksnapshot_refs[env];
-  DeleteRefIfPresent(env, &ref);
-  napi_create_reference(env, out, 1, &ref);
+  auto& state = EnsureMksnapshotState(env);
+  DeleteRefIfPresent(env, &state.binding_ref);
+  napi_create_reference(env, out, 1, &state.binding_ref);
   return out;
 }
 

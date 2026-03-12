@@ -6,11 +6,10 @@
 #include <fstream>
 #include <limits>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 
 namespace internal_binding {
@@ -26,7 +25,26 @@ struct StoredDataObject {
   std::string type;
 };
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
 struct BlobBindingState {
+  explicit BlobBindingState(napi_env env_in) : env(env_in) {}
+  ~BlobBindingState() {
+    for (auto& entry : objects) {
+      DeleteRefIfPresent(env, &entry.second.handle_ref);
+    }
+    objects.clear();
+    DeleteRefIfPresent(env, &binding_ref);
+    DeleteRefIfPresent(env, &handle_slice_ref);
+    DeleteRefIfPresent(env, &handle_get_reader_ref);
+    DeleteRefIfPresent(env, &reader_pull_ref);
+  }
+
+  napi_env env = nullptr;
   std::unordered_map<std::string, StoredDataObject> objects;
   napi_ref binding_ref = nullptr;
   napi_ref handle_slice_ref = nullptr;
@@ -34,39 +52,13 @@ struct BlobBindingState {
   napi_ref reader_pull_ref = nullptr;
 };
 
-std::unordered_map<napi_env, BlobBindingState> g_blob_state;
-std::unordered_set<napi_env> g_blob_cleanup_hook_registered;
-
-void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
-  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
-  napi_delete_reference(env, *ref);
-  *ref = nullptr;
+BlobBindingState* GetBlobState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<BlobBindingState>(env, kEdgeEnvironmentSlotBlobBindingState);
 }
 
-void OnBlobEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_blob_cleanup_hook_registered.erase(env);
-
-  auto it = g_blob_state.find(env);
-  if (it == g_blob_state.end()) return;
-  for (auto& entry : it->second.objects) {
-    DeleteRefIfPresent(env, &entry.second.handle_ref);
-  }
-  it->second.objects.clear();
-  DeleteRefIfPresent(env, &it->second.binding_ref);
-  DeleteRefIfPresent(env, &it->second.handle_slice_ref);
-  DeleteRefIfPresent(env, &it->second.handle_get_reader_ref);
-  DeleteRefIfPresent(env, &it->second.reader_pull_ref);
-  g_blob_state.erase(it);
-}
-
-void EnsureBlobCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_blob_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnBlobEnvCleanup, env) != napi_ok) {
-    g_blob_cleanup_hook_registered.erase(it);
-  }
+BlobBindingState& EnsureBlobState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<BlobBindingState>(
+      env, kEdgeEnvironmentSlotBlobBindingState);
 }
 
 bool GetNamedProperty(napi_env env, napi_value obj, const char* key, napi_value* out) {
@@ -223,8 +215,7 @@ napi_value GetOrCreateCachedFunction(napi_env env,
 }
 
 napi_value CreateBlobHandle(napi_env env, napi_value data_arraybuffer) {
-  EnsureBlobCleanupHook(env);
-  BlobBindingState& state = g_blob_state[env];
+  BlobBindingState& state = EnsureBlobState(env);
 
   napi_value handle = nullptr;
   if (napi_create_object(env, &handle) != napi_ok || handle == nullptr) return Undefined(env);
@@ -325,8 +316,7 @@ napi_value BlobHandleGetReaderCallback(napi_env env, napi_callback_info info) {
   if (napi_get_boolean(env, false, &done) != napi_ok || done == nullptr) return Undefined(env);
   if (napi_set_named_property(env, reader, kBlobReaderDoneKey, done) != napi_ok) return Undefined(env);
 
-  EnsureBlobCleanupHook(env);
-  BlobBindingState& state = g_blob_state[env];
+  BlobBindingState& state = EnsureBlobState(env);
   napi_value pull_fn = GetOrCreateCachedFunction(
       env, &state.reader_pull_ref, "pull", BlobReaderPullCallback);
   if (pull_fn == nullptr ||
@@ -517,7 +507,7 @@ napi_value BlobStoreDataObjectCallback(napi_env env, napi_callback_info info) {
     return Undefined(env);
   }
 
-  BlobBindingState& state = g_blob_state[env];
+  BlobBindingState& state = EnsureBlobState(env);
   auto existing = state.objects.find(key);
   if (existing != state.objects.end()) {
     if (existing->second.handle_ref != nullptr) {
@@ -539,10 +529,10 @@ napi_value BlobGetDataObjectCallback(napi_env env, napi_callback_info info) {
   std::string key;
   if (!ValueToUtf8(env, argv[0], &key) || key.empty()) return Undefined(env);
 
-  auto state_it = g_blob_state.find(env);
-  if (state_it == g_blob_state.end()) return Undefined(env);
-  auto item_it = state_it->second.objects.find(key);
-  if (item_it == state_it->second.objects.end()) return Undefined(env);
+  auto* state = GetBlobState(env);
+  if (state == nullptr) return Undefined(env);
+  auto item_it = state->objects.find(key);
+  if (item_it == state->objects.end()) return Undefined(env);
 
   napi_value handle = nullptr;
   if (napi_get_reference_value(env, item_it->second.handle_ref, &handle) != napi_ok || handle == nullptr) {
@@ -579,12 +569,12 @@ napi_value BlobRevokeObjectURLCallback(napi_env env, napi_callback_info info) {
   std::string key;
   if (!ValueToUtf8(env, argv[0], &key) || key.empty()) return Undefined(env);
 
-  auto state_it = g_blob_state.find(env);
-  if (state_it == g_blob_state.end()) return Undefined(env);
-  auto item_it = state_it->second.objects.find(key);
-  if (item_it == state_it->second.objects.end()) return Undefined(env);
+  auto* state = GetBlobState(env);
+  if (state == nullptr) return Undefined(env);
+  auto item_it = state->objects.find(key);
+  if (item_it == state->objects.end()) return Undefined(env);
   DeleteRefIfPresent(env, &item_it->second.handle_ref);
-  state_it->second.objects.erase(item_it);
+  state->objects.erase(item_it);
   return Undefined(env);
 }
 
@@ -599,11 +589,11 @@ bool DefineMethod(napi_env env, napi_value target, const char* name, napi_callba
 }  // namespace
 
 napi_value ResolveBlob(napi_env env, const ResolveOptions& /*options*/) {
-  EnsureBlobCleanupHook(env);
-  auto state_it = g_blob_state.find(env);
-  if (state_it != g_blob_state.end() && state_it->second.binding_ref != nullptr) {
+  auto* existing_state = GetBlobState(env);
+  if (existing_state != nullptr && existing_state->binding_ref != nullptr) {
     napi_value cached = nullptr;
-    if (napi_get_reference_value(env, state_it->second.binding_ref, &cached) == napi_ok && cached != nullptr) {
+    if (napi_get_reference_value(env, existing_state->binding_ref, &cached) == napi_ok &&
+        cached != nullptr) {
       return cached;
     }
   }
@@ -620,7 +610,7 @@ napi_value ResolveBlob(napi_env env, const ResolveOptions& /*options*/) {
     return Undefined(env);
   }
 
-  BlobBindingState& state = g_blob_state[env];
+  BlobBindingState& state = EnsureBlobState(env);
   DeleteRefIfPresent(env, &state.binding_ref);
   if (napi_create_reference(env, binding, 1, &state.binding_ref) != napi_ok) {
     state.binding_ref = nullptr;

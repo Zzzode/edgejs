@@ -2,10 +2,9 @@
 
 #include <vector>
 
+#include "edge_environment.h"
 #include "internal_binding/binding_async_wrap.h"
 #include "unofficial_napi.h"
-#include <unordered_map>
-#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 #include "edge_module_loader.h"
@@ -13,42 +12,29 @@
 
 namespace {
 
+void ResetRef(napi_env env, napi_ref* ref);
+
 struct AsyncWrapCache {
+  explicit AsyncWrapCache(napi_env env_in) : env(env_in) {}
+  ~AsyncWrapCache() {
+    for (auto& entry : context_frame_refs) {
+      ResetRef(env, &entry.second);
+    }
+    context_frame_refs.clear();
+    ResetRef(env, &binding_ref);
+    ResetRef(env, &async_id_fields_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref async_id_fields_ref = nullptr;
   std::unordered_map<int64_t, napi_ref> context_frame_refs;
 };
 
-std::unordered_map<napi_env, AsyncWrapCache> g_async_wrap_cache;
-std::unordered_set<napi_env> g_async_wrap_cleanup_hooks;
-
 void ResetRef(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
-}
-
-void OnAsyncWrapEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_async_wrap_cleanup_hooks.erase(env);
-  auto it = g_async_wrap_cache.find(env);
-  if (it == g_async_wrap_cache.end()) return;
-  for (auto& entry : it->second.context_frame_refs) {
-    ResetRef(env, &entry.second);
-  }
-  it->second.context_frame_refs.clear();
-  ResetRef(env, &it->second.binding_ref);
-  ResetRef(env, &it->second.async_id_fields_ref);
-  g_async_wrap_cache.erase(it);
-}
-
-void EnsureAsyncWrapCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_async_wrap_cleanup_hooks.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnAsyncWrapEnvCleanup, env) != napi_ok) {
-    g_async_wrap_cleanup_hooks.erase(it);
-  }
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -100,8 +86,8 @@ napi_value ResolveInternalBinding(napi_env env, const char* name) {
 }
 
 AsyncWrapCache& GetCache(napi_env env) {
-  EnsureAsyncWrapCleanupHook(env);
-  return g_async_wrap_cache[env];
+  return EdgeEnvironmentGetOrCreateSlotData<AsyncWrapCache>(
+      env, kEdgeEnvironmentSlotAsyncWrapCache);
 }
 
 bool GetPerIsolateSymbol(napi_env env, const char* name, napi_value* out) {

@@ -19,6 +19,7 @@
 #include "ncrypto.h"
 #include "internal_binding/helpers.h"
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_handle_wrap.h"
 #include "edge_module_loader.h"
@@ -54,6 +55,7 @@ int32_t CallParentMethodInt(TlsWrap* wrap,
                             napi_value* argv,
                             napi_value* result_out);
 int TLSExtStatusCallback(SSL* ssl, void* arg);
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
 
 struct ClientHelloData {
   const uint8_t* session_id = nullptr;
@@ -311,6 +313,33 @@ struct TlsWrap {
 };
 
 struct TlsBindingState {
+  explicit TlsBindingState(napi_env env_in) : env(env_in) {}
+  ~TlsBindingState() {
+    for (TlsWrap* wrap : wraps) {
+      if (wrap == nullptr) continue;
+      DeleteRefIfPresent(env, &wrap->base.onread_ref);
+      DeleteRefIfPresent(env, &wrap->base.user_read_buffer_ref);
+      DeleteRefIfPresent(env, &wrap->base.wrapper_ref);
+      wrap->wrapper_ref = nullptr;
+      DeleteRefIfPresent(env, &wrap->parent_ref);
+      DeleteRefIfPresent(env, &wrap->context_ref);
+      DeleteRefIfPresent(env, &wrap->pending_shutdown_req_ref);
+      DeleteRefIfPresent(env, &wrap->active_write_req_ref);
+      DeleteRefIfPresent(env, &wrap->active_parent_write_req_ref);
+      DeleteRefIfPresent(env, &wrap->user_read_buffer_ref);
+      for (auto& pending : wrap->pending_app_writes) {
+        DeleteRefIfPresent(env, &pending.req_ref);
+      }
+      for (auto& pending : wrap->pending_encrypted_writes) {
+        DeleteRefIfPresent(env, &pending.completion_req_ref);
+      }
+    }
+    DeleteRefIfPresent(env, &binding_ref);
+    DeleteRefIfPresent(env, &tls_wrap_ctor_ref);
+    wraps.clear();
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref tls_wrap_ctor_ref = nullptr;
   int64_t next_async_id = 300000;
@@ -346,9 +375,6 @@ const EdgeStreamBaseOps kTlsWrapOps = {
     nullptr,
     TlsWrapStreamBaseWriteBuffer,
 };
-
-std::unordered_map<napi_env, TlsBindingState> g_tls_states;
-std::unordered_set<napi_env> g_tls_cleanup_hook_registered;
 
 napi_value Undefined(napi_env env) {
   napi_value out = nullptr;
@@ -590,45 +616,13 @@ void SetState(napi_env env, int idx, int32_t value) {
 }
 
 TlsBindingState& EnsureState(napi_env env) {
-  if (env != nullptr) {
-    auto [it, inserted] = g_tls_cleanup_hook_registered.emplace(env);
-    if (inserted && napi_add_env_cleanup_hook(
-                        env,
-                        [](void* data) {
-                          napi_env cleanup_env = static_cast<napi_env>(data);
-                          g_tls_cleanup_hook_registered.erase(cleanup_env);
+  return EdgeEnvironmentGetOrCreateSlotData<TlsBindingState>(
+      env, kEdgeEnvironmentSlotTlsBindingState);
+}
 
-                          auto state_it = g_tls_states.find(cleanup_env);
-                          if (state_it == g_tls_states.end()) return;
-                          for (TlsWrap* wrap : state_it->second.wraps) {
-                            if (wrap == nullptr) continue;
-                            DeleteRefIfPresent(cleanup_env, &wrap->base.onread_ref);
-                            DeleteRefIfPresent(cleanup_env, &wrap->base.user_read_buffer_ref);
-                            DeleteRefIfPresent(cleanup_env, &wrap->base.wrapper_ref);
-                            wrap->wrapper_ref = nullptr;
-                            DeleteRefIfPresent(cleanup_env, &wrap->parent_ref);
-                            DeleteRefIfPresent(cleanup_env, &wrap->context_ref);
-                            DeleteRefIfPresent(cleanup_env, &wrap->pending_shutdown_req_ref);
-                            DeleteRefIfPresent(cleanup_env, &wrap->active_write_req_ref);
-                            DeleteRefIfPresent(cleanup_env, &wrap->active_parent_write_req_ref);
-                            DeleteRefIfPresent(cleanup_env, &wrap->user_read_buffer_ref);
-                            for (auto& pending : wrap->pending_app_writes) {
-                              DeleteRefIfPresent(cleanup_env, &pending.req_ref);
-                            }
-                            for (auto& pending : wrap->pending_encrypted_writes) {
-                              DeleteRefIfPresent(cleanup_env, &pending.completion_req_ref);
-                            }
-                          }
-                          DeleteRefIfPresent(cleanup_env, &state_it->second.binding_ref);
-                          DeleteRefIfPresent(cleanup_env, &state_it->second.tls_wrap_ctor_ref);
-                          state_it->second.wraps.clear();
-                          g_tls_states.erase(state_it);
-                        },
-                        env) != napi_ok) {
-      g_tls_cleanup_hook_registered.erase(it);
-    }
-  }
-  return g_tls_states[env];
+TlsBindingState* GetState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<TlsBindingState>(
+      env, kEdgeEnvironmentSlotTlsBindingState);
 }
 
 TlsWrap* UnwrapTlsWrap(napi_env env, napi_value value) {
@@ -639,9 +633,9 @@ TlsWrap* UnwrapTlsWrap(napi_env env, napi_value value) {
 }
 
 TlsWrap* FindWrapBySelf(napi_env env, napi_value self) {
-  auto it = g_tls_states.find(env);
-  if (it == g_tls_states.end()) return nullptr;
-  for (TlsWrap* wrap : it->second.wraps) {
+  TlsBindingState* state = GetState(env);
+  if (state == nullptr) return nullptr;
+  for (TlsWrap* wrap : state->wraps) {
     if (wrap == nullptr) continue;
     napi_value candidate = GetRefValue(env, wrap->wrapper_ref);
     bool same = false;
@@ -667,9 +661,9 @@ TlsWrap* UnwrapThis(napi_env env,
 
 void RemoveWrapFromState(TlsWrap* wrap) {
   if (wrap == nullptr || wrap->env == nullptr) return;
-  auto it = g_tls_states.find(wrap->env);
-  if (it == g_tls_states.end()) return;
-  auto& wraps = it->second.wraps;
+  TlsBindingState* state = GetState(wrap->env);
+  if (state == nullptr) return;
+  auto& wraps = state->wraps;
   for (auto vec_it = wraps.begin(); vec_it != wraps.end(); ++vec_it) {
     if (*vec_it == wrap) {
       wraps.erase(vec_it);

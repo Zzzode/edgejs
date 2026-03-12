@@ -1,10 +1,9 @@
 #include "internal_binding/dispatch.h"
 
 #include <cstring>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "unofficial_napi.h"
 
@@ -16,15 +15,21 @@ constexpr size_t kHeapStatisticsPropertiesCount = 14;
 constexpr size_t kHeapSpaceStatisticsPropertiesCount = 4;
 constexpr size_t kHeapCodeStatisticsPropertiesCount = 4;
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct V8BindingState {
+  explicit V8BindingState(napi_env env_in) : env(env_in) {}
+  ~V8BindingState() {
+    DeleteRefIfPresent(env, &heap_statistics_buffer_ref);
+    DeleteRefIfPresent(env, &heap_space_statistics_buffer_ref);
+    DeleteRefIfPresent(env, &heap_code_statistics_buffer_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref heap_statistics_buffer_ref = nullptr;
   napi_ref heap_space_statistics_buffer_ref = nullptr;
   napi_ref heap_code_statistics_buffer_ref = nullptr;
 };
-
-std::mutex g_v8_binding_state_mu;
-std::unordered_map<napi_env, V8BindingState> g_v8_binding_states;
-std::unordered_map<napi_env, bool> g_v8_binding_cleanup_hooks;
 
 napi_value MakeUndefined(napi_env env) {
   napi_value out = nullptr;
@@ -45,31 +50,6 @@ void SetNamedInt(napi_env env, napi_value obj, const char* key, int32_t value) {
   }
 }
 
-void OnV8BindingEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  V8BindingState state;
-  {
-    std::lock_guard<std::mutex> lock(g_v8_binding_state_mu);
-    g_v8_binding_cleanup_hooks.erase(env);
-    auto it = g_v8_binding_states.find(env);
-    if (it == g_v8_binding_states.end()) return;
-    state = it->second;
-    g_v8_binding_states.erase(it);
-  }
-  DeleteRefIfPresent(env, &state.heap_statistics_buffer_ref);
-  DeleteRefIfPresent(env, &state.heap_space_statistics_buffer_ref);
-  DeleteRefIfPresent(env, &state.heap_code_statistics_buffer_ref);
-}
-
-void EnsureV8BindingCleanupHook(napi_env env) {
-  std::lock_guard<std::mutex> lock(g_v8_binding_state_mu);
-  if (g_v8_binding_cleanup_hooks.emplace(env, true).second) {
-    if (napi_add_env_cleanup_hook(env, OnV8BindingEnvCleanup, env) != napi_ok) {
-      g_v8_binding_cleanup_hooks.erase(env);
-    }
-  }
-}
-
 void SetNamedMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
   napi_value fn = nullptr;
   if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok && fn != nullptr) {
@@ -86,9 +66,12 @@ void StoreBufferRef(napi_env env, napi_ref* slot, napi_value value) {
 }
 
 V8BindingState* GetV8BindingState(napi_env env) {
-  std::lock_guard<std::mutex> lock(g_v8_binding_state_mu);
-  auto it = g_v8_binding_states.find(env);
-  return it != g_v8_binding_states.end() ? &it->second : nullptr;
+  return EdgeEnvironmentGetSlotData<V8BindingState>(env, kEdgeEnvironmentSlotV8BindingState);
+}
+
+V8BindingState& EnsureV8BindingState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<V8BindingState>(
+      env, kEdgeEnvironmentSlotV8BindingState);
 }
 
 double* GetFloat64ArrayData(napi_env env, napi_ref ref, size_t minimum_length) {
@@ -277,8 +260,6 @@ napi_value V8GetCppHeapStatistics(napi_env env, napi_callback_info /*info*/) {
 }  // namespace
 
 napi_value ResolveV8(napi_env env, const ResolveOptions& /*options*/) {
-  EnsureV8BindingCleanupHook(env);
-
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
 
@@ -343,13 +324,10 @@ napi_value ResolveV8(napi_env env, const ResolveOptions& /*options*/) {
   napi_value heap_space_stats = CreateFloat64Array(env, kHeapSpaceStatisticsPropertiesCount);
   if (heap_space_stats != nullptr) napi_set_named_property(env, out, "heapSpaceStatisticsBuffer", heap_space_stats);
 
-  {
-    std::lock_guard<std::mutex> lock(g_v8_binding_state_mu);
-    V8BindingState& state = g_v8_binding_states[env];
-    StoreBufferRef(env, &state.heap_statistics_buffer_ref, heap_stats);
-    StoreBufferRef(env, &state.heap_code_statistics_buffer_ref, heap_code_stats);
-    StoreBufferRef(env, &state.heap_space_statistics_buffer_ref, heap_space_stats);
-  }
+  V8BindingState& state = EnsureV8BindingState(env);
+  StoreBufferRef(env, &state.heap_statistics_buffer_ref, heap_stats);
+  StoreBufferRef(env, &state.heap_code_statistics_buffer_ref, heap_code_stats);
+  StoreBufferRef(env, &state.heap_space_statistics_buffer_ref, heap_space_stats);
 
   napi_value detail_level = nullptr;
   if (napi_create_object(env, &detail_level) == napi_ok && detail_level != nullptr) {

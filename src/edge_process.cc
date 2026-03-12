@@ -4,6 +4,7 @@
 #include "edge_module_loader.h"
 #include "edge_runtime.h"
 #include "edge_worker_env.h"
+#include "edge_environment.h"
 
 #include <algorithm>
 #include <chrono>
@@ -163,7 +164,17 @@ void CloseDynamicLibrary(uv_lib_t* lib) {
 #define EDGE_STRINGIFY(x) EDGE_STRINGIFY_HELPER(x)
 #endif
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct ProcessMethodsBindingState {
+  explicit ProcessMethodsBindingState(napi_env env_in) : env(env_in) {}
+  ~ProcessMethodsBindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+    DeleteRefIfPresent(env, &hrtime_buffer_ref);
+    DeleteRefIfPresent(env, &emit_warning_sync_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref hrtime_buffer_ref = nullptr;
   napi_ref emit_warning_sync_ref = nullptr;
@@ -171,6 +182,12 @@ struct ProcessMethodsBindingState {
 };
 
 struct ReportBindingState {
+  explicit ReportBindingState(napi_env env_in) : env(env_in) {}
+  ~ReportBindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   bool compact = false;
   bool exclude_network = false;
@@ -186,9 +203,6 @@ struct ReportBindingState {
   uint64_t max_heap_size_bytes = 0;
   uint64_t sequence = 0;
 };
-
-std::map<napi_env, ProcessMethodsBindingState> g_process_methods_states;
-std::map<napi_env, ReportBindingState> g_report_states;
 constexpr const char kUvwasiVersion[] = "0.0.23";
 
 std::string ReadTextFileIfExists(const std::filesystem::path& path);
@@ -198,6 +212,12 @@ std::optional<std::filesystem::path> TryGetCurrentPath() {
   std::filesystem::path cwd = std::filesystem::current_path(ec);
   if (ec) return std::nullopt;
   return cwd.lexically_normal();
+}
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
 }
 
 void AppendCwdCandidates(const std::filesystem::path& relative_path,
@@ -927,9 +947,13 @@ std::string NapiValueToUtf8(napi_env env, napi_value value) {
 }
 
 ProcessMethodsBindingState* GetProcessMethodsState(napi_env env) {
-  auto it = g_process_methods_states.find(env);
-  if (it == g_process_methods_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<ProcessMethodsBindingState>(
+      env, kEdgeEnvironmentSlotProcessMethodsBindingState);
+}
+
+ProcessMethodsBindingState& EnsureProcessMethodsState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<ProcessMethodsBindingState>(
+      env, kEdgeEnvironmentSlotProcessMethodsBindingState);
 }
 
 bool ProcessEnvValueNeedsDeprecationWarning(napi_env env, napi_value value) {
@@ -992,9 +1016,13 @@ void MaybeEmitProcessEnvDeprecationWarning(napi_env env, napi_value value) {
 }
 
 ReportBindingState* GetReportState(napi_env env) {
-  auto it = g_report_states.find(env);
-  if (it == g_report_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<ReportBindingState>(
+      env, kEdgeEnvironmentSlotReportBindingState);
+}
+
+ReportBindingState& EnsureReportState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<ReportBindingState>(
+      env, kEdgeEnvironmentSlotReportBindingState);
 }
 
 bool SetNamedString(napi_env env, napi_value obj, const char* name, const std::string& value) {
@@ -4574,21 +4602,11 @@ napi_value ProcessMethodsResetStdioForTestingCallback(napi_env env, napi_callbac
 void ProcessMethodsBindingFinalize(napi_env env, void* data, void* hint) {
   (void)data;
   (void)hint;
-  auto it = g_process_methods_states.find(env);
-  if (it == g_process_methods_states.end()) return;
-  if (it->second.hrtime_buffer_ref != nullptr) {
-    napi_delete_reference(env, it->second.hrtime_buffer_ref);
-    it->second.hrtime_buffer_ref = nullptr;
-  }
-  if (it->second.emit_warning_sync_ref != nullptr) {
-    napi_delete_reference(env, it->second.emit_warning_sync_ref);
-    it->second.emit_warning_sync_ref = nullptr;
-  }
-  if (it->second.binding_ref != nullptr) {
-    napi_delete_reference(env, it->second.binding_ref);
-    it->second.binding_ref = nullptr;
-  }
-  g_process_methods_states.erase(it);
+  auto* state = GetProcessMethodsState(env);
+  if (state == nullptr) return;
+  DeleteRefIfPresent(env, &state->hrtime_buffer_ref);
+  DeleteRefIfPresent(env, &state->emit_warning_sync_ref);
+  DeleteRefIfPresent(env, &state->binding_ref);
 }
 
 bool WriteReportForUncaughtExceptionImpl(napi_env env, napi_value exception) {
@@ -4876,13 +4894,9 @@ napi_value ReportSetReportOnUncaughtExceptionCallback(napi_env env, napi_callbac
 void ReportBindingFinalize(napi_env env, void* data, void* hint) {
   (void)data;
   (void)hint;
-  auto it = g_report_states.find(env);
-  if (it == g_report_states.end()) return;
-  if (it->second.binding_ref != nullptr) {
-    napi_delete_reference(env, it->second.binding_ref);
-    it->second.binding_ref = nullptr;
-  }
-  g_report_states.erase(it);
+  auto* state = GetReportState(env);
+  if (state == nullptr) return;
+  DeleteRefIfPresent(env, &state->binding_ref);
 }
 
 }  // namespace
@@ -5220,19 +5234,10 @@ napi_status EdgeInstallProcessObject(napi_env env,
 
   // Native internalBinding('process_methods')
   {
-    auto& state = g_process_methods_states[env];
-    if (state.binding_ref != nullptr) {
-      napi_delete_reference(env, state.binding_ref);
-      state.binding_ref = nullptr;
-    }
-    if (state.hrtime_buffer_ref != nullptr) {
-      napi_delete_reference(env, state.hrtime_buffer_ref);
-      state.hrtime_buffer_ref = nullptr;
-    }
-    if (state.emit_warning_sync_ref != nullptr) {
-      napi_delete_reference(env, state.emit_warning_sync_ref);
-      state.emit_warning_sync_ref = nullptr;
-    }
+    auto& state = EnsureProcessMethodsState(env);
+    DeleteRefIfPresent(env, &state.binding_ref);
+    DeleteRefIfPresent(env, &state.hrtime_buffer_ref);
+    DeleteRefIfPresent(env, &state.emit_warning_sync_ref);
     napi_value binding = nullptr;
     status = napi_create_object(env, &binding);
     if (status != napi_ok || binding == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
@@ -5308,11 +5313,8 @@ napi_status EdgeInstallProcessObject(napi_env env,
 
   // Native internalBinding('report')
   {
-    auto& state = g_report_states[env];
-    if (state.binding_ref != nullptr) {
-      napi_delete_reference(env, state.binding_ref);
-      state.binding_ref = nullptr;
-    }
+    auto& state = EnsureReportState(env);
+    DeleteRefIfPresent(env, &state.binding_ref);
     state.compact = HasExecArgvFlag(exec_argv, "--report-compact");
     state.exclude_network = HasExecArgvFlag(exec_argv, "--report-exclude-network");
     state.exclude_env = HasExecArgvFlag(exec_argv, "--report-exclude-env");

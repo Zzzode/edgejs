@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "edge_environment.h"
 #include "edge_encoding_ids.h"
 #include "edge_runtime.h"
 #include "simdutf.h"
@@ -32,36 +33,27 @@ constexpr size_t kEdgeStringMaxLength = 0x1fffffe8;
 std::string GetUtf8String(napi_env env, napi_value value);
 
 struct BufferBindingState {
+  explicit BufferBindingState(napi_env env_in) : env(env_in) {}
+  ~BufferBindingState() {
+    if (zero_fill_toggle_ref != nullptr) {
+      napi_delete_reference(env, zero_fill_toggle_ref);
+      zero_fill_toggle_ref = nullptr;
+    }
+    if (buffer_prototype_ref != nullptr) {
+      napi_delete_reference(env, buffer_prototype_ref);
+      buffer_prototype_ref = nullptr;
+    }
+  }
+
+  napi_env env = nullptr;
   napi_ref zero_fill_toggle_ref = nullptr;
   uint32_t* zero_fill_toggle_data = nullptr;
   napi_ref buffer_prototype_ref = nullptr;
-  bool cleanup_hook_registered = false;
 };
 
-std::unordered_map<napi_env, BufferBindingState> g_buffer_states;
-
-void CleanupBufferBindingState(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  auto it = g_buffer_states.find(env);
-  if (it == g_buffer_states.end()) return;
-  if (it->second.zero_fill_toggle_ref != nullptr) {
-    napi_delete_reference(env, it->second.zero_fill_toggle_ref);
-    it->second.zero_fill_toggle_ref = nullptr;
-  }
-  if (it->second.buffer_prototype_ref != nullptr) {
-    napi_delete_reference(env, it->second.buffer_prototype_ref);
-    it->second.buffer_prototype_ref = nullptr;
-  }
-  g_buffer_states.erase(it);
-}
-
 BufferBindingState& EnsureBufferBindingState(napi_env env) {
-  auto [it, inserted] = g_buffer_states.emplace(env, BufferBindingState{});
-  if ((inserted || !it->second.cleanup_hook_registered) &&
-      napi_add_env_cleanup_hook(env, CleanupBufferBindingState, env) == napi_ok) {
-    it->second.cleanup_hook_registered = true;
-  }
-  return it->second;
+  return EdgeEnvironmentGetOrCreateSlotData<BufferBindingState>(
+      env, kEdgeEnvironmentSlotBufferBindingState);
 }
 
 bool DefaultZeroFillBuffersEnabled() {

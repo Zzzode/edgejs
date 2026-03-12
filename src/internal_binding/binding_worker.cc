@@ -24,6 +24,8 @@
 #include "unofficial_napi.h"
 #include "edge_active_resource.h"
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
+#include "edge_environment_runtime.h"
 #include "edge_env_loop.h"
 #include "edge_handle_wrap.h"
 #include "edge_option_helpers.h"
@@ -57,9 +59,12 @@ constexpr double kWorkerMb = 1024.0 * 1024.0;
 constexpr size_t kDefaultWorkerStackSize = 4 * 1024 * 1024;
 constexpr size_t kWorkerStackBufferSize = 192 * 1024;
 
+struct WorkerParentState {
+  explicit WorkerParentState(napi_env) {}
+  std::unordered_set<struct WorkerImplWrap*> workers;
+};
+
 std::mutex g_worker_registry_mu;
-std::unordered_map<napi_env, std::unordered_set<struct WorkerImplWrap*>> g_workers_by_parent_env;
-std::unordered_set<napi_env> g_worker_cleanup_hooks;
 
 enum class WorkerTaskType {
   kCpuUsage,
@@ -336,53 +341,27 @@ void DetachWorkerWrapFromJs(WorkerImplWrap* wrap) {
   DeleteRefIfPresent(wrap->env, &wrap->wrapper_ref);
 }
 
-void OnWorkerParentEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  std::vector<WorkerImplWrap*> wraps;
-  {
-    std::lock_guard<std::mutex> lock(g_worker_registry_mu);
-    g_worker_cleanup_hooks.erase(env);
-    auto it = g_workers_by_parent_env.find(env);
-    if (it != g_workers_by_parent_env.end()) {
-      wraps.assign(it->second.begin(), it->second.end());
-      g_workers_by_parent_env.erase(it);
-    }
-  }
-
-  for (WorkerImplWrap* wrap : wraps) {
-    if (wrap == nullptr) continue;
-    wrap->parent_env_closing.store(true, std::memory_order_release);
-    RequestWorkerStop(wrap);
-    CleanupWorkerForParentEnvShutdown(wrap);
-  }
+WorkerParentState* GetWorkerParentStateLocked(napi_env env) {
+  return EdgeEnvironmentGetSlotData<WorkerParentState>(env, kEdgeEnvironmentSlotWorkerParentState);
 }
 
-void EnsureWorkerParentEnvCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  std::lock_guard<std::mutex> lock(g_worker_registry_mu);
-  auto [it, inserted] = g_worker_cleanup_hooks.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnWorkerParentEnvCleanup, env) != napi_ok) {
-    g_worker_cleanup_hooks.erase(it);
-  }
+WorkerParentState& EnsureWorkerParentStateLocked(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<WorkerParentState>(
+      env, kEdgeEnvironmentSlotWorkerParentState);
 }
 
 void AddWorkerToRegistry(WorkerImplWrap* wrap) {
   if (wrap == nullptr || wrap->env == nullptr) return;
-  EnsureWorkerParentEnvCleanupHook(wrap->env);
   std::lock_guard<std::mutex> lock(g_worker_registry_mu);
-  g_workers_by_parent_env[wrap->env].insert(wrap);
+  EnsureWorkerParentStateLocked(wrap->env).workers.insert(wrap);
 }
 
 void RemoveWorkerFromRegistry(WorkerImplWrap* wrap) {
   if (wrap == nullptr || wrap->env == nullptr) return;
   std::lock_guard<std::mutex> lock(g_worker_registry_mu);
-  auto it = g_workers_by_parent_env.find(wrap->env);
-  if (it == g_workers_by_parent_env.end()) return;
-  it->second.erase(wrap);
-  if (it->second.empty()) {
-    g_workers_by_parent_env.erase(it);
-  }
+  auto* state = GetWorkerParentStateLocked(wrap->env);
+  if (state == nullptr) return;
+  state->workers.erase(wrap);
 }
 
 void StopWorkersForEnv(napi_env env) {
@@ -390,10 +369,10 @@ void StopWorkersForEnv(napi_env env) {
   std::vector<WorkerImplWrap*> wraps;
   {
     std::lock_guard<std::mutex> lock(g_worker_registry_mu);
-    auto it = g_workers_by_parent_env.find(env);
-    if (it != g_workers_by_parent_env.end()) {
-      wraps.assign(it->second.begin(), it->second.end());
-      g_workers_by_parent_env.erase(it);
+    auto* state = GetWorkerParentStateLocked(env);
+    if (state != nullptr) {
+      wraps.assign(state->workers.begin(), state->workers.end());
+      state->workers.clear();
     }
   }
 
@@ -1143,7 +1122,12 @@ void WorkerThreadMain(WorkerImplWrap* wrap, uintptr_t stack_top) {
     return;
   }
 
-  EdgeWorkerEnvConfigure(worker_env, wrap->worker_config);
+  if (!EdgeAttachEnvironmentForRuntime(worker_env, &wrap->worker_config)) {
+    (void)unofficial_napi_release_env(worker_scope);
+    DebugWorkerLog("WorkerThreadMain failed attach_env");
+    FinalizeWorkerThread(wrap, 1, "ERR_WORKER_INIT_FAILED", "Failed to attach worker env");
+    return;
+  }
   if (wrap->stack_base != 0) {
     (void)unofficial_napi_set_stack_limit(worker_env, reinterpret_cast<void*>(wrap->stack_base));
   }
@@ -1200,16 +1184,8 @@ void WorkerThreadMain(WorkerImplWrap* wrap, uintptr_t stack_top) {
   }
 
   (void)unofficial_napi_remove_near_heap_limit_callback(worker_env, 0);
-  EdgeRunTimersHostEnvCleanup(worker_env);
-  EdgeRunRuntimePlatformEnvCleanup(worker_env);
-  EdgeHandleWrapRunEnvCleanup(worker_env);
-  EdgeStreamBaseRunEnvCleanup(worker_env);
-  if (loop != nullptr) {
-    for (size_t guard = 0; guard < 1024 && uv_loop_alive(loop) != 0; ++guard) {
-      (void)uv_run(loop, UV_RUN_NOWAIT);
-    }
-  }
-  EdgeWorkerEnvRunCleanup(worker_env);
+  EdgeEnvironmentRunCleanup(worker_env);
+  EdgeEnvironmentRunAtExitCallbacks(worker_env);
   DebugWorkerLog("WorkerThreadMain releasing env thread_id=" + std::to_string(wrap->thread_id));
   (void)unofficial_napi_release_env(worker_scope);
   EdgeWorkerEnvForget(worker_env);
@@ -1748,9 +1724,9 @@ std::vector<EdgeWorkerReportEntry> EdgeWorkerCollectReports(napi_env env) {
   std::vector<WorkerImplWrap*> wraps;
   {
     std::lock_guard<std::mutex> lock(g_worker_registry_mu);
-    auto it = g_workers_by_parent_env.find(env);
-    if (it != g_workers_by_parent_env.end()) {
-      wraps.assign(it->second.begin(), it->second.end());
+    auto* state = GetWorkerParentStateLocked(env);
+    if (state != nullptr) {
+      wraps.assign(state->workers.begin(), state->workers.end());
     }
   }
 

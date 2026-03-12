@@ -25,6 +25,8 @@ NAPI_EXTERN napi_status unofficial_napi_create_env_with_options(
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
     void** scope_out);
+NAPI_EXTERN napi_status unofficial_napi_set_edge_environment(napi_env env, void* environment);
+NAPI_EXTERN void* unofficial_napi_get_edge_environment(napi_env env);
 NAPI_EXTERN napi_status unofficial_napi_destroy_env_instance(napi_env env);
 NAPI_EXTERN napi_status unofficial_napi_release_env(void* scope);
 NAPI_EXTERN napi_status unofficial_napi_set_flags_from_string(

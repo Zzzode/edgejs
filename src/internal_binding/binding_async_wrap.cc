@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "unofficial_napi.h"
 #include "edge_runtime_platform.h"
@@ -14,6 +15,8 @@
 namespace internal_binding {
 
 namespace {
+
+void ResetRef(napi_env env, napi_ref* ref);
 
 enum AsyncWrapConstants : uint32_t {
   kInit = 0,
@@ -32,6 +35,21 @@ enum AsyncWrapConstants : uint32_t {
 };
 
 struct AsyncWrapState {
+  explicit AsyncWrapState(napi_env env_in) : env(env_in) {}
+  ~AsyncWrapState() {
+    ResetRef(env, &binding_ref);
+    ResetRef(env, &async_hook_fields_ref);
+    ResetRef(env, &async_id_fields_ref);
+    ResetRef(env, &async_ids_stack_ref);
+    ResetRef(env, &execution_async_resources_ref);
+    ResetRef(env, &hooks_ref);
+    ResetRef(env, &callback_trampoline_ref);
+    for (napi_ref& hook_ref : promise_hooks) {
+      ResetRef(env, &hook_ref);
+    }
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref async_hook_fields_ref = nullptr;
   napi_ref async_id_fields_ref = nullptr;
@@ -51,47 +69,20 @@ struct DestroyHookData {
   napi_ref destroyed_ref = nullptr;
 };
 
-std::unordered_map<napi_env, AsyncWrapState> g_async_wrap_states;
-std::unordered_set<napi_env> g_async_wrap_cleanup_hooks;
-
 void ResetRef(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
 }
 
-void OnAsyncWrapEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_async_wrap_cleanup_hooks.erase(env);
-  auto it = g_async_wrap_states.find(env);
-  if (it == g_async_wrap_states.end()) return;
-  AsyncWrapState& state = it->second;
-  ResetRef(env, &state.binding_ref);
-  ResetRef(env, &state.async_hook_fields_ref);
-  ResetRef(env, &state.async_id_fields_ref);
-  ResetRef(env, &state.async_ids_stack_ref);
-  ResetRef(env, &state.execution_async_resources_ref);
-  ResetRef(env, &state.hooks_ref);
-  ResetRef(env, &state.callback_trampoline_ref);
-  for (napi_ref& hook_ref : state.promise_hooks) {
-    ResetRef(env, &hook_ref);
-  }
-  g_async_wrap_states.erase(it);
-}
-
-void EnsureAsyncWrapCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_async_wrap_cleanup_hooks.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnAsyncWrapEnvCleanup, env) != napi_ok) {
-    g_async_wrap_cleanup_hooks.erase(it);
-  }
-}
-
 AsyncWrapState* GetState(napi_env env) {
-  auto it = g_async_wrap_states.find(env);
-  if (it == g_async_wrap_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<AsyncWrapState>(
+      env, kEdgeEnvironmentSlotInternalAsyncWrapBindingState);
+}
+
+AsyncWrapState& EnsureState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<AsyncWrapState>(
+      env, kEdgeEnvironmentSlotInternalAsyncWrapBindingState);
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -620,8 +611,7 @@ bool AsyncWrapPopContext(napi_env env, double async_id) {
 }
 
 napi_value ResolveAsyncWrap(napi_env env, const ResolveOptions& /*options*/) {
-  EnsureAsyncWrapCleanupHook(env);
-  auto& state = g_async_wrap_states[env];
+  auto& state = EnsureState(env);
   if (state.binding_ref != nullptr) {
     napi_value existing = GetRefValue(env, state.binding_ref);
     if (existing != nullptr) return existing;

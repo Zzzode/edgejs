@@ -25,6 +25,7 @@
 
 #include "node_version.h"
 #include "unofficial_napi.h"
+#include "edge_environment_runtime.h"
 #include "edge_env_loop.h"
 #include "edge_handle_wrap.h"
 #include "edge_option_helpers.h"
@@ -96,6 +97,14 @@ int RunWithFreshEnv(const std::function<int(napi_env)>& runner, std::string* err
     return 1;
   }
 
+  if (!EdgeAttachEnvironmentForRuntime(env)) {
+    (void)unofficial_napi_release_env(env_scope);
+    if (error_out != nullptr) {
+      *error_out = "Failed to attach runtime environment";
+    }
+    return 1;
+  }
+
   if (EdgeRuntimePlatformInstallHooks(env) != napi_ok) {
     (void)unofficial_napi_release_env(env_scope);
     if (error_out != nullptr) {
@@ -105,17 +114,8 @@ int RunWithFreshEnv(const std::function<int(napi_env)>& runner, std::string* err
   }
 
   const int exit_code = runner(env);
-  EdgeWorkerStopAllForEnv(env);
-  EdgeRunTimersHostEnvCleanup(env);
-  EdgeRunRuntimePlatformEnvCleanup(env);
-  EdgeHandleWrapRunEnvCleanup(env);
-  EdgeStreamBaseRunEnvCleanup(env);
-  EdgeWorkerEnvRunCleanup(env);
-  if (uv_loop_t* loop = EdgeGetEnvLoop(env); loop != nullptr) {
-    for (size_t guard = 0; guard < 1024 && uv_loop_alive(loop) != 0; ++guard) {
-      (void)uv_run(loop, UV_RUN_NOWAIT);
-    }
-  }
+  EdgeEnvironmentRunCleanup(env);
+  EdgeEnvironmentRunAtExitCallbacks(env);
   const napi_status release_status = unofficial_napi_release_env(env_scope);
   if (release_status != napi_ok) {
     if (error_out != nullptr) {

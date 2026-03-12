@@ -20,6 +20,7 @@
 #include "cares/include/ares_dns.h"
 #include "cares/include/ares_dns_record.h"
 #include "cares/include/ares_nameser.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_runtime.h"
 
@@ -128,41 +129,47 @@ using HostentPtr = std::unique_ptr<hostent, HostentDeleter>;
 using AresDataPtr = std::unique_ptr<void, AresDataDeleter>;
 using AresStringPtr = std::unique_ptr<char, AresStringDeleter>;
 
-std::unordered_map<napi_env, std::unordered_set<ChannelWrap*>> g_channels_by_env;
-std::unordered_set<napi_env> g_cleanup_hook_registered;
-std::unordered_set<napi_env> g_cleanup_in_progress;
+struct CaresEnvState {
+  explicit CaresEnvState(napi_env /*env_in*/) {}
+
+  std::unordered_set<ChannelWrap*> channels;
+  bool cleanup_in_progress = false;
+};
+
 int g_cares_library_refcount = 0;
 
-void OnCaresEnvCleanup(void* arg);
+CaresEnvState* GetCaresState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<CaresEnvState>(
+      env, kEdgeEnvironmentSlotCaresChannelSet);
+}
 
-void EnsureCaresCleanupHook(napi_env env) {
-  if (env == nullptr) return;
+CaresEnvState& EnsureCaresState(napi_env env) {
   (void)EdgeEnsureEnvLoop(env, nullptr);
-  auto [it, inserted] = g_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnCaresEnvCleanup, env) != napi_ok) {
-    g_cleanup_hook_registered.erase(it);
-  }
+  return EdgeEnvironmentGetOrCreateSlotData<CaresEnvState>(
+      env, kEdgeEnvironmentSlotCaresChannelSet);
+}
+
+bool EnvCleanupInProgress(napi_env env) {
+  CaresEnvState* state = GetCaresState(env);
+  return state != nullptr && state->cleanup_in_progress;
 }
 
 void RegisterChannelForEnv(ChannelWrap* channel) {
   if (channel == nullptr || channel->env == nullptr) return;
-  EnsureCaresCleanupHook(channel->env);
-  g_channels_by_env[channel->env].insert(channel);
+  EnsureCaresState(channel->env).channels.insert(channel);
 }
 
 void UnregisterChannelForEnv(ChannelWrap* channel) {
   if (channel == nullptr || channel->env == nullptr) return;
-  if (g_cleanup_in_progress.find(channel->env) != g_cleanup_in_progress.end()) return;
-  auto it = g_channels_by_env.find(channel->env);
-  if (it == g_channels_by_env.end()) return;
-  it->second.erase(channel);
-  if (it->second.empty()) g_channels_by_env.erase(it);
+  if (EnvCleanupInProgress(channel->env)) return;
+  CaresEnvState* state = GetCaresState(channel->env);
+  if (state == nullptr) return;
+  state->channels.erase(channel);
 }
 
 void TrackPendingReq(napi_env env, CaresReqWrap* req) {
   if (env == nullptr || req == nullptr) return;
-  EnsureCaresCleanupHook(env);
+  (void)EnsureCaresState(env);
 }
 
 void UntrackPendingReq(CaresReqWrap* req) {
@@ -587,7 +594,7 @@ void ModifyActivityQueryCount(ChannelWrap* channel, int delta) {
   } else if (prev > 0 && channel->active_query_count == 0) {
     // During env cleanup, avoid dropping the last ref from inside c-ares
     // callbacks; ChannelFinalize will run as part of env teardown.
-    if (g_cleanup_in_progress.find(channel->env) != g_cleanup_in_progress.end()) {
+    if (EnvCleanupInProgress(channel->env)) {
       return;
     }
     uint32_t ref_count = 0;
@@ -1287,7 +1294,7 @@ void CompleteQuery(CaresReqWrap* req,
   }
 
   napi_env env = req->env;
-  const bool env_cleaning = (env != nullptr && g_cleanup_in_progress.find(env) != g_cleanup_in_progress.end());
+  const bool env_cleaning = (env != nullptr && EnvCleanupInProgress(env));
   UntrackPendingReq(req);
 
   if (env == nullptr) {
@@ -1455,17 +1462,16 @@ int DispatchQuery(ChannelWrap* channel, CaresReqWrap* req, const QueryMethodData
 
 void OnCaresEnvCleanup(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
-  g_cleanup_in_progress.emplace(env);
+  CaresEnvState* state = GetCaresState(env);
+  if (state == nullptr) return;
+  state->cleanup_in_progress = true;
 
   std::vector<ChannelWrap*> channels;
-  auto channel_it = g_channels_by_env.find(env);
-  if (channel_it != g_channels_by_env.end()) {
-    channels.reserve(channel_it->second.size());
-    for (ChannelWrap* channel : channel_it->second) {
-      channels.push_back(channel);
-    }
-    g_channels_by_env.erase(channel_it);
+  channels.reserve(state->channels.size());
+  for (ChannelWrap* channel : state->channels) {
+    channels.push_back(channel);
   }
+  state->channels.clear();
 
   std::vector<ChannelWrap*> pinned_channels;
   pinned_channels.reserve(channels.size());
@@ -1488,8 +1494,7 @@ void OnCaresEnvCleanup(void* arg) {
     (void)napi_reference_unref(env, channel->wrapper_ref, &ref_count);
   }
 
-  g_cleanup_in_progress.erase(env);
-  g_cleanup_hook_registered.erase(env);
+  state->cleanup_in_progress = false;
 }
 
 void ReqFinalize(napi_env env, void* data, void* /*hint*/) {
@@ -1566,7 +1571,6 @@ napi_value ChannelCtor(napi_env env, napi_callback_info info) {
     return nullptr;
   }
 
-  EnsureCaresCleanupHook(env);
   RegisterChannelForEnv(channel);
 
   napi_wrap(env, self, channel, ChannelFinalize, nullptr, &channel->wrapper_ref);
@@ -2144,6 +2148,11 @@ constexpr QueryMethodData kQuerySoaMethod{"querySoa", QueryKind::kSoa, ARES_REC_
 constexpr QueryMethodData kGetHostByAddrMethod{"getHostByAddr", QueryKind::kReverse, ARES_REC_TYPE_PTR};
 
 }  // namespace
+
+void EdgeRunCaresWrapEnvCleanup(napi_env env) {
+  if (env == nullptr) return;
+  OnCaresEnvCleanup(env);
+}
 
 napi_value EdgeInstallCaresWrapBinding(napi_env env) {
   napi_value binding = nullptr;

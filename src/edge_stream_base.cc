@@ -4,13 +4,12 @@
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "internal_binding/helpers.h"
 #include "edge_active_resource.h"
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_module_loader.h"
 #include "edge_pipe_wrap.h"
@@ -22,7 +21,17 @@
 
 namespace {
 
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
+
 struct StreamSymbolCache {
+  explicit StreamSymbolCache(napi_env env_in) : env(env_in) {}
+  ~StreamSymbolCache() {
+    DeleteRefIfPresent(env, &symbols_ref);
+    DeleteRefIfPresent(env, &owner_symbol_ref);
+    DeleteRefIfPresent(env, &handle_onclose_symbol_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref symbols_ref = nullptr;
   napi_ref owner_symbol_ref = nullptr;
   napi_ref handle_onclose_symbol_ref = nullptr;
@@ -91,23 +100,28 @@ struct LibuvShutdownReq {
   napi_ref req_obj_ref = nullptr;
 };
 
-std::unordered_map<napi_env, StreamSymbolCache> g_stream_symbols;
-std::unordered_set<napi_env> g_stream_symbol_cleanup_hook_registered;
-
 struct StreamBaseEnvState {
+  explicit StreamBaseEnvState(napi_env /*env_in*/) {}
+
   EdgeStreamBase* head = nullptr;
-  bool cleanup_hook_registered = false;
   bool cleanup_started = false;
 };
 
 std::mutex g_stream_base_env_states_mutex;
-std::unordered_map<napi_env, StreamBaseEnvState> g_stream_base_env_states;
 
-void MaybeEraseStreamBaseStateLocked(napi_env env) {
-  auto it = g_stream_base_env_states.find(env);
-  if (it == g_stream_base_env_states.end()) return;
-  if (it->second.head != nullptr || it->second.cleanup_hook_registered) return;
-  g_stream_base_env_states.erase(it);
+StreamSymbolCache& GetSymbolCache(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<StreamSymbolCache>(
+      env, kEdgeEnvironmentSlotStreamSymbolCache);
+}
+
+StreamBaseEnvState* GetStreamBaseState(napi_env env) {
+  return EdgeEnvironmentGetSlotData<StreamBaseEnvState>(
+      env, kEdgeEnvironmentSlotStreamBaseEnvState);
+}
+
+StreamBaseEnvState& EnsureStreamBaseState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<StreamBaseEnvState>(
+      env, kEdgeEnvironmentSlotStreamBaseEnvState);
 }
 
 void UnlinkStreamBaseLocked(StreamBaseEnvState* state, EdgeStreamBase* base) {
@@ -128,41 +142,25 @@ void UnlinkStreamBaseLocked(StreamBaseEnvState* state, EdgeStreamBase* base) {
 void StreamBaseDetach(EdgeStreamBase* base) {
   if (base == nullptr || base->env == nullptr || !base->attached) return;
   std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
-  auto it = g_stream_base_env_states.find(base->env);
-  if (it == g_stream_base_env_states.end()) {
+  auto* state = GetStreamBaseState(base->env);
+  if (state == nullptr) {
     base->prev = nullptr;
     base->next = nullptr;
     base->attached = false;
     return;
   }
-  UnlinkStreamBaseLocked(&it->second, base);
-  MaybeEraseStreamBaseStateLocked(base->env);
+  UnlinkStreamBaseLocked(state, base);
 }
 
 void RunStreamBaseEnvCleanup(napi_env env);
-
-void OnStreamBaseEnvCleanup(void* data) {
-  RunStreamBaseEnvCleanup(static_cast<napi_env>(data));
-}
-
-void EnsureStreamBaseCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
-  auto& state = g_stream_base_env_states[env];
-  if (state.cleanup_hook_registered || state.cleanup_started) return;
-  if (napi_add_env_cleanup_hook(env, OnStreamBaseEnvCleanup, env) == napi_ok) {
-    state.cleanup_hook_registered = true;
-  }
-}
 
 void StreamBaseMaybeAttach(EdgeStreamBase* base) {
   if (base == nullptr || base->env == nullptr || base->attached) return;
   if (base->ops == nullptr || base->ops->get_handle == nullptr || base->ops->on_close == nullptr) return;
   uv_handle_t* handle = base->ops->get_handle(base);
   if (handle == nullptr) return;
-  EnsureStreamBaseCleanupHook(base->env);
   std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
-  auto& state = g_stream_base_env_states[base->env];
+  auto& state = EnsureStreamBaseState(base->env);
   if (state.cleanup_started) return;
   base->prev = nullptr;
   base->next = state.head;
@@ -178,11 +176,10 @@ void RunStreamBaseEnvCleanup(napi_env env) {
   std::vector<EdgeStreamBase*> bases_to_close;
   {
     std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
-    auto it = g_stream_base_env_states.find(env);
-    if (it == g_stream_base_env_states.end()) return;
-    it->second.cleanup_hook_registered = false;
-    it->second.cleanup_started = true;
-    for (EdgeStreamBase* base = it->second.head; base != nullptr; base = base->next) {
+    auto* state = GetStreamBaseState(env);
+    if (state == nullptr) return;
+    state->cleanup_started = true;
+    for (EdgeStreamBase* base = state->head; base != nullptr; base = base->next) {
       bases_to_close.push_back(base);
     }
   }
@@ -203,37 +200,11 @@ void RunStreamBaseEnvCleanup(napi_env env) {
     bool empty = false;
     {
       std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
-      auto it = g_stream_base_env_states.find(env);
-      empty = (it == g_stream_base_env_states.end()) || (it->second.head == nullptr);
-      if (empty) {
-        MaybeEraseStreamBaseStateLocked(env);
-      }
+      auto* state = GetStreamBaseState(env);
+      empty = state == nullptr || state->head == nullptr;
     }
     if (empty) break;
     (void)uv_run(loop, UV_RUN_ONCE);
-  }
-}
-
-void OnStreamSymbolsEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_stream_symbol_cleanup_hook_registered.erase(env);
-
-  auto it = g_stream_symbols.find(env);
-  if (it == g_stream_symbols.end()) return;
-  if (it->second.symbols_ref != nullptr) napi_delete_reference(env, it->second.symbols_ref);
-  if (it->second.owner_symbol_ref != nullptr) napi_delete_reference(env, it->second.owner_symbol_ref);
-  if (it->second.handle_onclose_symbol_ref != nullptr) {
-    napi_delete_reference(env, it->second.handle_onclose_symbol_ref);
-  }
-  g_stream_symbols.erase(it);
-}
-
-void EnsureStreamSymbolsCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_stream_symbol_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnStreamSymbolsEnvCleanup, env) != napi_ok) {
-    g_stream_symbol_cleanup_hook_registered.erase(it);
   }
 }
 
@@ -283,11 +254,6 @@ napi_value ResolveInternalBinding(napi_env env, const char* name) {
     return nullptr;
   }
   return binding;
-}
-
-StreamSymbolCache& GetSymbolCache(napi_env env) {
-  EnsureStreamSymbolsCleanupHook(env);
-  return g_stream_symbols[env];
 }
 
 napi_value GetSymbolsBinding(napi_env env) {
@@ -997,21 +963,12 @@ void EdgeStreamBaseUnref(EdgeStreamBase* base) {
 bool EdgeStreamBaseEnvCleanupStarted(napi_env env) {
   if (env == nullptr) return false;
   std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
-  auto it = g_stream_base_env_states.find(env);
-  return it != g_stream_base_env_states.end() && it->second.cleanup_started;
+  auto* state = GetStreamBaseState(env);
+  return state != nullptr && state->cleanup_started;
 }
 
 void EdgeStreamBaseRunEnvCleanup(napi_env env) {
   if (env == nullptr) return;
-  {
-    std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
-    auto it = g_stream_base_env_states.find(env);
-    if (it == g_stream_base_env_states.end()) return;
-    if (it->second.cleanup_hook_registered) {
-      (void)napi_remove_env_cleanup_hook(env, OnStreamBaseEnvCleanup, env);
-      it->second.cleanup_hook_registered = false;
-    }
-  }
   RunStreamBaseEnvCleanup(env);
 }
 

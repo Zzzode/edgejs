@@ -9,6 +9,7 @@
 #include <uv.h>
 
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 #include "edge_env_loop.h"
 #include "edge_runtime.h"
 #include "edge_stream_base.h"
@@ -32,6 +33,13 @@ struct PipeConnectReqWrap {
 };
 
 struct PipeBindingState {
+  explicit PipeBindingState(napi_env env_in) : env(env_in) {}
+  ~PipeBindingState() {
+    if (pipe_ctor_ref != nullptr) napi_delete_reference(env, pipe_ctor_ref);
+    if (binding_ref != nullptr) napi_delete_reference(env, binding_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref pipe_ctor_ref = nullptr;
   napi_ref binding_ref = nullptr;
 };
@@ -44,38 +52,13 @@ struct PipeWrap {
   bool ipc = false;
 };
 
-std::unordered_map<napi_env, PipeBindingState> g_pipe_states;
-std::unordered_set<napi_env> g_pipe_cleanup_hook_registered;
-
-void OnPipeEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_pipe_cleanup_hook_registered.erase(env);
-
-  auto it = g_pipe_states.find(env);
-  if (it == g_pipe_states.end()) return;
-  if (it->second.pipe_ctor_ref != nullptr) napi_delete_reference(env, it->second.pipe_ctor_ref);
-  if (it->second.binding_ref != nullptr) napi_delete_reference(env, it->second.binding_ref);
-  g_pipe_states.erase(it);
-}
-
-void EnsurePipeCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_pipe_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnPipeEnvCleanup, env) != napi_ok) {
-    g_pipe_cleanup_hook_registered.erase(it);
-  }
-}
-
 PipeBindingState* GetBindingState(napi_env env) {
-  auto it = g_pipe_states.find(env);
-  if (it == g_pipe_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<PipeBindingState>(env, kEdgeEnvironmentSlotPipeBindingState);
 }
 
 PipeBindingState& EnsureBindingState(napi_env env) {
-  EnsurePipeCleanupHook(env);
-  return g_pipe_states[env];
+  return EdgeEnvironmentGetOrCreateSlotData<PipeBindingState>(
+      env, kEdgeEnvironmentSlotPipeBindingState);
 }
 
 PipeWrap* FromBase(EdgeStreamBase* base) {

@@ -13,6 +13,7 @@
 #include <uv.h>
 
 #include "edge_async_wrap.h"
+#include "edge_environment.h"
 #include "edge_runtime.h"
 #include "edge_pipe_wrap.h"
 #include "edge_stream_base.h"
@@ -89,11 +90,21 @@ struct Parser {
 };
 
 struct ParserReadBufferState {
+  explicit ParserReadBufferState(napi_env) {}
+  ~ParserReadBufferState() {
+    free(data);
+    data = nullptr;
+    in_use = false;
+  }
+
   char* data = nullptr;
   bool in_use = false;
 };
 
-std::unordered_map<napi_env, ParserReadBufferState> g_parser_read_buffer_by_env;
+ParserReadBufferState& GetParserReadBufferState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<ParserReadBufferState>(
+      env, kEdgeEnvironmentSlotParserReadBufferState);
+}
 
 template <typename T>
 T* Unwrap(napi_env env, napi_callback_info info, napi_value* this_arg = nullptr) {
@@ -120,7 +131,7 @@ bool DispatchConsumedParserRead(Parser* p,
 
 bool AcquireParserReadBuffer(napi_env env, size_t suggested_size, uv_buf_t* out) {
   if (env == nullptr || out == nullptr) return false;
-  ParserReadBufferState& state = g_parser_read_buffer_by_env[env];
+  ParserReadBufferState& state = GetParserReadBufferState(env);
   if (state.data == nullptr) {
     state.data = static_cast<char*>(malloc(kAllocBufferSize));
     state.in_use = false;
@@ -138,11 +149,10 @@ bool AcquireParserReadBuffer(napi_env env, size_t suggested_size, uv_buf_t* out)
 
 void ReleaseParserReadBuffer(napi_env env, const char* base) {
   if (env == nullptr || base == nullptr) return;
-  auto it = g_parser_read_buffer_by_env.find(env);
-  if (it != g_parser_read_buffer_by_env.end() &&
-      it->second.in_use &&
-      it->second.data == base) {
-    it->second.in_use = false;
+  auto* state =
+      EdgeEnvironmentGetSlotData<ParserReadBufferState>(env, kEdgeEnvironmentSlotParserReadBufferState);
+  if (state != nullptr && state->in_use && state->data == base) {
+    state->in_use = false;
     return;
   }
   free(const_cast<char*>(base));

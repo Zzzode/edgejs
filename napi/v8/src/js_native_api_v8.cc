@@ -1,6 +1,7 @@
 #include "internal/napi_v8_env.h"
 #include "node_api_types.h"
 #include "unofficial_napi_error_utils.h"
+#include "edge_environment.h"
 
 #include <climits>
 #include <atomic>
@@ -584,6 +585,8 @@ napi_env__::~napi_env__() {
   if (instance_data_finalize_cb != nullptr) {
     instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
   }
+  EdgeEnvironmentDetach(this);
+  edge_environment = nullptr;
 }
 
 v8::Local<v8::Context> napi_env__::context() const {

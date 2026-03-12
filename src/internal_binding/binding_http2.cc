@@ -21,6 +21,7 @@
 #include "nghttp2/nghttp2.h"
 #include "uv.h"
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "../edge_async_wrap.h"
 #include "../edge_runtime.h"
@@ -39,6 +40,8 @@ constexpr size_t kStreamStateCount = 6;
 constexpr size_t kStreamStatsCount = 6;
 constexpr size_t kSessionStatsCount = 9;
 constexpr size_t kOptionsBufferLength = 14;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref);
 
 constexpr uint32_t kDefaultSettingsHeaderTableSize = 4096;
 constexpr uint32_t kDefaultSettingsEnablePush = 1;
@@ -161,6 +164,17 @@ struct NamedStringConstant {
 };
 
 struct Http2BindingState {
+  explicit Http2BindingState(napi_env env_in) : env(env_in) {}
+  ~Http2BindingState() {
+    DeleteRefIfPresent(env, &binding_ref);
+    DeleteRefIfPresent(env, &session_ctor_ref);
+    DeleteRefIfPresent(env, &stream_ctor_ref);
+    for (napi_ref& ref : callback_refs) {
+      DeleteRefIfPresent(env, &ref);
+    }
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref session_ctor_ref = nullptr;
   napi_ref stream_ctor_ref = nullptr;
@@ -297,9 +311,6 @@ struct Http2StreamWrap {
   bool close_pending = false;
   uint32_t pending_close_code = NGHTTP2_NO_ERROR;
 };
-
-std::unordered_map<napi_env, Http2BindingState> g_http2_states;
-std::unordered_set<napi_env> g_http2_cleanup_hooks;
 
 const char* SessionTypeName(const Http2SessionWrap* session) {
   return session != nullptr && session->type == kSessionTypeClient ? "client" : "server";
@@ -767,28 +778,9 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   *ref = nullptr;
 }
 
-void CleanupHttp2Env(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_http2_cleanup_hooks.erase(env);
-  auto it = g_http2_states.find(env);
-  if (it == g_http2_states.end()) return;
-  DeleteRefIfPresent(env, &it->second.binding_ref);
-  DeleteRefIfPresent(env, &it->second.session_ctor_ref);
-  DeleteRefIfPresent(env, &it->second.stream_ctor_ref);
-  for (napi_ref& ref : it->second.callback_refs) {
-    DeleteRefIfPresent(env, &ref);
-  }
-  g_http2_states.erase(it);
-}
-
 Http2BindingState& EnsureHttp2State(napi_env env) {
-  auto& state = g_http2_states[env];
-  if (g_http2_cleanup_hooks.emplace(env).second) {
-    if (napi_add_env_cleanup_hook(env, CleanupHttp2Env, env) != napi_ok) {
-      g_http2_cleanup_hooks.erase(env);
-    }
-  }
-  return state;
+  return EdgeEnvironmentGetOrCreateSlotData<Http2BindingState>(
+      env, kEdgeEnvironmentSlotHttp2BindingState);
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -1129,8 +1121,7 @@ void FillDefaultSettingsBuffer(Http2BindingState& state) {
 }
 
 Http2BindingState* GetHttp2State(napi_env env) {
-  auto it = g_http2_states.find(env);
-  return it == g_http2_states.end() ? nullptr : &it->second;
+  return EdgeEnvironmentGetSlotData<Http2BindingState>(env, kEdgeEnvironmentSlotHttp2BindingState);
 }
 
 bool GetNamedValue(napi_env env, napi_value object, const char* name, napi_value* out) {

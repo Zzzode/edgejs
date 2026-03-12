@@ -8,6 +8,7 @@
 
 #include <uv.h>
 
+#include "edge_environment.h"
 #include "internal_binding/helpers.h"
 #include "edge_env_loop.h"
 #include "edge_runtime.h"
@@ -16,7 +17,16 @@ namespace internal_binding {
 
 namespace {
 
+void ResetRef(napi_env env, napi_ref* ref_ptr);
+
 struct FsDirBindingState {
+  explicit FsDirBindingState(napi_env env_in) : env(env_in) {}
+  ~FsDirBindingState() {
+    ResetRef(env, &binding_ref);
+    ResetRef(env, &dir_handle_ctor_ref);
+  }
+
+  napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   napi_ref dir_handle_ctor_ref = nullptr;
 };
@@ -48,13 +58,13 @@ struct DirReq {
   uv_fs_t req{};
 };
 
-std::unordered_map<napi_env, FsDirBindingState> g_fs_dir_states;
-std::unordered_set<napi_env> g_fs_dir_cleanup_hook_registered;
-
 FsDirBindingState* GetState(napi_env env) {
-  auto it = g_fs_dir_states.find(env);
-  if (it == g_fs_dir_states.end()) return nullptr;
-  return &it->second;
+  return EdgeEnvironmentGetSlotData<FsDirBindingState>(env, kEdgeEnvironmentSlotFsDirBindingState);
+}
+
+FsDirBindingState& EnsureState(napi_env env) {
+  return EdgeEnvironmentGetOrCreateSlotData<FsDirBindingState>(
+      env, kEdgeEnvironmentSlotFsDirBindingState);
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -68,26 +78,6 @@ void ResetRef(napi_env env, napi_ref* ref_ptr) {
   if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
   napi_delete_reference(env, *ref_ptr);
   *ref_ptr = nullptr;
-}
-
-void OnFsDirEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_fs_dir_cleanup_hook_registered.erase(env);
-
-  auto it = g_fs_dir_states.find(env);
-  if (it == g_fs_dir_states.end()) return;
-  ResetRef(env, &it->second.binding_ref);
-  ResetRef(env, &it->second.dir_handle_ctor_ref);
-  g_fs_dir_states.erase(it);
-}
-
-void EnsureFsDirCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_fs_dir_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnFsDirEnvCleanup, env) != napi_ok) {
-    g_fs_dir_cleanup_hook_registered.erase(it);
-  }
 }
 
 void SetNamedMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
@@ -580,12 +570,11 @@ napi_value FsDirOpendirSync(napi_env env, napi_callback_info info) {
 }  // namespace
 
 napi_value ResolveFsDir(napi_env env, const ResolveOptions& options) {
-  EnsureFsDirCleanupHook(env);
   if (options.callbacks.resolve_binding == nullptr) return Undefined(env);
   napi_value binding = options.callbacks.resolve_binding(env, options.state, "fs_dir");
   if (binding == nullptr || IsUndefined(env, binding)) return Undefined(env);
 
-  auto& state = g_fs_dir_states[env];
+  auto& state = EnsureState(env);
   if (state.binding_ref == nullptr) {
     napi_create_reference(env, binding, 1, &state.binding_ref);
   }

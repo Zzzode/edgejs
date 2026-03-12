@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
+
+#include "edge_environment.h"
 
 namespace {
 
@@ -21,55 +21,39 @@ struct ActiveRequestEntry {
   std::string resource_name;
 };
 
+void DeleteRef(napi_env env, napi_ref* ref);
+
 struct ActiveResourceState {
+  explicit ActiveResourceState(napi_env env_in) : env(env_in) {}
+  ~ActiveResourceState() {
+    for (ActiveHandleEntry* entry : handles) {
+      if (entry == nullptr) continue;
+      DeleteRef(env, &entry->keepalive_ref);
+      delete entry;
+    }
+    for (ActiveRequestEntry* entry : requests) {
+      if (entry == nullptr) continue;
+      DeleteRef(env, &entry->req_ref);
+      delete entry;
+    }
+    handles.clear();
+    requests.clear();
+  }
+
+  napi_env env = nullptr;
   std::vector<ActiveHandleEntry*> handles;
   std::vector<ActiveRequestEntry*> requests;
 };
 
-std::unordered_map<napi_env, ActiveResourceState> g_active_resource_states;
-std::unordered_set<napi_env> g_active_resource_cleanup_hook_registered;
-
-void EnsureActiveResourceCleanupHook(napi_env env);
-
 ActiveResourceState& GetState(napi_env env) {
-  EnsureActiveResourceCleanupHook(env);
-  return g_active_resource_states[env];
+  return EdgeEnvironmentGetOrCreateSlotData<ActiveResourceState>(
+      env, kEdgeEnvironmentSlotActiveResourceState);
 }
 
 void DeleteRef(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
-}
-
-void OnActiveResourceEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_active_resource_cleanup_hook_registered.erase(env);
-
-  auto it = g_active_resource_states.find(env);
-  if (it == g_active_resource_states.end()) return;
-  for (ActiveHandleEntry* entry : it->second.handles) {
-    if (entry == nullptr) continue;
-    DeleteRef(env, &entry->keepalive_ref);
-    delete entry;
-  }
-  for (ActiveRequestEntry* entry : it->second.requests) {
-    if (entry == nullptr) continue;
-    DeleteRef(env, &entry->req_ref);
-    delete entry;
-  }
-  it->second.handles.clear();
-  it->second.requests.clear();
-  g_active_resource_states.erase(it);
-}
-
-void EnsureActiveResourceCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_active_resource_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnActiveResourceEnvCleanup, env) != napi_ok) {
-    g_active_resource_cleanup_hook_registered.erase(it);
-  }
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
