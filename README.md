@@ -14,9 +14,9 @@
 
 Edge.js is a **Node.js-compatible** runtime with stronger sandboxing than any other JS runtime thanks to WebAssembly.
 
-✅ **Full compatibility with Node**: use your codebase, packages, and workflow.
-🛡️ **Sandboxed by design**: built for serverless and embedded workloads.
-🧩 **Choose the JS engine**: V8, JavaScriptCore or QuickJS.
+✅ **Full compatibility with Node**: use your codebase, packages, and workflow.<br />
+🔒 **Sandboxed by design**: built for serverless and embedded workloads.<br />
+🧩 **Choose the JS engine**: V8, JavaScriptCore or QuickJS.<br />
 💪 **Compatible with NPM/PNPM/Yarn/Bun**: use your current package manager with `ubi`.
 
 ## Install Edge.js
@@ -74,9 +74,9 @@ NODE_TEST_RUNNER="$(pwd)/build-ubi/ubi" \
 ```
 
 
-## Roadmap
+## Contribute 🤗
 
-### [Contribute to our ROADMAP](https://github.com/wasmerio/ubi/issues/8)
+We have created a [public ROADMAP](https://github.com/wasmerio/ubi/issues/8), so you can contribute into the project easily!
 
 - `0.x` Production readiness: platform coverage across Linux, Windows, macOS, iOS, and Android; reliability in constrained environments; security audits; and successful real production use.
 - `1.x` Need for speed: faster startup, faster core paths, and performance that competes with or beats Node.js, Bun, and Deno on most workloads.
