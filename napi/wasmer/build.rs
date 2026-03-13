@@ -5,6 +5,9 @@ fn main() {
         .parent()
         .unwrap();
 
+    let edge_src = project_root.join("src");
+    let libuv_include = project_root.join("deps/uv/include");
+
     // napi/v8 paths
     let napi_v8_dir = project_root.join("napi/v8");
     let napi_include = project_root.join("napi/include");
@@ -29,9 +32,12 @@ fn main() {
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
         .include(&v8_include)
+        .include(edge_src.to_str().unwrap())
+        .include(libuv_include.to_str().unwrap())
         .include(napi_include.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
+        .file(edge_src.join("edge_environment.cc").to_str().unwrap())
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
         .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap());
 
