@@ -329,7 +329,7 @@ impl NapiSession {
                 .context("missing runtime function env during instance setup")?
         };
 
-        for export_name in ["ubi_guest_malloc", "malloc"] {
+        for export_name in ["unofficial_napi_guest_malloc", "ubi_guest_malloc", "malloc"] {
             if let Ok(malloc) = instance
                 .exports
                 .get_typed_function::<i32, i32>(&store, export_name)

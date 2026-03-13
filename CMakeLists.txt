@@ -715,11 +715,6 @@ if(EDGE_BUILD_CLI)
       "-Wl,--import-undefined"
     )
   endif()
-  if(EDGE_IS_WASIX_TARGET)
-    target_link_options(edge PRIVATE
-      "-Wl,--export=ubi_guest_malloc"
-    )
-  endif()
 
   add_executable(edgeenv
     "${EDGE_ROOT}/src/edgeenv_main.cc"

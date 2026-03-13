@@ -20,7 +20,8 @@ extern "C" uint64_t uv_get_constrained_memory(void) {
   return 0;
 }
 
-extern "C" __attribute__((used)) uint32_t ubi_guest_malloc(uint32_t size) {
+extern "C" __attribute__((used, export_name("unofficial_napi_guest_malloc")))
+uint32_t unofficial_napi_guest_malloc(uint32_t size) {
   void* ptr = std::malloc(static_cast<size_t>(size));
   return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ptr));
 }

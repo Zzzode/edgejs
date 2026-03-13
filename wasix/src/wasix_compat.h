@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -148,5 +149,14 @@ static inline char* wasix_ptsname(int fd) {
   return (char*)0;
 }
 #define ptsname wasix_ptsname
+
+// Exported guest allocator used by the WASIX N-API bridge.
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint32_t unofficial_napi_guest_malloc(uint32_t size);
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // WASIX_COMPAT_H
