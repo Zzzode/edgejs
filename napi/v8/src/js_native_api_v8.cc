@@ -3054,7 +3054,32 @@ napi_status NAPI_CDECL napi_add_finalizer(napi_env env,
                                           void* finalize_hint,
                                           napi_ref* result) {
   if (!CheckValue(env, js_object) || finalize_cb == nullptr) return napi_invalid_arg;
-  return napi_wrap(env, js_object, finalize_data, finalize_cb, finalize_hint, result);
+
+  v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
+  if (!value->IsObject()) return napi_object_expected;
+
+  auto* record = new (std::nothrow) WrapFinalizerRecord();
+  if (record == nullptr) return napi_generic_failure;
+
+  record->env = env;
+  record->native_object = finalize_data;
+  record->finalize_cb = finalize_cb;
+  record->finalize_hint = finalize_hint;
+  record->handle.Reset(env->isolate, value.As<v8::Object>());
+  record->handle.SetWeak(record, WrapWeakCallback, v8::WeakCallbackType::kParameter);
+  env->wrap_finalizers.push_back(record);
+
+  if (result != nullptr) {
+    napi_status status = napi_create_reference(env, js_object, 0, result);
+    if (status != napi_ok) {
+      RemoveWrapFinalizerRecord(env, record);
+      record->handle.Reset();
+      delete record;
+      return status;
+    }
+  }
+
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result) {

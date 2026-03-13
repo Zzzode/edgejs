@@ -484,15 +484,25 @@ napi_value IsInsideNodeModulesCallback(napi_env env, napi_callback_info info) {
   return out != nullptr ? out : Undefined(env);
 }
 
-napi_value LazyPropertyGetter(napi_env env, napi_callback_info info) {
-  size_t argc = 0;
-  napi_value this_arg = nullptr;
-  void* data = nullptr;
-  if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, &data) != napi_ok || data == nullptr) {
-    return Undefined(env);
-  }
+void MaterializeLazyProperty(napi_env env, napi_value target, const LazyPropertyData& lazy, napi_value value) {
+  if (!IsObjectLike(env, target)) return;
+  if (value == nullptr) value = Undefined(env);
 
-  auto* lazy = static_cast<LazyPropertyData*>(data);
+  napi_property_descriptor descriptor = {
+      .utf8name = lazy.key.c_str(),
+      .name = nullptr,
+      .method = nullptr,
+      .getter = nullptr,
+      .setter = nullptr,
+      .value = value,
+      .attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable |
+                                                          (lazy.enumerable ? napi_enumerable : napi_default)),
+      .data = nullptr,
+  };
+  napi_define_properties(env, target, 1, &descriptor);
+}
+
+napi_value ResolveLazyPropertyValue(napi_env env, const LazyPropertyData& lazy) {
   napi_value require_fn = EdgeGetRequireFunction(env);
   if (!IsFunction(env, require_fn)) {
     require_fn = GetGlobalNamed(env, "require");
@@ -500,7 +510,7 @@ napi_value LazyPropertyGetter(napi_env env, napi_callback_info info) {
   if (!IsFunction(env, require_fn)) return Undefined(env);
 
   napi_value id = nullptr;
-  if (napi_create_string_utf8(env, lazy->module_id.c_str(), lazy->module_id.size(), &id) != napi_ok || id == nullptr) {
+  if (napi_create_string_utf8(env, lazy.module_id.c_str(), lazy.module_id.size(), &id) != napi_ok || id == nullptr) {
     return Undefined(env);
   }
 
@@ -510,26 +520,40 @@ napi_value LazyPropertyGetter(napi_env env, napi_callback_info info) {
   if (!IsObjectLike(env, module)) return Undefined(env);
 
   napi_value value = nullptr;
-  if (napi_get_named_property(env, module, lazy->key.c_str(), &value) != napi_ok || value == nullptr) {
+  if (napi_get_named_property(env, module, lazy.key.c_str(), &value) != napi_ok || value == nullptr) {
     value = Undefined(env);
   }
 
-  if (IsObjectLike(env, this_arg)) {
-    napi_property_descriptor descriptor = {
-        .utf8name = lazy->key.c_str(),
-        .name = nullptr,
-        .method = nullptr,
-        .getter = nullptr,
-        .setter = nullptr,
-        .value = value,
-        .attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable |
-                                                            (lazy->enumerable ? napi_enumerable : napi_default)),
-        .data = nullptr,
-    };
-    napi_define_properties(env, this_arg, 1, &descriptor);
+  return value;
+}
+
+napi_value LazyPropertyGetter(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_value this_arg = nullptr;
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, &data) != napi_ok || data == nullptr) {
+    return Undefined(env);
   }
 
+  auto* lazy = static_cast<LazyPropertyData*>(data);
+  napi_value value = ResolveLazyPropertyValue(env, *lazy);
+  MaterializeLazyProperty(env, this_arg, *lazy, value);
   return value;
+}
+
+napi_value LazyPropertySetter(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, &this_arg, &data) != napi_ok || data == nullptr) {
+    return Undefined(env);
+  }
+
+  auto* lazy = static_cast<LazyPropertyData*>(data);
+  napi_value value = (argc >= 1 && argv[0] != nullptr) ? argv[0] : Undefined(env);
+  MaterializeLazyProperty(env, this_arg, *lazy, value);
+  return Undefined(env);
 }
 
 void TrySetLazyGetterName(napi_env env, napi_value target, const std::string& key) {
@@ -616,7 +640,7 @@ napi_value DefineLazyPropertiesCallback(napi_env env, napi_callback_info info) {
         .name = nullptr,
         .method = nullptr,
         .getter = LazyPropertyGetter,
-        .setter = nullptr,
+        .setter = LazyPropertySetter,
         .value = nullptr,
         .attributes = static_cast<napi_property_attributes>(napi_configurable |
                                                             (enumerable ? napi_enumerable : napi_default)),
