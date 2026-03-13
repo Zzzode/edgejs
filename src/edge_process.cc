@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <ctime>

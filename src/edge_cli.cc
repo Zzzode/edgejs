@@ -1,6 +1,8 @@
 #include "edge_cli.h"
 
+#include <cctype>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
