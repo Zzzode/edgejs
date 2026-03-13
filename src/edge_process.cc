@@ -3524,21 +3524,13 @@ napi_value ProcessCpuUsageCallback(napi_env env, napi_callback_info info) {
 
 napi_value ProcessAvailableMemoryCallback(napi_env env, napi_callback_info info) {
   napi_value out = nullptr;
-#if defined(__wasi__)
-  napi_create_double(env, 0, &out);
-#else
   napi_create_double(env, static_cast<double>(uv_get_available_memory()), &out);
-#endif
   return out;
 }
 
 napi_value ProcessConstrainedMemoryCallback(napi_env env, napi_callback_info info) {
   napi_value out = nullptr;
-#if defined(__wasi__)
-  napi_create_double(env, 0, &out);
-#else
   napi_create_double(env, static_cast<double>(uv_get_constrained_memory()), &out);
-#endif
   return out;
 }
 

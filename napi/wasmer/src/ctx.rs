@@ -134,8 +134,6 @@ impl NapiCtx {
             "uv_resident_set_memory",
             "uv_get_free_memory",
             "uv_get_total_memory",
-            "uv_get_available_memory",
-            "uv_get_constrained_memory",
             "_Z20OSSL_set_max_threadsP15ossl_lib_ctx_sty",
         ];
 

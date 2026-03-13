@@ -2350,6 +2350,21 @@ extern "C" int snapi_bridge_unofficial_get_call_sites(SnapiEnvState* env_state,
   return napi_ok;
 }
 
+extern "C" int snapi_bridge_unofficial_get_current_stack_trace(
+    SnapiEnvState* env_state,
+    uint32_t frames,
+    uint32_t* callsites_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  napi_value callsites = nullptr;
+  napi_status s = unofficial_napi_get_current_stack_trace(env, frames, &callsites);
+  if (s != napi_ok) return s;
+  if (callsites_out != nullptr) *callsites_out = StoreValue(*bridge_state, callsites);
+  return napi_ok;
+}
+
 extern "C" int snapi_bridge_unofficial_get_caller_location(SnapiEnvState* env_state,
                                                            uint32_t* location_out) {
   auto* bridge_state = RequireEnvState(env_state);
@@ -2573,6 +2588,19 @@ extern "C" int snapi_bridge_unofficial_get_process_memory_info(
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   return unofficial_napi_get_process_memory_info(
       env, heap_total_out, heap_used_out, external_out, array_buffers_out);
+}
+
+extern "C" int snapi_bridge_unofficial_get_hash_seed(SnapiEnvState* env_state,
+                                                      uint64_t* hash_seed_out) {
+  auto* bridge_state = RequireEnvState(env_state);
+  if (bridge_state == nullptr) return napi_invalid_arg;
+  napi_env env = bridge_state->env;
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  if (
+      hash_seed_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  return unofficial_napi_get_hash_seed(env, hash_seed_out);
 }
 
 extern "C" int snapi_bridge_unofficial_get_error_source_positions(

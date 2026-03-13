@@ -324,6 +324,27 @@ fn guest_unofficial_napi_get_call_sites(
     status
 }
 
+fn guest_unofficial_napi_get_current_stack_trace(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    frames: i32,
+    callsites_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut callsites_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_current_stack_trace(
+            env_handle,
+            frames as u32,
+            &mut callsites_id,
+        )
+    };
+    if status == 0 && callsites_ptr > 0 {
+        write_guest_u32(&mut env, callsites_ptr as u32, callsites_id);
+    }
+    status
+}
+
 fn guest_unofficial_napi_get_caller_location(
     mut env: FunctionEnvMut<RuntimeEnv>,
     napi_env: i32,
@@ -674,6 +695,20 @@ fn guest_unofficial_napi_get_process_memory_info(
         write_guest_f64(&mut env, array_buffers_out as u32, array_buffers);
     }
     0
+}
+
+fn guest_unofficial_napi_get_hash_seed(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    hash_seed_out: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut hash_seed = 0u64;
+    let status = unsafe { snapi_bridge_unofficial_get_hash_seed(env_handle, &mut hash_seed) };
+    if status == 0 && hash_seed_out > 0 {
+        write_guest_u64(&mut env, hash_seed_out as u32, hash_seed);
+    }
+    status
 }
 
 fn guest_unofficial_napi_get_error_source_positions(
@@ -4588,6 +4623,10 @@ pub fn register_napi_imports(
         guest_unofficial_napi_get_call_sites
     );
     reg!(
+        "unofficial_napi_get_current_stack_trace",
+        guest_unofficial_napi_get_current_stack_trace
+    );
+    reg!(
         "unofficial_napi_get_caller_location",
         guest_unofficial_napi_get_caller_location
     );
@@ -4670,6 +4709,10 @@ pub fn register_napi_imports(
     reg!(
         "unofficial_napi_get_process_memory_info",
         guest_unofficial_napi_get_process_memory_info
+    );
+    reg!(
+        "unofficial_napi_get_hash_seed",
+        guest_unofficial_napi_get_hash_seed
     );
     reg!(
         "unofficial_napi_get_error_source_positions",
@@ -5089,14 +5132,6 @@ fn guest_env_uv_get_total_memory() -> i64 {
     0
 }
 
-fn guest_env_uv_get_available_memory() -> i64 {
-    0
-}
-
-fn guest_env_uv_get_constrained_memory() -> i64 {
-    0
-}
-
 fn guest_env_ossl_set_max_threads(_ctx: i32, _max_threads: i64) -> i32 {
     // The Wasm-hosted runtime executes on a single host thread, so there is no
     // native OpenSSL worker-pool sizing to apply here.
@@ -5119,11 +5154,6 @@ pub fn register_env_imports(store: &mut impl AsStoreMut, io: &mut Imports) {
     reg_env!("uv_resident_set_memory", guest_env_uv_resident_set_memory);
     reg_env!("uv_get_free_memory", guest_env_uv_get_free_memory);
     reg_env!("uv_get_total_memory", guest_env_uv_get_total_memory);
-    reg_env!("uv_get_available_memory", guest_env_uv_get_available_memory);
-    reg_env!(
-        "uv_get_constrained_memory",
-        guest_env_uv_get_constrained_memory
-    );
     reg_env!(
         "_Z20OSSL_set_max_threadsP15ossl_lib_ctx_sty",
         guest_env_ossl_set_max_threads

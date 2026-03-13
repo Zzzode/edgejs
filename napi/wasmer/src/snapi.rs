@@ -118,6 +118,11 @@ unsafe extern "C" {
         frames: u32,
         callsites_out: *mut u32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_get_current_stack_trace(
+        env: SnapiEnv,
+        frames: u32,
+        callsites_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_get_caller_location(
         env: SnapiEnv,
         location_out: *mut u32,
@@ -171,6 +176,7 @@ unsafe extern "C" {
         external_out: *mut f64,
         array_buffers_out: *mut f64,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_get_hash_seed(env: SnapiEnv, hash_seed_out: *mut u64) -> i32;
     pub fn snapi_bridge_unofficial_get_error_source_positions(
         env: SnapiEnv,
         error_id: u32,

@@ -752,6 +752,11 @@ target_compile_definitions(edge_runtime
     EDGE_HAS_SMALL_ICU=1
     EDGE_EMBEDDED_V8_VERSION="${EDGE_EMBEDDED_V8_VERSION}"
 )
+if(EDGE_IS_WASIX_TARGET)
+  target_sources(edge_runtime PRIVATE
+    src/wasix_compat.cc
+  )
+endif()
 if(EDGE_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_compile_definitions(edge_runtime PRIVATE EDGE_BUNDLED_NAPI_V8=1)
 endif()
