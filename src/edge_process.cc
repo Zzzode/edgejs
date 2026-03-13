@@ -3837,6 +3837,10 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
     }
     std::cerr.flush();
   }
+  // process.reallyExit() is reached from JS after process.exit() already marked
+  // the process as exiting. When called directly, make that state explicit so
+  // the embedder loop will not emit a second exit event while unwinding.
+  EdgePrepareProcessExit(env, exit_code);
   EdgeEnvironmentRunAtExitCallbacks(env);
   if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
     environment->set_exiting(true);
@@ -3850,6 +3854,7 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
     EdgeWorkerStopAllForEnv(env);
     return nullptr;
   }
+
   EdgeWorkerStopAllForEnv(env);
   return nullptr;
 }

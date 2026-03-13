@@ -3091,6 +3091,34 @@ bool EdgeReadExecArgvUint64Option(const char* prefix, uint64_t* out, bool* found
   return ReadExecArgvUint64Option(prefix, out, found);
 }
 
+void EdgePrepareProcessExit(napi_env env, int exit_code) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return;
+  }
+
+  bool has_process = false;
+  if (napi_has_named_property(env, global, "process", &has_process) != napi_ok || !has_process) {
+    return;
+  }
+
+  napi_value process_obj = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return;
+  }
+
+  napi_value exit_code_value = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(exit_code), &exit_code_value) == napi_ok &&
+      exit_code_value != nullptr) {
+    (void)napi_set_named_property(env, process_obj, "exitCode", exit_code_value);
+  }
+
+  napi_value exiting_value = nullptr;
+  if (napi_get_boolean(env, true, &exiting_value) == napi_ok && exiting_value != nullptr) {
+    (void)napi_set_named_property(env, process_obj, "_exiting", exiting_value);
+  }
+}
+
 napi_status EdgeMakeCallbackWithFlags(napi_env env,
                                      napi_value recv,
                                      napi_value callback,
