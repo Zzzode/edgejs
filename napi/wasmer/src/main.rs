@@ -323,7 +323,9 @@ fn main() -> Result<()> {
         }
         maybe_add_builtin_mounts(&mut extra_mounts, builtin_js_dir)?;
         let exit = run_wasix_example(&napi, wasm_path, &guest_args, &extra_mounts)?;
-        println!("wasix_exit_code={exit}");
+        if exit != 0 {
+            bail!("non-zero exit code: {exit}");
+        }
         return Ok(());
     }
 
