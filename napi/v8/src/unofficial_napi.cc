@@ -24,7 +24,6 @@
 #include "internal/napi_v8_env.h"
 #include "internal/unofficial_napi_bridge.h"
 #include "unofficial_napi_error_utils.h"
-#include "edge_environment.h"
 #include "edge_v8_platform.h"
 
 namespace {
@@ -161,14 +160,19 @@ bool CopyStringToMallocBuffer(const std::string& input, char** data_out, size_t*
 }
 
 uint64_t GenerateHashSeed() {
-  std::random_device random_device;
-  const uint64_t high = static_cast<uint64_t>(random_device());
-  const uint64_t low = static_cast<uint64_t>(random_device());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch();
-  const uint64_t monotonic_ticks = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-  const uint64_t mixed = (high << 32) ^ low ^ monotonic_ticks;
-  return mixed == 0 ? 1 : mixed;
+  try {
+    std::random_device random_device;
+    const uint64_t high = static_cast<uint64_t>(random_device());
+    const uint64_t low = static_cast<uint64_t>(random_device());
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const uint64_t monotonic_ticks = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    const uint64_t mixed = (high << 32) ^ low ^ monotonic_ticks;
+    if (mixed != 0) return mixed;
+  } catch (...) {
+    // Fall back below if entropy is unavailable in this runtime.
+  }
+  return 1;
 }
 
 void AppendEscapedJsonString(std::string* out, std::string_view input) {
@@ -1304,11 +1308,42 @@ void* unofficial_napi_get_edge_environment(napi_env env) {
   return env == nullptr ? nullptr : env->edge_environment;
 }
 
+napi_status NAPI_CDECL unofficial_napi_set_env_cleanup_callback(
+    napi_env env,
+    unofficial_napi_env_cleanup_callback callback,
+    void* data) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->env_cleanup_callback = callback;
+  env->env_cleanup_callback_data = data;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_env_destroy_callback(
+    napi_env env,
+    unofficial_napi_env_destroy_callback callback,
+    void* data) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->env_destroy_callback = callback;
+  env->env_destroy_callback_data = data;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_context_token_callbacks(
+    napi_env env,
+    unofficial_napi_context_token_callback assign_callback,
+    unofficial_napi_context_token_callback unassign_callback,
+    void* data) {
+  if (env == nullptr) return napi_invalid_arg;
+  env->context_token_assign_callback = assign_callback;
+  env->context_token_unassign_callback = unassign_callback;
+  env->context_token_callback_data = data;
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  if (EdgeEnvironmentGet(env) != nullptr) {
-    EdgeEnvironmentRunCleanup(env);
-    EdgeEnvironmentRunAtExitCallbacks(env);
+  if (env->env_cleanup_callback != nullptr) {
+    env->env_cleanup_callback(env, env->env_cleanup_callback_data);
   }
   ProfilerState profiler_state;
   bool has_profiler_state = false;
