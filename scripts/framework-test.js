@@ -246,11 +246,11 @@ async function runRunnerStage(stage, projects, skippedProjects) {
     const project = projects[index];
 
     try {
-      const compatibleLaunchers = prepareProjectForStage(project, stage);
-      const result = await testProject(project, stage, index, projects.length);
+      const preparation = prepareProjectForStage(project, stage);
+      const result = await testProject(project, stage, index, projects.length, preparation);
       passed.push({
         ...result,
-        compatibleLaunchers,
+        compatibleLaunchers: preparation.compatibleLaunchers,
         project,
       });
       logSuccess(`validated ${project.name}: HTTP ${result.response.statusCode} via ${result.runtime.name} on ${DEFAULT_HOST}:${result.port}`);
@@ -274,9 +274,17 @@ async function runRunnerStage(stage, projects, skippedProjects) {
 
 function prepareProjectForStage(project, stage) {
   log(`[${stage.label}] preparing ${project.name}`);
-  removeGeneratedFrameworkArtifacts(project);
+  const reuseExistingBuild = stage.key !== 'node' && hasGeneratedFrameworkArtifacts(project);
+  if (reuseExistingBuild) {
+    log(`reusing generated build artifacts for ${project.name} on ${stage.label}`);
+  } else {
+    removeGeneratedFrameworkArtifacts(project);
+  }
   const injection = injectRunner(project, stage.targetPath);
-  return injection.compatibleLaunchers;
+  return {
+    compatibleLaunchers: injection.compatibleLaunchers,
+    reuseExistingBuild,
+  };
 }
 
 function createFailureRecord(project, stage, error) {
@@ -470,7 +478,10 @@ function installProject(project) {
 
     const child = spawn('pnpm', ['install', '--no-lockfile', '--store-dir', PNPM_STORE_DIR], {
       cwd: project.dir,
-      env: process.env,
+      env: {
+        ...process.env,
+        CI: process.env.CI || 'true',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -496,7 +507,7 @@ function installProject(project) {
   });
 }
 
-async function testProject(project, stage, index, total) {
+async function testProject(project, stage, index, total, preparation) {
   logProgress(index + 1, total, `[${stage.label}] testing ${project.name}`);
 
   let runtime = detectRuntimeScript(project);
@@ -506,10 +517,15 @@ async function testProject(project, stage, index, total) {
   const portCandidates = buildPortCandidates(index);
   log(`port candidates for ${project.name}: ${portCandidates.join(', ')}`);
 
-  if (shouldBuildProject(project, runtime)) {
+  const shouldBuild = shouldBuildProject(project, runtime);
+  const reuseExistingBuild = Boolean(preparation && preparation.reuseExistingBuild);
+
+  if (shouldBuild && !reuseExistingBuild) {
     log(`building ${project.name} before runtime validation`);
     const buildResult = await runProjectBuild(project, stage);
     log(`build completed for ${project.name} (${formatDuration(buildResult.durationMs)})`);
+  } else if (reuseExistingBuild) {
+    log(`reusing existing build output for ${project.name} on ${stage.label}`);
   } else {
     log(`skipping build for ${project.name}; runtime script ${runtime.name} is development-oriented`);
   }
@@ -518,7 +534,7 @@ async function testProject(project, stage, index, total) {
   try {
     validateHttpResponse(project, runtime, server.response);
     return {
-      buildLogPath: shouldBuildProject(project, runtime) ? buildLogPath(project, stage) : null,
+      buildLogPath: shouldBuild && !reuseExistingBuild ? buildLogPath(project, stage) : null,
       candidate: server.candidate,
       port: server.port,
       project,
@@ -1357,6 +1373,12 @@ function removeFileOrSymlink(targetPath) {
   }
 
   fs.rmSync(targetPath, { force: true });
+}
+
+function hasGeneratedFrameworkArtifacts(project) {
+  return GENERATED_FRAMEWORK_PATHS
+    .map((relativePath) => path.join(project.dir, relativePath))
+    .some((targetPath) => fs.existsSync(targetPath));
 }
 
 function reset(selector) {
