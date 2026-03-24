@@ -15,7 +15,7 @@
 #elif defined(__wasm__)
 #define NAPI_EXTERN                                                            \
   __attribute__((visibility("default")))                                       \
-  __attribute__((__import_module__("napi_v10")))
+  __attribute__((__import_module__("napi")))
 #else
 #define NAPI_EXTERN __attribute__((visibility("default")))
 #endif
