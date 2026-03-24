@@ -1,20 +1,17 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
 
 #[cfg(feature = "wasix")]
-use wasmer_wasix::{runners::wasi::WasiRunner, PluggableRuntime};
+use wasmer_wasix::{PluggableRuntime, runners::wasi::WasiRunner};
 
 use crate::{
-    guest::{
-        callback::{clear_top_level_callback_state, set_top_level_callback_state},
-        napi::{register_env_imports, register_napi_imports},
-    },
     RuntimeEnv,
+    guest::napi::{register_env_imports, register_napi_imports},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -67,7 +64,6 @@ impl std::fmt::Debug for NapiSession {
 
 impl Drop for NapiSessionInner {
     fn drop(&mut self) {
-        clear_top_level_callback_state();
         self.ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -127,20 +123,7 @@ impl NapiCtx {
     }
 
     pub fn module_needs_napi(module: &Module) -> bool {
-        const NAPI_ENV_IMPORTS: &[&str] = &[
-            "uv_cpu_info",
-            "uv_interface_addresses",
-            "uv_free_interface_addresses",
-            "uv_resident_set_memory",
-            "uv_get_free_memory",
-            "uv_get_total_memory",
-            "_Z20OSSL_set_max_threadsP15ossl_lib_ctx_sty",
-        ];
-
-        module.imports().any(|import| {
-            import.module() == "napi"
-                || (import.module() == "env" && NAPI_ENV_IMPORTS.contains(&import.name()))
-        })
+        module.imports().any(|import| import.module() == "napi")
     }
 
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
@@ -152,27 +135,29 @@ impl NapiCtx {
 
     pub fn new_session(&self, module: &Module) -> Result<NapiSession> {
         let previous = self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
-        if let Some(max_sessions) = self.inner.limits.max_sessions {
-            if previous >= max_sessions {
-                self.inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
-                bail!("refusing to create more than {max_sessions} active N-API sessions");
-            }
+        if let Some(max_sessions) = self.inner.limits.max_sessions
+            && previous >= max_sessions
+        {
+            self.inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
+            bail!("refusing to create more than {max_sessions} active N-API sessions");
         }
 
         let imported_memory_type = module.imports().find_map(|import| {
-            if import.module() == "env" && import.name() == "memory" {
-                if let ExternType::Memory(ty) = import.ty() {
-                    return Some(*ty);
-                }
+            if import.module() == "env"
+                && import.name() == "memory"
+                && let ExternType::Memory(ty) = import.ty()
+            {
+                return Some(*ty);
             }
             None
         });
 
         let imported_table_type = module.imports().find_map(|import| {
-            if import.module() == "env" && import.name() == "__indirect_function_table" {
-                if let ExternType::Table(ty) = import.ty() {
-                    return Some(*ty);
-                }
+            if import.module() == "env"
+                && import.name() == "__indirect_function_table"
+                && let ExternType::Table(ty) = import.ty()
+            {
+                return Some(*ty);
             }
             None
         });
@@ -247,6 +232,7 @@ impl NapiRuntimeHooks {
         module: &Module,
         store: &mut StoreMut<'_>,
         instance: &Instance,
+        imported_memory: Option<&wasmer::Memory>,
     ) -> Result<()> {
         if !NapiCtx::module_needs_napi(module) {
             return Ok(());
@@ -270,7 +256,7 @@ impl NapiRuntimeHooks {
             session
         };
 
-        session.configure_instance(store, instance)
+        session.configure_instance(store, instance, imported_memory)
     }
 
     #[cfg(feature = "wasix")]
@@ -280,8 +266,8 @@ impl NapiRuntimeHooks {
             .with_additional_imports(move |module, store| hooks.additional_imports(module, store));
 
         let hooks = self.clone();
-        runtime.with_instance_setup(move |module, store, instance| {
-            hooks.configure_instance(module, store, instance)
+        runtime.with_instance_setup(move |module, store, instance, imported_memory| {
+            hooks.configure_instance(module, store, instance, imported_memory)
         });
     }
 }
@@ -317,7 +303,12 @@ impl NapiSession {
         Ok(import_object)
     }
 
-    pub fn configure_instance(&self, store: &mut StoreMut<'_>, instance: &Instance) -> Result<()> {
+    pub fn configure_instance(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        imported_memory: Option<&wasmer::Memory>,
+    ) -> Result<()> {
         let func_env = {
             let guard = self
                 .inner
@@ -328,6 +319,10 @@ impl NapiSession {
                 .clone()
                 .context("missing runtime function env during instance setup")?
         };
+
+        if let Some(memory) = imported_memory {
+            func_env.as_mut(&mut *store).memory = Some(memory.clone());
+        }
 
         for export_name in ["unofficial_napi_guest_malloc", "ubi_guest_malloc", "malloc"] {
             if let Ok(malloc) = instance
@@ -342,9 +337,6 @@ impl NapiSession {
         if let Ok(table) = instance.exports.get_table("__indirect_function_table") {
             func_env.as_mut(&mut *store).table = Some(table.clone());
         }
-        let table = func_env.as_ref(&store).table.clone();
-        let guest_envs = func_env.as_ref(&store).napi_state_to_guest_env.clone();
-        set_top_level_callback_state(store, table, guest_envs);
         Ok(())
     }
 
@@ -354,8 +346,8 @@ impl NapiSession {
         runtime.with_additional_imports(move |_module, store| session.create_imports(store));
 
         let session = self.clone();
-        runtime.with_instance_setup(move |_module, store, instance| {
-            session.configure_instance(store, instance)
+        runtime.with_instance_setup(move |_module, store, instance, imported_memory| {
+            session.configure_instance(store, instance, imported_memory)
         });
     }
 }
@@ -363,14 +355,13 @@ impl NapiSession {
 #[cfg(test)]
 mod tests {
     use super::NapiCtx;
-    use crate::module::make_store;
-    use wasmer::Module;
+    use wasmer::{Module, Store};
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
     #[test]
     fn max_sessions_limit_is_enforced() {
-        let store = make_store();
+        let store = Store::default();
         let module = Module::new(&store, EMPTY_WASM_MODULE).expect("empty wasm module compiles");
         let ctx = NapiCtx::builder().max_sessions(1).build();
 
