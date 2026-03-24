@@ -9,6 +9,7 @@ use std::ffi::{CString, c_void};
 use wasmer::{AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Imports};
 
 use crate::{
+    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME,
     RuntimeEnv,
     guest::{
         MAX_GUEST_CSTRING_SCAN,
@@ -4819,7 +4820,8 @@ fn guest_napi_new_instance(
 }
 
 // ============================================================
-// Register all WASM imports for the "napi" module
+// Register WASM imports for both the core "napi" module and the
+// Wasmer-specific "napi_extension_wasmer_v0" extension module.
 // ============================================================
 
 pub fn register_napi_imports(
@@ -4829,8 +4831,13 @@ pub fn register_napi_imports(
 ) {
     macro_rules! reg {
         ($name:expr, $func:expr) => {
+            let module_name = if $name.starts_with("unofficial_napi_") {
+                NAPI_EXTENSION_WASMER_MODULE_NAME
+            } else {
+                NAPI_MODULE_NAME
+            };
             io.define(
-                "napi",
+                module_name,
                 $name,
                 Function::new_typed_with_env(store, fe, $func),
             );

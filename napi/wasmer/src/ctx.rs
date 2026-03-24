@@ -10,6 +10,7 @@ use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table
 use wasmer_wasix::{PluggableRuntime, runners::wasi::WasiRunner};
 
 use crate::{
+    NAPI_EXTENSION_WASMER_MODULE_NAME, NAPI_MODULE_NAME,
     RuntimeEnv,
     guest::napi::{register_env_imports, register_napi_imports},
 };
@@ -123,7 +124,12 @@ impl NapiCtx {
     }
 
     pub fn module_needs_napi(module: &Module) -> bool {
-        module.imports().any(|import| import.module() == "napi")
+        module.imports().any(|import| {
+            matches!(
+                import.module(),
+                NAPI_MODULE_NAME | NAPI_EXTENSION_WASMER_MODULE_NAME
+            )
+        })
     }
 
     pub fn runtime_hooks(&self) -> NapiRuntimeHooks {

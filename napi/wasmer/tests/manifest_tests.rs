@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
-use napi_wasmer::run_wasix_main_capture_stdout;
 use serde::Deserialize;
 
 fn crate_root() -> PathBuf {
@@ -43,9 +43,26 @@ fn build_wasix_test(name: &str) -> PathBuf {
     root.join(format!("target/wasm32-wasix/release/{name}.wasm"))
 }
 
+fn build_cli_binary() -> PathBuf {
+    static CLI_PATH: OnceLock<PathBuf> = OnceLock::new();
+    CLI_PATH
+        .get_or_init(|| {
+            let root = crate_root();
+            let status = Command::new(env!("CARGO"))
+                .args(["build", "--features", "cli", "--bin", "napi_wasmer"])
+                .current_dir(&root)
+                .status()
+                .expect("failed to build napi_wasmer CLI binary for tests");
+            assert!(status.success(), "failed to build napi_wasmer CLI binary");
+            root.join("target/debug/napi_wasmer")
+        })
+        .clone()
+}
+
 #[test]
 fn manifest_tests_match_native_and_wasix() {
     let root = crate_root();
+    let cli = build_cli_binary();
     let manifest_path = root.join("tests/programs/manifest.json");
     let manifest_content = std::fs::read_to_string(&manifest_path)
         .expect("failed to read test/programs/manifest.json");
@@ -90,9 +107,17 @@ fn manifest_tests_match_native_and_wasix() {
 
         // Build and run WASIX test
         let wasix_path = build_wasix_test(&case.name);
-        let (wasix_code, wasix_stdout) =
-            run_wasix_main_capture_stdout(&wasix_path, &[], &[]).expect("failed to run WASIX test");
-        assert_eq!(wasix_code, 0, "wasix test exited non-zero: {}", case.name);
+        let wasix_out = Command::new(&cli)
+            .arg(&wasix_path)
+            .output()
+            .expect("failed to run WASIX test via napi_wasmer CLI");
+        assert_eq!(
+            wasix_out.status.code().unwrap_or(-1),
+            0,
+            "wasix test exited non-zero: {}",
+            case.name
+        );
+        let wasix_stdout = String::from_utf8(wasix_out.stdout).expect("wasix output not utf-8");
         if let Some(expected) = &case.expected_stdout {
             assert_eq!(
                 &wasix_stdout, expected,
