@@ -21,6 +21,18 @@
 #endif
 #endif
 
+#ifndef NAPI_EXTENSION_WASMER_EXTERN
+#ifdef _WIN32
+#define NAPI_EXTENSION_WASMER_EXTERN __declspec(dllexport)
+#elif defined(__wasm__)
+#define NAPI_EXTENSION_WASMER_EXTERN                                                            \
+  __attribute__((visibility("default")))                                       \
+  __attribute__((__import_module__("napi_extension_wasmer_v0")))
+#else
+#define NAPI_EXTENSION_WASMER_EXTERN __attribute__((visibility("default")))
+#endif
+#endif
+
 #define NAPI_AUTO_LENGTH SIZE_MAX
 
 #ifdef __cplusplus
