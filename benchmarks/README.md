@@ -57,6 +57,15 @@ What it does not measure:
 - network or filesystem async work
 - framework-level reactivity behavior
 
+## Runtime prerequisites
+
+Install and verify the comparison runtimes you want to use:
+
+- locally built Edge.js
+- Node.js
+- Bun
+- `hyperfine`
+
 ## Build Edge locally
 
 ```bash
