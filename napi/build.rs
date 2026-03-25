@@ -36,9 +36,10 @@ enum ExtraLink {
 
 fn main() {
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
-    println!("cargo:rerun-if-changed=native/edge");
-    println!("cargo:rerun-if-changed=native/include");
-    println!("cargo:rerun-if-changed=native/v8/src");
+    println!("cargo:rerun-if-changed=include");
+    println!("cargo:rerun-if-changed=v8/src");
+    println!("cargo:rerun-if-changed=../src/edge_napi_embedder_hooks.cc");
+    println!("cargo:rerun-if-changed=../src/edge_napi_embedder_hooks.h");
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
@@ -56,10 +57,12 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
-    let native_dir = manifest_dir.join("native");
-    let napi_include = native_dir.join("include");
-    let napi_v8_src = native_dir.join("v8/src");
-    let edge_src = native_dir.join("edge");
+    let project_root = manifest_dir
+        .parent()
+        .expect("napi crate must live directly under the repo root");
+    let napi_include = manifest_dir.join("include");
+    let napi_v8_src = manifest_dir.join("v8/src");
+    let edge_src = project_root.join("src");
     let v8 = resolve_v8_config().unwrap_or_else(|err| panic!("{err}"));
     assert!(
         v8.include_dir.join("v8.h").exists(),
@@ -180,8 +183,7 @@ fn resolve_v8_config() -> Result<V8Config, String> {
             })
         }
         V8Method::Source => Err(
-            "NAPI_V8_BUILD_METHOD=source is not supported by napi/wasmer cargo build.rs yet"
-                .to_string(),
+            "NAPI_V8_BUILD_METHOD=source is not supported by napi cargo build.rs yet".to_string(),
         ),
     }
 }

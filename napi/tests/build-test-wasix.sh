@@ -10,10 +10,9 @@ fi
 TEST_NAME="$1"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
-PROJECT_ROOT="$ROOT_DIR/../.."
 OUT_DIR="$ROOT_DIR/target/wasm32-wasix/release"
 OUT_FILE="$OUT_DIR/${TEST_NAME}.wasm"
-NAPI_INCLUDE_DIR="$PROJECT_ROOT/napi/include"
+NAPI_INCLUDE_DIR="$ROOT_DIR/include"
 TEST_INCLUDE_DIR="$ROOT_DIR/tests/programs"
 
 if ! command -v wasixcc >/dev/null 2>&1 && [[ -x "${HOME}/.wasixcc/bin/wasixcc" ]]; then

@@ -11,25 +11,21 @@ fi
 
 TEST_NAME="$1"
 
-# ROOT_DIR = napi/wasmer (the crate root)
+# ROOT_DIR = napi (the crate root)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../ && pwd)"
-# PROJECT_ROOT = top-level (node-napi)
-PROJECT_ROOT="$ROOT_DIR/../.."
+# PROJECT_ROOT = top-level repo root
+PROJECT_ROOT="$ROOT_DIR/.."
 OUT_DIR="$ROOT_DIR/target/native"
 OUT_FILE="$OUT_DIR/${TEST_NAME}"
-NAPI_INCLUDE_DIR="$ROOT_DIR/../include"
+NAPI_INCLUDE_DIR="$ROOT_DIR/include"
 TEST_INCLUDE_DIR="$ROOT_DIR/tests/programs"
 NATIVE_INIT_SRC="$ROOT_DIR/tests/napi_native_init.cc"
 
 # napi/v8 paths
-NAPI_V8_DIR="$PROJECT_ROOT/napi/v8"
-NAPI_V8_INCLUDE="$PROJECT_ROOT/napi/include"
+NAPI_V8_DIR="$ROOT_DIR/v8"
+NAPI_V8_INCLUDE="$ROOT_DIR/include"
 NAPI_V8_SRC="$NAPI_V8_DIR/src"
 EDGE_SRC="$PROJECT_ROOT/src"
-LIBUV_INCLUDE="$PROJECT_ROOT/deps/uv/include"
-if [[ -d "$PROJECT_ROOT/deps/libuv-wasix/include" ]]; then
-  LIBUV_INCLUDE="$PROJECT_ROOT/deps/libuv-wasix/include"
-fi
 
 resolve_primary_library() {
   local dir="$1"
@@ -133,35 +129,23 @@ resolve_local_v8() {
   return 1
 }
 
-resolve_libuv_link_args() {
-  local candidate
-  for candidate in \
-    "$PROJECT_ROOT/node/out/Release/libuv.a" \
-    "$PROJECT_ROOT/build-v8-napi/deps/uv/libuv.a" \
-    "$PROJECT_ROOT/build-napi-v8/deps/uv/libuv.a" \
-    "$PROJECT_ROOT/build-edge/deps/uv/libuv.a" \
-    "$PROJECT_ROOT/build-wasix/deps/uv/libuv.a" \
-    "$PROJECT_ROOT/build-ubi/deps/uv/libuv.a" \
-    /opt/homebrew/lib/libuv.a \
-    /opt/homebrew/lib/libuv.dylib \
-    /usr/local/lib/libuv.a \
-    /usr/local/lib/libuv.dylib
-  do
-    if [[ -f "$candidate" ]]; then
-      LIBUV_LINK_ARGS=("$candidate")
-      return 0
-    fi
-  done
-  LIBUV_LINK_ARGS=(-luv)
-}
-
 # V8 paths/defines
 V8_DEFINES="${V8_DEFINES:-${NAPI_V8_DEFINES:-V8_COMPRESS_POINTERS}}"
 V8_INCLUDE_DIR="${V8_INCLUDE_DIR:-${NAPI_V8_INCLUDE_DIR:-}}"
 V8_LIB_DIR="${V8_LIB_DIR:-}"
 V8_LIBRARY_PATH="${NAPI_V8_LIBRARY:-${NAPI_V8_V8_LIBRARY:-${NAPI_V8_V8_MONOLITH_LIB:-}}}"
 V8_LINK_ARGS=()
-LIBUV_LINK_ARGS=()
+PLATFORM_LINK_ARGS=()
+C_COMPILER=clang
+CXX_COMPILER=clang++
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  C_COMPILER=/usr/bin/clang
+  CXX_COMPILER=/usr/bin/clang++
+  PLATFORM_LINK_ARGS=(-lc++)
+else
+  PLATFORM_LINK_ARGS=(-lstdc++ -ldl -lm -lpthread -lrt)
+fi
 
 if [[ -n "$V8_INCLUDE_DIR" && -n "$V8_LIBRARY_PATH" ]]; then
   V8_LINK_ARGS=("$V8_LIBRARY_PATH")
@@ -178,8 +162,6 @@ if [[ -z "${V8_INCLUDE_DIR:-}" || -z "${V8_LIBRARY_PATH:-}" ]]; then
   echo "failed to resolve compatible V8 headers/library for native tests" >&2
   exit 1
 fi
-
-resolve_libuv_link_args
 
 TEST_SRC=""
 for ext in c cc cpp; do
@@ -231,7 +213,7 @@ fi
 # Step 1: Compile the test translation unit.
 case "$TEST_SRC" in
   *.cc|*.cpp)
-    clang++ -c -std=c++20 -O2 \
+    "$CXX_COMPILER" -c -std=c++20 -O2 \
       -fno-rtti \
       -w \
       -DNAPI_EXTERN= \
@@ -242,7 +224,7 @@ case "$TEST_SRC" in
       -o "$OUT_DIR/${TEST_NAME}.o"
     ;;
   *)
-    clang -c -std=c11 -O2 \
+    "$C_COMPILER" -c -std=c11 -O2 \
       -DNAPI_EXTERN= \
       -DNAPI_VERSION=8 \
       -I"$NAPI_INCLUDE_DIR" \
@@ -253,7 +235,7 @@ case "$TEST_SRC" in
 esac
 
 # Step 2: Compile native init + napi/v8 and link everything
-clang++ -std=c++20 -O2 \
+"$CXX_COMPILER" -std=c++20 -O2 \
   -fno-rtti \
   -w \
   -DNAPI_EXTERN= \
@@ -263,13 +245,12 @@ clang++ -std=c++20 -O2 \
   -I"$NAPI_V8_INCLUDE" \
   -I"$NAPI_V8_SRC" \
   -I"$EDGE_SRC" \
-  -I"$LIBUV_INCLUDE" \
   -I"$V8_INCLUDE_DIR" \
   "$OUT_DIR/${TEST_NAME}.o" \
   "$NATIVE_INIT_SRC" \
   "${NAPI_V8_SOURCES[@]}" \
   "${V8_LINK_ARGS[@]}" \
-  "${LIBUV_LINK_ARGS[@]}" \
+  "${PLATFORM_LINK_ARGS[@]}" \
   -o "$OUT_FILE"
 
 # Clean up intermediate object file

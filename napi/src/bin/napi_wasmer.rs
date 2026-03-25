@@ -22,7 +22,10 @@ fn maybe_add_builtin_mounts(
         }
         path
     } else {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         let lib = repo_root.join("lib");
         if lib.is_dir() {
             std::fs::canonicalize(&lib).ok().unwrap_or(lib)

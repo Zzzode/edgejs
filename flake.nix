@@ -33,7 +33,7 @@
               inherit system nixpkgs;
             };
             rustToolchain =
-              pkgs.rust-bin.fromRustupToolchainFile ./napi/wasmer/rust-toolchain.toml;
+              pkgs.rust-bin.fromRustupToolchainFile ./napi/rust-toolchain.toml;
             v8Prebuilt = pkgs.stdenvNoCC.mkDerivation {
               pname = "ubi-v8-prebuilt";
               version = "11.9.2";
@@ -131,7 +131,7 @@
               export LD_LIBRARY_PATH="$V8_LIB_DIR:$LD_LIBRARY_PATH"
               echo "WASIX build shell ready."
               echo "Try: ubi/wasix/build-wasix.sh"
-              echo "Try: cargo build --manifest-path napi/wasmer/Cargo.toml"
+              echo "Try: cargo build --manifest-path napi/Cargo.toml"
             '';
           };
       });

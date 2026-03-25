@@ -51,7 +51,7 @@ jobs:
           curl -fsSL "https://github.com/wasmerio/v8-custom-builds/releases/download/${V8_VERSION}/${ASSET}" -o "$V8_ROOT/${ASSET}"
           tar -xJf "$V8_ROOT/${ASSET}" -C "$V8_ROOT"
 
-          # napi/wasmer links dynamic V8 libs.
+          # napi links dynamic V8 libs.
           c++ -shared \
             -Wl,--whole-archive "$V8_ROOT/lib/libv8.a" -Wl,--no-whole-archive \
             -o "$V8_ROOT/lib/libv8.so" \
@@ -71,7 +71,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$V8_ROOT/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Test napi-wasmer
-        run: cargo test --manifest-path napi/wasmer/Cargo.toml --lib -- --nocapture
+        run: cargo test --manifest-path napi/Cargo.toml --lib -- --nocapture
 
       - name: sccache stats
         if: always()
@@ -120,7 +120,7 @@ jobs:
           curl -fsSL "https://github.com/wasmerio/v8-custom-builds/releases/download/${V8_VERSION}/${ASSET}" -o "$V8_ROOT/${ASSET}"
           tar -xJf "$V8_ROOT/${ASSET}" -C "$V8_ROOT"
 
-          # napi/wasmer links dynamic V8 libs.
+          # napi links dynamic V8 libs.
           /usr/bin/clang++ -dynamiclib \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-all_load "$V8_ROOT/lib/libv8.a" \
@@ -141,7 +141,7 @@ jobs:
           echo "DYLD_LIBRARY_PATH=$V8_ROOT/lib:${DYLD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Test napi-wasmer
-        run: cargo test --manifest-path napi/wasmer/Cargo.toml --lib -- --nocapture
+        run: cargo test --manifest-path napi/Cargo.toml --lib -- --nocapture
 
       - name: sccache stats
         if: always()
