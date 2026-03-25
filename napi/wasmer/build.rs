@@ -36,13 +36,9 @@ enum ExtraLink {
 
 fn main() {
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
-    println!("cargo:rerun-if-changed=../../src/edge_napi_embedder_hooks.cc");
-    println!("cargo:rerun-if-changed=../../src/edge_napi_embedder_hooks.h");
-    println!("cargo:rerun-if-changed=../v8/src/edge_v8_platform.cc");
-    println!("cargo:rerun-if-changed=../v8/src/js_native_api_v8.cc");
-    println!("cargo:rerun-if-changed=../v8/src/unofficial_napi.cc");
-    println!("cargo:rerun-if-changed=../v8/src/unofficial_napi_error_utils.cc");
-    println!("cargo:rerun-if-changed=../v8/src/unofficial_napi_contextify.cc");
+    println!("cargo:rerun-if-changed=native/edge");
+    println!("cargo:rerun-if-changed=native/include");
+    println!("cargo:rerun-if-changed=native/v8/src");
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
@@ -58,16 +54,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NAPI_V8_V8_LIBRARY");
     println!("cargo:rerun-if-env-changed=NAPI_V8_V8_MONOLITH_LIB");
 
-    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-
-    let napi_v8_dir = project_root.join("napi/v8");
-    let napi_include = project_root.join("napi/include");
-    let napi_v8_src = napi_v8_dir.join("src");
-    let edge_src = project_root.join("src");
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+    let native_dir = manifest_dir.join("native");
+    let napi_include = native_dir.join("include");
+    let napi_v8_src = native_dir.join("v8/src");
+    let edge_src = native_dir.join("edge");
     let v8 = resolve_v8_config().unwrap_or_else(|err| panic!("{err}"));
     assert!(
         v8.include_dir.join("v8.h").exists(),
