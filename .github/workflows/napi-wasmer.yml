@@ -51,20 +51,6 @@ jobs:
           curl -fsSL "https://github.com/wasmerio/v8-custom-builds/releases/download/${V8_VERSION}/${ASSET}" -o "$V8_ROOT/${ASSET}"
           tar -xJf "$V8_ROOT/${ASSET}" -C "$V8_ROOT"
 
-          # napi links dynamic V8 libs.
-          c++ -shared \
-            -Wl,--whole-archive "$V8_ROOT/lib/libv8.a" -Wl,--no-whole-archive \
-            -o "$V8_ROOT/lib/libv8.so" \
-            -ldl -pthread -lm -lrt || true
-          cat > "$V8_ROOT/lib/v8_libplatform_stub.cc" <<'EOF'
-          extern "C" void __dummy_v8_libplatform() {}
-          EOF
-          c++ -shared "$V8_ROOT/lib/v8_libplatform_stub.cc" -o "$V8_ROOT/lib/libv8_libplatform.so"
-          cat > "$V8_ROOT/lib/v8_libbase_stub.cc" <<'EOF'
-          extern "C" void __dummy_v8_libbase() {}
-          EOF
-          c++ -shared "$V8_ROOT/lib/v8_libbase_stub.cc" -o "$V8_ROOT/lib/libv8_libbase.so"
-
           echo "V8_INCLUDE_DIR=$V8_ROOT/include" >> "$GITHUB_ENV"
           echo "V8_LIB_DIR=$V8_ROOT/lib" >> "$GITHUB_ENV"
           echo "V8_DEFINES=V8_COMPRESS_POINTERS" >> "$GITHUB_ENV"
@@ -119,21 +105,6 @@ jobs:
           mkdir -p "$V8_ROOT"
           curl -fsSL "https://github.com/wasmerio/v8-custom-builds/releases/download/${V8_VERSION}/${ASSET}" -o "$V8_ROOT/${ASSET}"
           tar -xJf "$V8_ROOT/${ASSET}" -C "$V8_ROOT"
-
-          # napi links dynamic V8 libs.
-          /usr/bin/clang++ -dynamiclib \
-            -Wl,-undefined,dynamic_lookup \
-            -Wl,-all_load "$V8_ROOT/lib/libv8.a" \
-            -framework CoreFoundation \
-            -o "$V8_ROOT/lib/libv8.dylib"
-          cat > "$V8_ROOT/lib/v8_libplatform_stub.cc" <<'EOF'
-          extern "C" void __dummy_v8_libplatform() {}
-          EOF
-          /usr/bin/clang++ -dynamiclib "$V8_ROOT/lib/v8_libplatform_stub.cc" -o "$V8_ROOT/lib/libv8_libplatform.dylib"
-          cat > "$V8_ROOT/lib/v8_libbase_stub.cc" <<'EOF'
-          extern "C" void __dummy_v8_libbase() {}
-          EOF
-          /usr/bin/clang++ -dynamiclib "$V8_ROOT/lib/v8_libbase_stub.cc" -o "$V8_ROOT/lib/libv8_libbase.dylib"
 
           echo "V8_INCLUDE_DIR=$V8_ROOT/include" >> "$GITHUB_ENV"
           echo "V8_LIB_DIR=$V8_ROOT/lib" >> "$GITHUB_ENV"

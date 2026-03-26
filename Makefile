@@ -1,4 +1,4 @@
-.PHONY: build test test-only check-portability clean-dist dist dist-only framework-test framework-test-reset
+.PHONY: build build-wasix build-napi-wasmer-cli test-wasix-napi-cli test test-only check-portability clean-dist dist dist-only framework-test framework-test-reset
 
 UNAME_S := $(shell uname -s)
 BUILD_NAPI_DIR ?= build-v8-napi
@@ -18,6 +18,10 @@ BUILD_ENV ?= env
 EXTRA_CMAKE_ARGS ?=
 FRAMEWORK_TEST_SCRIPT := $(CURDIR)/scripts/framework-test.js
 FRAMEWORK_TEST_SELECTOR := $(filter js-%,$(MAKECMDGOALS))
+NAPI_WASMER_DIR ?= napi
+NAPI_WASMER_BINARY ?= ./$(NAPI_WASMER_DIR)/target/debug/napi_wasmer
+WASIX_EDGEJS_WASM ?= ./build-wasix/edgejs.wasm
+WASIX_NAPI_SMOKE_JS ?= console.log('hello world!');
 
 ifeq ($(UNAME_S),Darwin)
 BUILD_ENV := env -u CPPFLAGS -u LDFLAGS
@@ -35,6 +39,17 @@ test-napi-only:
 build:
 	$(BUILD_ENV) cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
 	$(BUILD_ENV) cmake --build $(BUILD_DIR) -j$(JOBS)
+
+build-wasix:
+	./wasix/build-wasix.sh
+
+build-napi-wasmer-cli:
+	cd $(NAPI_WASMER_DIR) && ./cargo-standalone.sh build --features cli --bin napi_wasmer
+
+test-wasix-napi-cli:
+	@output="$$($(NAPI_WASMER_BINARY) $(WASIX_EDGEJS_WASM) -e "$(WASIX_NAPI_SMOKE_JS)")"; \
+	printf '%s\n' "$$output"; \
+	printf '%s\n' "$$output" | grep -Fx "hello world!"
 
 $(EDGE_BINARY):
 	$(MAKE) build
