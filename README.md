@@ -75,7 +75,6 @@ NODE_TEST_RUNNER="$(pwd)/build-edge/edge" \
 ./test/nodejs_test_harness --category=node:assert
 ```
 
-
 ## Contribute 🤗
 
 We have created a [public ROADMAP](https://github.com/wasmerio/edgejs/issues/8), so you can contribute into the project easily!
