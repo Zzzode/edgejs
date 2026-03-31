@@ -71,6 +71,29 @@ What it does not measure:
 - large real-world archive throughput
 - long-running server workloads
 
+### `string-compare-split`
+
+Repeatedly splits the same delimited string and performs deterministic string comparisons over the resulting parts, then prints a checksum.
+
+What it isolates:
+- short-lived string splitting cost
+- simple string comparison work on repeated in-memory inputs
+- a runtime surface that maps to the roadmap’s string optimization lane
+
+What it does not measure:
+- regex-heavy parsing
+- large-text search workloads
+- filesystem or network I/O
+- long-running application throughput
+
+## Coverage notes
+
+Each benchmark in this directory is intentionally narrow.
+
+A single workload should be read as one slice of a runtime surface, not as a complete representation of that entire area. For example, a one-shot in-memory zlib benchmark is useful for covering one compression path, but it does not stand in for streaming behavior, decompression cost, larger payloads, or broader application throughput.
+
+The goal of this suite is to grow coverage incrementally with small, reviewable workloads that are easy to reproduce and compare across runtimes. When a surface needs deeper coverage, it should expand as a small family of related benchmarks rather than one oversized mixed workload.
+
 ## Runtime prerequisites
 
 Install and verify the comparison runtimes you want to use:
