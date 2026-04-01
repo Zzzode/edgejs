@@ -18,10 +18,15 @@
 #endif
 
 #include "edge_process.h"
+#include "edge_version.h"
 
 namespace {
 
 constexpr const char kSafeModeInstallUrl[] = "https://docs.wasmer.io/install";
+
+#ifndef EDGE_DEFAULT_WASMER_PACKAGE
+#define EDGE_DEFAULT_WASMER_PACKAGE "wasmer/edge@=" EDGE_VERSION_STRING
+#endif
 
 struct CommandResult {
   int exit_code = 1;
@@ -29,6 +34,16 @@ struct CommandResult {
   std::string stdout_output;
   std::string stderr_output;
 };
+
+std::string ResolveWasmerBinary(std::string_view wasmer_bin) {
+  if (!wasmer_bin.empty()) return std::string(wasmer_bin);
+  return "wasmer";
+}
+
+std::string ResolveWasmerPackage(std::string_view wasmer_package) {
+  if (!wasmer_package.empty()) return std::string(wasmer_package);
+  return EDGE_DEFAULT_WASMER_PACKAGE;
+}
 
 std::string BuildEdgeBinaryPath() {
   namespace fs = std::filesystem;
@@ -77,6 +92,20 @@ std::string BuildCompatWrappedPathPrefix() {
     updated_path += current_path;
   }
   return updated_path;
+}
+
+std::vector<std::string> BuildDefaultSafeModeCommand(std::string_view wasmer_bin,
+                                                     std::string_view wasmer_package) {
+  const std::string resolved_wasmer_bin = ResolveWasmerBinary(wasmer_bin);
+  const std::string resolved_wasmer_package = ResolveWasmerPackage(wasmer_package);
+  return {
+      resolved_wasmer_bin,
+      "run",
+      "--experimental-napi",
+      resolved_wasmer_package,
+      "--volume=.",
+      "--net",
+  };
 }
 
 bool SafeModeVersionHasRequiredNapiFeatures(const std::string& version_output) {
@@ -303,11 +332,19 @@ bool EdgeShouldWrapCompatCommand(std::string_view command) {
   return false;
 }
 
-int EdgeRunSafeModeCommand(const std::vector<std::string>& forwarded_args, std::string* error_out) {
-  const CommandResult version_result = RunCommandCapture({"wasmer", "--version", "-v"});
+int EdgeRunSafeModeCommand(const std::vector<std::string>& forwarded_args,
+                           std::string_view wasmer_bin,
+                           std::string_view wasmer_package,
+                           std::string* error_out) {
+  const std::string resolved_wasmer_bin = ResolveWasmerBinary(wasmer_bin);
+  const CommandResult version_result = RunCommandCapture({resolved_wasmer_bin, "--version", "-v"});
   if (version_result.exec_errno == ENOENT) {
     if (error_out != nullptr) {
-      *error_out = "safe mode requires Wasmer.\nInstall it from " + std::string(kSafeModeInstallUrl) + ".";
+      if (resolved_wasmer_bin == "wasmer") {
+        *error_out = "safe mode requires Wasmer.\nInstall it from " + std::string(kSafeModeInstallUrl) + ".";
+      } else {
+        *error_out = "safe mode requires a valid Wasmer binary: " + resolved_wasmer_bin;
+      }
     }
     return 1;
   }
@@ -333,7 +370,8 @@ int EdgeRunSafeModeCommand(const std::vector<std::string>& forwarded_args, std::
     return 1;
   }
 
-  std::vector<std::string> child_args = {"wasmer", "run", "--experimental-napi", "wasmer/edgejs", "--volume=.", "--net"};
+  std::vector<std::string> child_args =
+      BuildDefaultSafeModeCommand(resolved_wasmer_bin, wasmer_package);
   child_args.insert(child_args.end(), forwarded_args.begin(), forwarded_args.end());
   return RunCommandPassthrough(child_args, error_out);
 }

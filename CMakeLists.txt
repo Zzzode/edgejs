@@ -10,6 +10,29 @@ set(EDGE_ROOT "${PROJECT_ROOT}")
 set(NAPI_V8_ROOT "${PROJECT_ROOT}/napi/v8")
 set(NAPI_INCLUDE_ROOT "${PROJECT_ROOT}/napi/include")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(Git QUIET)
+
+set(EDGE_VERSION_COMMIT "unknown")
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse --short=7 HEAD
+    WORKING_DIRECTORY "${PROJECT_ROOT}"
+    OUTPUT_VARIABLE EDGE_VERSION_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+endif()
+if(EDGE_VERSION_COMMIT STREQUAL "")
+  set(EDGE_VERSION_COMMIT "unknown")
+endif()
+set(EDGE_VERSION_SUFFIX "")
+if(NOT EDGE_VERSION_COMMIT STREQUAL "unknown")
+  set(EDGE_VERSION_SUFFIX "-${EDGE_VERSION_COMMIT}")
+endif()
+set(EDGE_DEFAULT_WASMER_PACKAGE
+  "$ENV{EDGE_WASMER_PACKAGE}"
+  CACHE STRING "Default Wasmer package used by edge --safe"
+)
 
 include("${PROJECT_ROOT}/napi/v8/cmake/NapiBuildCache.cmake")
 napi_enable_sccache_if_available()
@@ -928,6 +951,8 @@ target_compile_definitions(edge_runtime
     EDGE_HAS_SMALL_ICU=1
     EDGE_NODE_SHARED_OPENSSL=${EDGE_NODE_SHARED_OPENSSL}
     EDGE_EMBEDDED_V8_VERSION="${EDGE_EMBEDDED_V8_VERSION}"
+    EDGE_VERSION_COMMIT="${EDGE_VERSION_COMMIT}"
+    EDGE_VERSION_SUFFIX="${EDGE_VERSION_SUFFIX}"
 )
 if(EDGE_IS_WASIX_TARGET)
   target_sources(edge_runtime PRIVATE
@@ -954,6 +979,17 @@ target_link_libraries(edge_cli
   PRIVATE
     uv_a
 )
+target_compile_definitions(edge_cli
+  PRIVATE
+    EDGE_VERSION_COMMIT="${EDGE_VERSION_COMMIT}"
+    EDGE_VERSION_SUFFIX="${EDGE_VERSION_SUFFIX}"
+)
+if(NOT EDGE_DEFAULT_WASMER_PACKAGE STREQUAL "")
+  target_compile_definitions(edge_cli
+    PRIVATE
+      EDGE_DEFAULT_WASMER_PACKAGE="${EDGE_DEFAULT_WASMER_PACKAGE}"
+  )
+endif()
 
 option(EDGE_BUILD_CLI "Build edge CLI binary" ON)
 if(EDGE_BUILD_CLI)

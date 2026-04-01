@@ -116,7 +116,6 @@ jobs:
       TARGET_REPO: wasmerio/edgejs-nightlies
       RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
       RELEASE_NAME: ${{ needs.metadata.outputs.release_name }}
-      EDGE_VERSION: ${{ needs.metadata.outputs.edge_version }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Download Linux artifact
@@ -156,12 +155,60 @@ jobs:
           printf 'Discovered %s release asset(s)\n' "${#files[@]}"
           printf '%s\n' "${files[@]}"
 
+      - name: Prepare Wasmer publish assets
+        id: wasmer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          linux_zip="$(find release-assets/linux -type f -name '*.zip' | head -n 1)"
+          wasix_zip="$(find release-assets/wasix -type f -name '*.zip' | head -n 1)"
+
+          if [[ -z "${linux_zip}" || ! -f "${linux_zip}" ]]; then
+            echo "Missing Linux artifact zip" >&2
+            exit 1
+          fi
+          if [[ -z "${wasix_zip}" || ! -f "${wasix_zip}" ]]; then
+            echo "Missing WASIX artifact zip" >&2
+            exit 1
+          fi
+
+          linux_dir="release-assets/linux/unpacked"
+          wasix_dir="release-assets/wasix/unpacked"
+          rm -rf "${linux_dir}" "${wasix_dir}"
+          mkdir -p "${linux_dir}" "${wasix_dir}"
+
+          unzip -q "${linux_zip}" -d "${linux_dir}"
+          unzip -q "${wasix_zip}" -d "${wasix_dir}"
+
+          edge_bin="${linux_dir}/bin/edge"
+          if [[ ! -x "${edge_bin}" ]]; then
+            echo "Expected packaged edge binary at ${edge_bin}" >&2
+            exit 1
+          fi
+
+          edge_version="$("${edge_bin}" -p "process.versions.edge")"
+          if [[ -z "${edge_version}" ]]; then
+            echo "Failed to determine EDGE version from packaged binary" >&2
+            exit 1
+          fi
+
+          if [[ ! -f "${wasix_dir}/wasmer.toml" ]]; then
+            echo "Expected wasmer.toml in ${wasix_dir}" >&2
+            exit 1
+          fi
+
+          {
+            echo "edge_version=${edge_version}"
+            echo "wasix_dist_dir=${wasix_dir}"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Create release notes
         shell: bash
         run: |
           set -euo pipefail
           {
-            echo "Automated nightly build for EDGE ${EDGE_VERSION}."
+            echo "Automated nightly build for EDGE ${{ steps.wasmer.outputs.edge_version }}."
             echo
             echo "- Source repo: ${GITHUB_REPOSITORY}"
             echo "- Commit: ${GITHUB_SHA}"
@@ -207,6 +254,33 @@ jobs:
             --repo "${TARGET_REPO}" \
             --clobber \
             "${files[@]}"
+
+      - name: Install Wasmer CLI
+        uses: wasmerio/setup-wasmer@v3
+
+      - name: Publish to wasmer.wtf
+        env:
+          WASMER_TOKEN: ${{ secrets.DEV_BACKEND_CIUSER_TOKEN }}
+          EDGE_VERSION: ${{ steps.wasmer.outputs.edge_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          wasmer publish "${{ steps.wasmer.outputs.wasix_dist_dir }}" \
+            --registry wasmer.wtf \
+            --token "${WASMER_TOKEN}" \
+            --version="${EDGE_VERSION}"
+
+      - name: Publish to wasmer.io
+        env:
+          WASMER_TOKEN: ${{ secrets.PROD_BACKEND_CIUSER_TOKEN }}
+          EDGE_VERSION: ${{ steps.wasmer.outputs.edge_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          wasmer publish "${{ steps.wasmer.outputs.wasix_dist_dir }}" \
+            --registry wasmer.io \
+            --token "${WASMER_TOKEN}" \
+            --version="${EDGE_VERSION}"
 
   build-macos:
     name: build-macos

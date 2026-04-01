@@ -21,6 +21,17 @@ NAPI_WASMER_DIR ?= napi
 NAPI_WASMER_BINARY ?= ./$(NAPI_WASMER_DIR)/target/debug/napi_wasmer
 WASIX_EDGEJS_WASM ?= ./build-wasix/edgejs.wasm
 WASIX_NAPI_SMOKE_JS ?= console.log('hello world!');
+EDGE_VERSION_MAJOR := $(shell awk '$$2 == "EDGE_MAJOR_VERSION" {print $$3; exit}' src/edge_version.h)
+EDGE_VERSION_MINOR := $(shell awk '$$2 == "EDGE_MINOR_VERSION" {print $$3; exit}' src/edge_version.h)
+EDGE_VERSION_PATCH := $(shell awk '$$2 == "EDGE_PATCH_VERSION" {print $$3; exit}' src/edge_version.h)
+EDGE_VERSION_COMMIT := $(shell git rev-parse --short=7 HEAD 2>/dev/null || printf unknown)
+EDGE_VERSION_BASE := $(EDGE_VERSION_MAJOR).$(EDGE_VERSION_MINOR).$(EDGE_VERSION_PATCH)
+ifneq ($(filter 1 true TRUE yes YES,$(IS_FINAL_RELEASE)),)
+EDGE_PACKAGE_VERSION := $(EDGE_VERSION_BASE)
+else
+EDGE_PACKAGE_VERSION := $(EDGE_VERSION_BASE)-$(EDGE_VERSION_COMMIT)
+endif
+EDGE_WASMER_PACKAGE ?= wasmer/edge@=$(EDGE_PACKAGE_VERSION)
 
 ifeq ($(UNAME_S),Darwin)
 BUILD_ENV := env -u CPPFLAGS -u LDFLAGS
@@ -36,7 +47,7 @@ test-napi-only:
 	$(BUILD_ENV) ctest --test-dir $(BUILD_NAPI_DIR) --output-on-failure -R '^napi_v8\.'
 
 build:
-	$(BUILD_ENV) cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
+	$(BUILD_ENV) cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) -DEDGE_DEFAULT_WASMER_PACKAGE=$(EDGE_WASMER_PACKAGE) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
 	$(BUILD_ENV) cmake --build $(BUILD_DIR) -j$(JOBS)
 
 build-wasix:
@@ -150,3 +161,4 @@ framework-test-reset:
 
 js-%:
 	@:
+

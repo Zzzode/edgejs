@@ -62,6 +62,20 @@ constexpr const char kPathEnvSeparator[] = ";";
 constexpr const char kPathEnvSeparator[] = ":";
 #endif
 
+bool EdgeIsTruthyEnvVar(const char* value) {
+  if (value == nullptr || value[0] == '\0') return false;
+
+  std::string normalized(value);
+  for (char& ch : normalized) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+
+  return normalized != "0" &&
+         normalized != "false" &&
+         normalized != "no" &&
+         normalized != "off";
+}
+
 void ResetSignalHandlersLikeNode() {
 #if !defined(_WIN32)
   struct sigaction act;
@@ -1086,16 +1100,109 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
   if (argc > 1 && argv[1] != nullptr && EdgeShouldWrapCompatCommand(argv[1])) {
     return EdgeRunCompatCommand(argc, argv, error_out);
   }
+  const bool env_safe_mode = EdgeIsTruthyEnvVar(std::getenv("EDGE_SAFE"));
+  bool cli_safe_mode = false;
   for (int i = 1; i < argc; ++i) {
-    if (argv[i] == nullptr || std::string(argv[i]) != "--safe") continue;
-
-    std::vector<std::string> forwarded_args;
-    forwarded_args.reserve(static_cast<size_t>(argc > 1 ? argc - 2 : 0));
-    for (int argi = 1; argi < argc; ++argi) {
-      if (argi == i || argv[argi] == nullptr) continue;
-      forwarded_args.emplace_back(argv[argi]);
+    if (argv[i] == nullptr) continue;
+    if (std::string(argv[i]) == "--safe") cli_safe_mode = true;
+  }
+  const bool safe_mode_requested = cli_safe_mode || env_safe_mode;
+  if (safe_mode_requested) {
+    bool has_cli_wasmer_bin = false;
+    bool has_cli_wasmer_package = false;
+    std::string wasmer_bin;
+    std::string wasmer_package;
+    for (int i = 1; i < argc; ++i) {
+      if (argv[i] == nullptr) continue;
+      const std::string token(argv[i]);
+      if (token == "--wasmer-bin") {
+        if (i + 1 >= argc || argv[i + 1] == nullptr) {
+          if (error_out != nullptr) {
+            *error_out = FormatCliError("--wasmer-bin requires an argument");
+          }
+          return 1;
+        }
+        has_cli_wasmer_bin = true;
+        wasmer_bin = argv[i + 1];
+        ++i;
+        continue;
+      }
+      if (token.rfind("--wasmer-bin=", 0) == 0) {
+        has_cli_wasmer_bin = true;
+        wasmer_bin = token.substr(std::strlen("--wasmer-bin="));
+        if (wasmer_bin.empty()) {
+          if (error_out != nullptr) {
+            *error_out = FormatCliError("--wasmer-bin requires an argument");
+          }
+          return 1;
+        }
+      }
+      if (token == "--edgejs-wasmer-package" || token == "--wasmer-package") {
+        if (i + 1 >= argc || argv[i + 1] == nullptr) {
+          if (error_out != nullptr) {
+            *error_out = FormatCliError(token + " requires an argument");
+          }
+          return 1;
+        }
+        has_cli_wasmer_package = true;
+        wasmer_package = argv[i + 1];
+        ++i;
+        continue;
+      }
+      if (token.rfind("--edgejs-wasmer-package=", 0) == 0) {
+        has_cli_wasmer_package = true;
+        wasmer_package = token.substr(std::strlen("--edgejs-wasmer-package="));
+        if (wasmer_package.empty()) {
+          if (error_out != nullptr) {
+            *error_out = FormatCliError("--edgejs-wasmer-package requires an argument");
+          }
+          return 1;
+        }
+        continue;
+      }
+      if (token.rfind("--wasmer-package=", 0) == 0) {
+        has_cli_wasmer_package = true;
+        wasmer_package = token.substr(std::strlen("--wasmer-package="));
+        if (wasmer_package.empty()) {
+          if (error_out != nullptr) {
+            *error_out = FormatCliError("--wasmer-package requires an argument");
+          }
+          return 1;
+        }
+      }
     }
-    return EdgeRunSafeModeCommand(forwarded_args, error_out);
+    if (!has_cli_wasmer_bin) {
+      const char* env_wasmer_bin = std::getenv("WASMER_BIN");
+      if (env_wasmer_bin != nullptr && env_wasmer_bin[0] != '\0') {
+        wasmer_bin = env_wasmer_bin;
+      }
+    }
+    if (!has_cli_wasmer_package) {
+      const char* env_wasmer_package = std::getenv("EDGE_WASMER_PACKAGE");
+      if (env_wasmer_package != nullptr && env_wasmer_package[0] != '\0') {
+        wasmer_package = env_wasmer_package;
+      }
+    }
+    std::vector<std::string> forwarded_args;
+    forwarded_args.reserve(static_cast<size_t>(argc > 1 ? argc - 1 : 0));
+    for (int i = 1; i < argc; ++i) {
+      if (argv[i] == nullptr) continue;
+      const std::string token(argv[i]);
+      if (token == "--safe") continue;
+      if (token == "--wasmer-bin") {
+        ++i;
+        continue;
+      }
+      if (token == "--edgejs-wasmer-package" || token == "--wasmer-package") {
+        ++i;
+        continue;
+      }
+      if (token.rfind("--wasmer-bin=", 0) == 0) continue;
+      if (token.rfind("--edgejs-wasmer-package=", 0) == 0) continue;
+      if (token.rfind("--wasmer-package=", 0) == 0) continue;
+      forwarded_args.emplace_back(argv[i]);
+    }
+    return EdgeRunSafeModeCommand(forwarded_args, wasmer_bin, wasmer_package, error_out);
   }
   if (argc > 1 && argv[1] != nullptr &&
       (std::string(argv[1]) == "-v" || std::string(argv[1]) == "--version")) {
