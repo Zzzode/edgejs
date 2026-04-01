@@ -33,6 +33,9 @@ namespace {
 constexpr int32_t kPromisePending = 0;
 constexpr int32_t kPromiseFulfilled = 1;
 constexpr int32_t kPromiseRejected = 2;
+constexpr uint32_t kMaxCallSitesFrames = 200;
+constexpr uint32_t kMaxRawCallSitesFrames = kMaxCallSitesFrames + 1;
+constexpr uint32_t kEdgeInternalCallSiteFrames = 1;
 
 constexpr int32_t kExitInfoKExiting = 0;
 constexpr int32_t kExitInfoKExitCode = 1;
@@ -190,6 +193,85 @@ napi_value GetNamedProperty(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
   if (napi_get_named_property(env, obj, key, &out) != napi_ok || out == nullptr) return nullptr;
   return out;
+}
+
+bool CreateLocationFromCallSite(napi_env env, napi_value callsite, napi_value* location_out) {
+  if (callsite == nullptr || location_out == nullptr) return false;
+
+  napi_value file = GetNamedProperty(env, callsite, "scriptNameOrSourceURL");
+  if (file == nullptr) file = GetNamedProperty(env, callsite, "scriptName");
+  napi_value line_v = GetNamedProperty(env, callsite, "lineNumber");
+  napi_value column_v = GetNamedProperty(env, callsite, "columnNumber");
+  if (file == nullptr || line_v == nullptr || column_v == nullptr) return false;
+
+  napi_valuetype file_type = napi_undefined;
+  size_t file_length = 0;
+  if (napi_typeof(env, file, &file_type) != napi_ok || file_type != napi_string ||
+      napi_get_value_string_utf8(env, file, nullptr, 0, &file_length) != napi_ok || file_length == 0) {
+    return false;
+  }
+
+  uint32_t line = 0;
+  uint32_t column = 0;
+  if (napi_get_value_uint32(env, line_v, &line) != napi_ok ||
+      napi_get_value_uint32(env, column_v, &column) != napi_ok) {
+    return false;
+  }
+
+  napi_value location = nullptr;
+  napi_value line_out = nullptr;
+  napi_value column_out = nullptr;
+  if (napi_create_array_with_length(env, 3, &location) != napi_ok || location == nullptr ||
+      napi_create_uint32(env, line, &line_out) != napi_ok || line_out == nullptr ||
+      napi_create_uint32(env, column, &column_out) != napi_ok || column_out == nullptr) {
+    return false;
+  }
+
+  if (napi_set_element(env, location, 0, line_out) != napi_ok ||
+      napi_set_element(env, location, 1, column_out) != napi_ok ||
+      napi_set_element(env, location, 2, file) != napi_ok) {
+    return false;
+  }
+
+  *location_out = location;
+  return true;
+}
+
+uint32_t RawCallSiteFramesForEdge(uint32_t frames) {
+  if (frames == 0) return 0;
+  if (frames >= kMaxCallSitesFrames) return kMaxRawCallSitesFrames;
+  return frames + kEdgeInternalCallSiteFrames;
+}
+
+bool CreateSkippedCallSitesArray(napi_env env,
+                                 napi_value raw_callsites,
+                                 uint32_t skip_frames,
+                                 napi_value* out) {
+  if (raw_callsites == nullptr || out == nullptr) return false;
+
+  bool is_array = false;
+  if (napi_is_array(env, raw_callsites, &is_array) != napi_ok || !is_array) return false;
+
+  uint32_t length = 0;
+  if (napi_get_array_length(env, raw_callsites, &length) != napi_ok) return false;
+
+  const uint32_t start = std::min(skip_frames, length);
+  const uint32_t count = length - start;
+  napi_value result = nullptr;
+  if (napi_create_array_with_length(env, count, &result) != napi_ok || result == nullptr) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < count; ++i) {
+    napi_value callsite = nullptr;
+    if (napi_get_element(env, raw_callsites, start + i, &callsite) != napi_ok ||
+        napi_set_element(env, result, i, callsite) != napi_ok) {
+      return false;
+    }
+  }
+
+  *out = result;
+  return true;
 }
 
 napi_value GetGlobal(napi_env env) {
@@ -454,15 +536,16 @@ napi_value IsInsideNodeModulesCallback(napi_env env, napi_callback_info info) {
   bool result = false;
   uint32_t frames = static_cast<uint32_t>(frame_limit + 32);
   if (frames < 64) frames = 64;
-  if (frames > 200) frames = 200;
+  if (frames > kMaxCallSitesFrames) frames = kMaxCallSitesFrames;
+  const uint32_t raw_frames = RawCallSiteFramesForEdge(frames);
 
   napi_value callsites = nullptr;
-  if (unofficial_napi_get_call_sites(env, frames, &callsites) == napi_ok && callsites != nullptr) {
+  if (unofficial_napi_get_call_sites(env, raw_frames, &callsites) == napi_ok && callsites != nullptr) {
     bool is_array = false;
     if (napi_is_array(env, callsites, &is_array) == napi_ok && is_array) {
       uint32_t length = 0;
       if (napi_get_array_length(env, callsites, &length) == napi_ok) {
-        for (uint32_t i = 0; i < length; ++i) {
+        for (uint32_t i = std::min(kEdgeInternalCallSiteFrames, length); i < length; ++i) {
           napi_value callsite = nullptr;
           if (napi_get_element(env, callsites, i, &callsite) != napi_ok || callsite == nullptr) continue;
 
@@ -844,13 +927,9 @@ napi_value GetProxyDetailsCallback(napi_env env, napi_callback_info info) {
 }
 
 napi_value GetCallerLocationCallback(napi_env env, napi_callback_info /*info*/) {
-  napi_value out = nullptr;
-  if (unofficial_napi_get_caller_location(env, &out) == napi_ok && out != nullptr) {
-    return out;
-  }
-
   napi_value callsites = nullptr;
-  if (unofficial_napi_get_call_sites(env, 64, &callsites) != napi_ok || callsites == nullptr) {
+  if (unofficial_napi_get_call_sites(env, RawCallSiteFramesForEdge(64), &callsites) != napi_ok ||
+      callsites == nullptr) {
     return Undefined(env);
   }
 
@@ -860,36 +939,13 @@ napi_value GetCallerLocationCallback(napi_env env, napi_callback_info /*info*/) 
   uint32_t length = 0;
   if (napi_get_array_length(env, callsites, &length) != napi_ok || length == 0) return Undefined(env);
 
-  for (uint32_t i = 0; i < length; ++i) {
+  for (uint32_t i = std::min(kEdgeInternalCallSiteFrames, length); i < length; ++i) {
     napi_value callsite = nullptr;
     if (napi_get_element(env, callsites, i, &callsite) != napi_ok || callsite == nullptr) continue;
-
-    napi_value file = GetNamedProperty(env, callsite, "scriptName");
-    napi_value line_v = GetNamedProperty(env, callsite, "lineNumber");
-    napi_value column_v = GetNamedProperty(env, callsite, "columnNumber");
-    if (file == nullptr || line_v == nullptr || column_v == nullptr) continue;
-
-    uint32_t line = 0;
-    uint32_t column = 0;
-    if (napi_get_value_uint32(env, line_v, &line) != napi_ok ||
-        napi_get_value_uint32(env, column_v, &column) != napi_ok) {
-      continue;
-    }
-
     napi_value location = nullptr;
-    napi_value line_out = nullptr;
-    napi_value column_out = nullptr;
-    if (napi_create_array_with_length(env, 3, &location) != napi_ok || location == nullptr ||
-        napi_create_uint32(env, line, &line_out) != napi_ok || line_out == nullptr ||
-        napi_create_uint32(env, column, &column_out) != napi_ok || column_out == nullptr) {
-      continue;
+    if (CreateLocationFromCallSite(env, callsite, &location) && location != nullptr) {
+      return location;
     }
-    if (napi_set_element(env, location, 0, line_out) != napi_ok ||
-        napi_set_element(env, location, 1, column_out) != napi_ok ||
-        napi_set_element(env, location, 2, file) != napi_ok) {
-      continue;
-    }
-    return location;
   }
 
   return Undefined(env);
@@ -1100,9 +1156,18 @@ napi_value GetCallSitesCallback(napi_env env, napi_callback_info info) {
 
   uint32_t frames = 0;
   if (napi_get_value_uint32(env, argv[0], &frames) != napi_ok) return Undefined(env);
+  if (frames == 0 || frames > kMaxCallSitesFrames) return Undefined(env);
+
+  const uint32_t raw_frames = RawCallSiteFramesForEdge(frames);
+  napi_value raw_out = nullptr;
+  if (unofficial_napi_get_call_sites(env, raw_frames, &raw_out) != napi_ok || raw_out == nullptr) {
+    return Undefined(env);
+  }
 
   napi_value out = nullptr;
-  if (unofficial_napi_get_call_sites(env, frames, &out) != napi_ok || out == nullptr) return Undefined(env);
+  if (!CreateSkippedCallSitesArray(env, raw_out, kEdgeInternalCallSiteFrames, &out) || out == nullptr) {
+    return Undefined(env);
+  }
   return out;
 }
 

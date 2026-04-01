@@ -1020,6 +1020,24 @@ bool StdinIsTTY() {
 #endif
 }
 
+bool StdinSupportsRawMode() {
+  if (!StdinIsTTY()) return false;
+#if defined(__wasi__) || defined(__wasm32__)
+  return false;
+#else
+  return true;
+#endif
+}
+
+void PrepareEnvForRepl() {
+  // WASIX stdio can present stdin as a TTY while still rejecting raw mode.
+  // Force the plain line-based REPL in that case instead of crashing during
+  // readline startup.
+  if (StdinIsTTY() && !StdinSupportsRawMode()) {
+    (void)ApplyEnvUpdate("NODE_NO_READLINE", "1");
+  }
+}
+
 int RunCliBuiltin(const char* source_text,
                   const char* native_main_builtin_id,
                   const char* current_script_path,
@@ -1502,6 +1520,7 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
       }
       return 1;
     }
+    PrepareEnvForRepl();
     EdgeSetScriptArgv({});
     return RunCliBuiltin(";", "internal/main/repl", nullptr, error_out);
   }
@@ -1575,6 +1594,7 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
     if (mode == CliMode::kCheck) {
       return RunCliBuiltin(";", "internal/main/check_syntax", "-", error_out);
     }
+    PrepareEnvForRepl();
     return RunCliBuiltin(";", StdinIsTTY() ? "internal/main/repl" : "internal/main/eval_stdin",
                          "-", error_out);
   }
