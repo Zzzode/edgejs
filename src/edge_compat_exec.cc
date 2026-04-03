@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -35,14 +37,152 @@ struct CommandResult {
   std::string stderr_output;
 };
 
+std::string ResolveHomeDirectory() {
+  const char* home = std::getenv("HOME");
+  if (home != nullptr && home[0] != '\0') return std::string(home);
+#if defined(_WIN32)
+  const char* userprofile = std::getenv("USERPROFILE");
+  if (userprofile != nullptr && userprofile[0] != '\0') return std::string(userprofile);
+  const char* homedrive = std::getenv("HOMEDRIVE");
+  const char* homepath = std::getenv("HOMEPATH");
+  if (homedrive != nullptr && homedrive[0] != '\0' && homepath != nullptr && homepath[0] != '\0') {
+    return std::string(homedrive) + std::string(homepath);
+  }
+#endif
+  return {};
+}
+
+std::optional<std::string> ReadTextFile(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) return std::nullopt;
+  return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+}
+
+bool FindJsonStringField(const std::string& source,
+                         std::string_view key,
+                         size_t start,
+                         std::string* value_out,
+                         size_t* next_pos_out) {
+  const std::string needle = "\"" + std::string(key) + "\"";
+  size_t key_pos = start;
+  while (true) {
+    key_pos = source.find(needle, key_pos);
+    if (key_pos == std::string::npos) return false;
+
+    const size_t colon_pos = source.find(':', key_pos + needle.size());
+    if (colon_pos == std::string::npos) return false;
+
+    size_t value_pos = colon_pos + 1;
+    while (value_pos < source.size() &&
+           (source[value_pos] == ' ' || source[value_pos] == '\n' ||
+            source[value_pos] == '\r' || source[value_pos] == '\t')) {
+      ++value_pos;
+    }
+    if (value_pos >= source.size()) return false;
+    if (source[value_pos] != '"') {
+      key_pos = value_pos;
+      continue;
+    }
+
+    std::string value;
+    bool escaped = false;
+    for (size_t i = value_pos + 1; i < source.size(); ++i) {
+      const char ch = source[i];
+      if (escaped) {
+        value.push_back(ch);
+        escaped = false;
+        continue;
+      }
+      if (ch == '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch == '"') {
+        if (value_out != nullptr) *value_out = value;
+        if (next_pos_out != nullptr) *next_pos_out = i + 1;
+        return true;
+      }
+      value.push_back(ch);
+    }
+    return false;
+  }
+}
+
+std::optional<std::string> ResolveCachedWasmerPackage(std::string_view wasmer_package) {
+  const std::string package(wasmer_package);
+  const size_t slash_pos = package.find('/');
+  const size_t exact_version_pos = package.find("@=");
+  if (slash_pos == std::string::npos || exact_version_pos == std::string::npos || exact_version_pos <= slash_pos + 1) {
+    return std::nullopt;
+  }
+
+  const std::string package_namespace = package.substr(0, slash_pos);
+  const std::string package_name = package.substr(slash_pos + 1, exact_version_pos - slash_pos - 1);
+  const std::string package_version = package.substr(exact_version_pos + 2);
+  if (package_namespace.empty() || package_name.empty() || package_version.empty()) {
+    return std::nullopt;
+  }
+
+  const std::string home_directory = ResolveHomeDirectory();
+  if (home_directory.empty()) return std::nullopt;
+
+  namespace fs = std::filesystem;
+  const fs::path wasmer_dir = fs::path(home_directory) / ".wasmer";
+  const fs::path query_path =
+      wasmer_dir / "cache" / "queries" / "https___wasmer.io_graphql" / (package_namespace + "#" + package_name);
+  const std::optional<std::string> query_contents = ReadTextFile(query_path);
+  if (!query_contents.has_value()) return std::nullopt;
+
+  size_t search_pos = 0;
+  while (true) {
+    std::string version;
+    size_t next_pos = 0;
+    if (!FindJsonStringField(*query_contents, "version", search_pos, &version, &next_pos)) break;
+    search_pos = next_pos;
+    if (version != package_version) continue;
+
+    std::string hash;
+    size_t hash_next_pos = 0;
+    if (!FindJsonStringField(*query_contents, "piritaSha256Hash", search_pos, &hash, &hash_next_pos)) {
+      break;
+    }
+
+    const fs::path cached_package = wasmer_dir / "cache" / "checkouts" / (hash + ".bin");
+    std::error_code ec;
+    if (fs::exists(cached_package, ec) && !ec) {
+      return cached_package.lexically_normal().string();
+    }
+    break;
+  }
+
+  return std::nullopt;
+}
+
 std::string ResolveWasmerBinary(std::string_view wasmer_bin) {
   if (!wasmer_bin.empty()) return std::string(wasmer_bin);
+  const std::string home_directory = ResolveHomeDirectory();
+  if (!home_directory.empty()) {
+    const std::filesystem::path home_wasmer =
+        std::filesystem::path(home_directory) / ".wasmer" / "bin" / "wasmer";
+    std::error_code ec;
+    if (std::filesystem::exists(home_wasmer, ec) && !ec) {
+      return home_wasmer.lexically_normal().string();
+    }
+  }
   return "wasmer";
 }
 
 std::string ResolveWasmerPackage(std::string_view wasmer_package) {
-  if (!wasmer_package.empty()) return std::string(wasmer_package);
-  return EDGE_DEFAULT_WASMER_PACKAGE;
+  const std::string package =
+      wasmer_package.empty() ? std::string(EDGE_DEFAULT_WASMER_PACKAGE) : std::string(wasmer_package);
+  std::error_code ec;
+  if (std::filesystem::exists(std::filesystem::path(package), ec) && !ec) {
+    return std::filesystem::path(package).lexically_normal().string();
+  }
+  if (const auto cached_package = ResolveCachedWasmerPackage(package); cached_package.has_value()) {
+    return *cached_package;
+  }
+  return package;
 }
 
 std::string BuildEdgeBinaryPath() {
@@ -103,7 +243,8 @@ std::vector<std::string> BuildDefaultSafeModeCommand(std::string_view wasmer_bin
       "run",
       "--experimental-napi",
       resolved_wasmer_package,
-      "--volume=.",
+      "--volume=.:/home",
+      "--cwd=/home",
       "--net",
       "--",
   };

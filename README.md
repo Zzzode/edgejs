@@ -47,12 +47,43 @@ http
 $ edge server.js
 ```
 
+Run a script inside the WebAssembly sandbox with `--safe`:
+
+```bash
+$ edge --safe server.js
+```
+
 If you want to use it in your current workflow, just wrap your commands with `edge`:
 
 ```bash
 $ edge node myfile.js
 $ edge npm install
 $ edge pnpm run dev
+```
+
+## Safe mode
+
+`edge --safe` runs the program through Wasmer with the current working
+directory mounted at `/home` inside the guest sandbox.
+
+By default, Edge resolves the safe-mode runtime in this order:
+
+1. `--wasmer-bin` / `--wasmer-package`
+2. `WASMER_BIN` / `EDGE_WASMER_PACKAGE`
+3. `~/.wasmer/bin/wasmer`
+4. A matching cached `wasmer/edgejs@=...` package from
+   `~/.wasmer/cache/checkouts/`
+5. The registry package name baked into the build
+
+That means a locally installed Wasmer plus a previously cached
+`wasmer/edgejs` package is enough to run `edge --safe` offline.
+
+If you want to pin a specific runtime explicitly:
+
+```bash
+WASMER_BIN="$HOME/.wasmer/bin/wasmer" \
+EDGE_WASMER_PACKAGE="$HOME/.wasmer/cache/checkouts/<sha>.bin" \
+edge --safe server.js
 ```
 
 ## Development
