@@ -78,16 +78,54 @@ case "$BENCHMARK" in
     BUN_CMD="$BUN_BIN benchmarks/workloads/string-compare-split.js"
     DENO_CMD="$DENO_BIN run benchmarks/workloads/string-compare-split.js"
     ;;
+  cli-eval-empty)
+    EDGE_CMD="$EDGE_BIN -e \"\""
+    NODE_CMD="$NODE_BIN -e \"\""
+    BUN_CMD="$BUN_BIN -e \"\""
+    DENO_CMD="$DENO_BIN eval \"\""
+    ;;
+  cli-print-literal)
+    EDGE_CMD="$EDGE_BIN -p \"1\""
+    NODE_CMD="$NODE_BIN -p \"1\""
+    BUN_CMD="$BUN_BIN -p \"1\""
+    DENO_CMD="$DENO_BIN eval \"console.log(1)\""
+    ;;
+  cli-print-process-version)
+    EDGE_CMD="$EDGE_BIN -p \"process.version\""
+    NODE_CMD="$NODE_BIN -p \"process.version\""
+    BUN_CMD="$BUN_BIN -p \"process.version\""
+    DENO_CMD="$DENO_BIN eval \"console.log(process.version)\""
+    ;;
   *)
     echo "Unknown benchmark: $BENCHMARK"
-    echo "Available benchmarks: empty-startup, console-log, json-parse-stringify, promise-microtask-chain, zlib-deflate-sync, string-compare-split"
+    echo "Available benchmarks: empty-startup, console-log, json-parse-stringify, promise-microtask-chain, zlib-deflate-sync, string-compare-split, cli-eval-empty, cli-print-literal, cli-print-process-version"
     exit 1
     ;;
 esac
 
+if [[ -n "${DENO_CMD:-}" ]]; then
+  command -v "$DENO_BIN" >/dev/null 2>&1 || {
+    echo "Missing deno binary: $DENO_BIN"
+    echo "Install Deno first, then re-run this script."
+    exit 1
+  }
+fi
+
+echo "EDGE_CMD: $EDGE_CMD"
+
 JSON_OUT="$RESULTS_DIR/${BENCHMARK}.json"
 CSV_OUT="$RESULTS_DIR/${BENCHMARK}.csv"
 MD_OUT="$RESULTS_DIR/${BENCHMARK}.md"
+PROFILE_JSON_OUT="$RESULTS_DIR/${BENCHMARK}.edge-profile.json"
+PROFILE_MD_OUT="$RESULTS_DIR/${BENCHMARK}.edge-profile.md"
+
+COMMAND_ARGS=(
+  --command-name edge "$EDGE_CMD"
+  --command-name node "$NODE_CMD"
+  --command-name bun "$BUN_CMD"
+  --command-name deno "$DENO_CMD"
+)
+
 
 hyperfine \
   --warmup "$WARMUP" \
@@ -95,13 +133,17 @@ hyperfine \
   --export-json "$JSON_OUT" \
   --export-csv "$CSV_OUT" \
   --export-markdown "$MD_OUT" \
-  --command-name edge "$EDGE_CMD" \
-  --command-name node "$NODE_CMD" \
-  --command-name bun "$BUN_CMD" \
-  --command-name deno "$DENO_CMD"
+  "${COMMAND_ARGS[@]}"
+
+"$NODE_BIN" benchmarks/capture-edge-startup-profile.mjs \
+  "$PROFILE_JSON_OUT" \
+  "$PROFILE_MD_OUT" \
+  "$EDGE_CMD"
 
 echo
 echo "Exported:"
 echo "  $JSON_OUT"
 echo "  $CSV_OUT"
 echo "  $MD_OUT"
+echo "  $PROFILE_JSON_OUT"
+echo "  $PROFILE_MD_OUT"

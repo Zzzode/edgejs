@@ -26,6 +26,45 @@ What it does not measure:
 - async scheduling
 - parsing or serialization cost
 
+### `cli-eval-empty`
+
+Runs an empty `-e` snippet.
+
+What it isolates:
+- CLI eval startup overhead without file loading
+- argument parsing and eval-entry bootstrap cost
+
+What it does not measure:
+- file-entry startup
+- useful application work
+- richer module-loader or inspector setup
+
+### `cli-print-literal`
+
+Runs `-p "1"`.
+
+What it isolates:
+- CLI print startup cost for a trivial expression
+- eval-path setup plus minimal output work
+
+What it does not measure:
+- file-entry startup
+- module-heavy eval behavior
+- non-trivial compute
+
+### `cli-print-process-version`
+
+Runs `-p "process.version"`.
+
+What it isolates:
+- CLI print startup for a small process-backed expression
+- startup behavior closer to common “version probe” checks
+
+What it does not measure:
+- file-entry startup
+- require-heavy eval behavior
+- async or I/O work
+
 ### `console-log`
 
 Prints a single line to stdout.
@@ -130,14 +169,37 @@ deno run benchmarks/workloads/<workload>.js
 
 These benchmark files are intentionally small and standalone so they can be compared across runtimes with minimal harness-specific behavior.
 
+CLI startup benchmarks intentionally omit Deno from the matrix because they exercise Node/Bun-compatible `-e` and `-p` entry paths rather than file-entry workloads.
+
+Each benchmark run also captures an Edge-only startup phase profile when the binary was built with `-DEDGE_ENABLE_STARTUP_PROFILE=ON`. Alongside the usual `hyperfine` exports, the harness writes:
+
+- `benchmarks/results/<workload>.edge-profile.json`
+- `benchmarks/results/<workload>.edge-profile.md`
+
+These artifacts record the native startup phase breakdown for the exact Edge command used in the benchmark, so wall-clock deltas can be reviewed together with phase deltas. When the profiler is not compiled into the binary, the harness writes a placeholder note instead.
+
 ## Build Edge locally
 
 ```bash
 make build
 ```
 
+To embed the internal startup profiler in the binary for benchmark analysis:
+
+```bash
+cmake -S . -B build-edge -DCMAKE_BUILD_TYPE=Release -DEDGE_ENABLE_STARTUP_PROFILE=ON
+cmake --build build-edge -j8
+```
+
 ## Example benchmark command
 
 ```bash
 EDGE_BIN=./build-edge/edge NODE_BIN=node BUN_BIN=bun DENO_BIN=deno ./benchmarks/run.sh console-log
+```
+
+```bash
+EDGE_BIN=./build-edge/edge \
+NODE_BIN=/Users/syrusakbary/.nvm/versions/node/v22.22.2/bin/node \
+BUN_BIN=/opt/homebrew/bin/bun \
+./benchmarks/run.sh cli-print-literal
 ```
